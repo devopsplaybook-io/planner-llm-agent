@@ -54,4 +54,4 @@ COPY package.json /opt/app/planner-llm-agent/package.json
 
 WORKDIR /opt/app/planner-llm-agent
 
-CMD [ "dist/App.js" ]
+CMD [ "node", "dist/App.js" ]
