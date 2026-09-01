@@ -10,14 +10,43 @@ logger.info("====== Starting planner-llm-agent ======");
 Promise.resolve().then(async () => {
   //
   const config = new Config();
-  await config.reload();
+  try {
+    await config.reload();
+  } catch (error) {
+    logger.error(
+      `Failed to load configuration file '${config.CONFIG_FILE}'`,
+      error as Error,
+    );
+    process.exit(1);
+  }
+
+  // Check the configuration requirements
+  const validationErrors = config.validate();
+  if (validationErrors.length > 0) {
+    logger.error("Missing or invalid configuration:");
+    for (const validationError of validationErrors) {
+      logger.error(`  - ${validationError}`);
+    }
+    process.exit(1);
+  }
+
   watchFile(config.CONFIG_FILE, () => {
     logger.info(`Config updated: ${config.CONFIG_FILE}`);
-    config.reload();
+    config.reload().catch((error: Error) => {
+      logger.error(
+        `Failed to reload configuration file '${config.CONFIG_FILE}'`,
+        error,
+      );
+    });
   });
 
   // OpenTelemetry
-  OTelInit(config);
+  try {
+    OTelInit(config);
+  } catch (error) {
+    logger.error("Failed to initialize OpenTelemetry", error as Error);
+    process.exit(1);
+  }
 
   const span = OTelTracer().startSpan("init");
   span.end();

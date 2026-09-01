@@ -110,4 +110,54 @@ describe("Config", () => {
       expect(config.TASK_POLLING_INTERVAL).toBe(60);
     });
   });
+
+  describe("validate", () => {
+    it("should return no errors for a valid configuration", () => {
+      const config = new Config();
+      config.AGENT_NAME = "agent";
+      config.PLANNER_URL = "http://planner:8080";
+      config.PLANNER_API_KEY = "key";
+      config.TASK_POLLING_INTERVAL = 60;
+      expect(config.validate()).toEqual([]);
+    });
+
+    it("should report all missing required values", () => {
+      const config = new Config();
+      config.AGENT_NAME = "";
+      config.PLANNER_URL = "";
+      config.PLANNER_API_KEY = "";
+      config.TASK_POLLING_INTERVAL = 0;
+
+      const errors = config.validate();
+      expect(errors).toHaveLength(4);
+      expect(errors).toContain("AGENT_NAME is required");
+      expect(errors).toContain("PLANNER_URL is required");
+      expect(errors).toContain("PLANNER_API_KEY is required");
+      expect(errors).toContain(
+        "TASK_POLLING_INTERVAL must be a positive integer (current value: '0')",
+      );
+    });
+
+    it("should report invalid PLANNER_URL", () => {
+      const config = new Config();
+      config.PLANNER_API_KEY = "key";
+      config.PLANNER_URL = "not-a-url";
+
+      const errors = config.validate();
+      expect(errors).toEqual([
+        "PLANNER_URL must be a valid http(s) URL (current value: 'not-a-url')",
+      ]);
+    });
+
+    it("should report non-integer TASK_POLLING_INTERVAL", () => {
+      const config = new Config();
+      config.PLANNER_API_KEY = "key";
+      config.TASK_POLLING_INTERVAL = NaN;
+
+      const errors = config.validate();
+      expect(errors).toEqual([
+        "TASK_POLLING_INTERVAL must be a positive integer (current value: 'NaN')",
+      ]);
+    });
+  });
 });

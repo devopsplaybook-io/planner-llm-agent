@@ -1,6 +1,6 @@
 {
-  "AGENT_NAME": "dev-agent",
-  "PLANNER_URL": "http://localhost:8080",
-  "PLANNER_API_KEY": "dev",
-  "TASK_POLLING_INTERVAL": 60
+  "AGENT_NAME": "",
+  "PLANNER_URL": "",
+  "PLANNER_API_KEY": "",
+  "TASK_POLLING_INTERVAL": 0
 }

@@ -1,6 +1,15 @@
 import * as fs from "fs-extra";
 import * as path from "path";
 
+function isValidHttpUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    return url.protocol === "http:" || url.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
 export class Config {
   public CONFIG_FILE: string;
   public DATA_DIR: string;
@@ -133,5 +142,36 @@ export class Config {
       this.OPENTELEMETRY_COLLECT_AUTHORIZATION_HEADER =
         process.env.OPENTELEMETRY_COLLECT_AUTHORIZATION_HEADER;
     }
+  }
+
+  public validate(): string[] {
+    const errors: string[] = [];
+
+    if (!this.AGENT_NAME || this.AGENT_NAME.trim().length === 0) {
+      errors.push("AGENT_NAME is required");
+    }
+
+    if (!this.PLANNER_URL || this.PLANNER_URL.trim().length === 0) {
+      errors.push("PLANNER_URL is required");
+    } else if (!isValidHttpUrl(this.PLANNER_URL)) {
+      errors.push(
+        `PLANNER_URL must be a valid http(s) URL (current value: '${this.PLANNER_URL}')`,
+      );
+    }
+
+    if (!this.PLANNER_API_KEY || this.PLANNER_API_KEY.trim().length === 0) {
+      errors.push("PLANNER_API_KEY is required");
+    }
+
+    if (
+      !Number.isInteger(this.TASK_POLLING_INTERVAL) ||
+      this.TASK_POLLING_INTERVAL <= 0
+    ) {
+      errors.push(
+        `TASK_POLLING_INTERVAL must be a positive integer (current value: '${this.TASK_POLLING_INTERVAL}')`,
+      );
+    }
+
+    return errors;
   }
 }
