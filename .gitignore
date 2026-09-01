@@ -1,0 +1,13 @@
+/tmp
+/*/node_modules
+/*/dist
+/*/docker-packaging
+/*/docker-packaging-config/files
+/builds
+node_modules/
+coverage
+/docs/dev/env.sh
+.vscode
+/env-dev.js
+/*/tmp
+/docs/dev/data
