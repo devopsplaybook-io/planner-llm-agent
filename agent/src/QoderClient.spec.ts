@@ -1,4 +1,5 @@
 import { execFile } from "child_process";
+import * as fse from "fs-extra";
 import * as os from "os";
 import * as path from "path";
 import { QoderClient } from "./QoderClient";
@@ -33,6 +34,7 @@ describe("QoderClient", () => {
 
   afterEach(() => {
     process.env = originalEnv;
+    fse.removeSync(path.join(os.tmpdir(), "qoder-spec"));
   });
 
   it("should run a headless prompt to verify authentication", async () => {
@@ -103,18 +105,24 @@ describe("QoderClient", () => {
     );
   });
 
-  it("should perform a task and return the summary", async () => {
+  it("should read the task summary from the file written by qoder", async () => {
+    const taskDir = path.join(os.tmpdir(), "qoder-spec");
+    const notesFile = path.join(taskDir, "task-1-Agent.md");
+    const summaryFile = path.join(taskDir, "task-1-Agent-Summary.md");
+    await fse.ensureDir(taskDir);
     mockExecFile.mockImplementation(
       (
         _command: string,
         _args: string[],
         _options: unknown,
         callback: (error: Error | null, stdout: string, stderr: string) => void,
-      ) => callback(null, "  Implemented the feature  \n", ""),
+      ) => {
+        fse.writeFileSync(summaryFile, "  Implemented the feature  \n");
+        callback(null, "", "");
+      },
     );
 
     const client = new QoderClient(config);
-    const notesFile = path.join(os.tmpdir(), "qoder-spec", "task-1-Agent.md");
     const summary = await client.performTask(
       {
         id: "task-1",
@@ -134,10 +142,37 @@ describe("QoderClient", () => {
     expect(String(args[1])).toContain(
       `Task documentation file: ${notesFile}`,
     );
+    expect(String(args[1])).toContain(`to the file: ${summaryFile}`);
     expect(options).toMatchObject({
       timeout: 1800000,
-      cwd: path.dirname(notesFile),
+      cwd: taskDir,
     });
+    expect(await fse.pathExists(summaryFile)).toBe(false);
+  });
+
+  it("should fall back to stdout when qoder does not write a summary file", async () => {
+    mockExecFile.mockImplementation(
+      (
+        _command: string,
+        _args: string[],
+        _options: unknown,
+        callback: (error: Error | null, stdout: string, stderr: string) => void,
+      ) => callback(null, "  Implemented the feature  \n", ""),
+    );
+
+    const client = new QoderClient(config);
+    const summary = await client.performTask(
+      {
+        id: "task-1",
+        title: "Implement feature",
+        status: "To Do",
+        description: "Add a feature",
+        comments: [],
+      },
+      path.join(os.tmpdir(), "qoder-spec", "task-1-Agent.md"),
+    );
+
+    expect(summary).toBe("Implemented the feature");
   });
 
   it("should return a fallback summary when qoder returns no output", async () => {

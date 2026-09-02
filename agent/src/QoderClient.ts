@@ -1,5 +1,6 @@
 import { execFile } from "child_process";
 import type { ExecFileOptionsWithStringEncoding } from "child_process";
+import * as fse from "fs-extra";
 import * as path from "path";
 import { Config } from "./Config";
 import { OTelTracer } from "./OTelContext";
@@ -60,14 +61,22 @@ export class QoderClient {
     notesFile: string,
   ): Promise<string> {
     const span = OTelTracer().startSpan("qoder-client.perform-task");
+    const summaryFile = getSummaryFile(notesFile);
     try {
+      // Remove any summary file left over from a previous run so only the
+      // output of this run is picked up.
+      try {
+        await fse.remove(summaryFile);
+      } catch {
+        // Non-fatal: qoder overwrites the file anyway.
+      }
       const prompt = [
         "You are an autonomous agent working on an assigned task.",
         `Task documentation file: ${notesFile}`,
         "Read the documentation file first: it contains the task description and all comments.",
         "1. Perform the task described in the documentation file.",
         '2. Keep the "Agent Notes" section of the documentation file updated with what you did and learned, so future runs know the state of the task.',
-        "3. Reply with a concise summary of what has been done. The reply will be posted as a comment on the task.",
+        `3. Write a concise summary of what has been done to the file: ${summaryFile}. The summary will be posted as a comment on the task.`,
       ].join("\n");
       const result = await runCli(
         this.config.QODER_CLI,
@@ -79,7 +88,20 @@ export class QoderClient {
           maxBuffer: 10 * 1024 * 1024,
         },
       );
-      const summary = result.stdout.trim();
+      // Prefer the summary file qoder was asked to write; headless CLI
+      // output on stdout is not reliable and is only a fallback.
+      let summary = "";
+      try {
+        if (await fse.pathExists(summaryFile)) {
+          summary = (await fse.readFile(summaryFile, "utf8")).trim();
+          await fse.remove(summaryFile);
+        }
+      } catch {
+        // Fall back to stdout when the summary file cannot be read.
+      }
+      if (summary.length === 0) {
+        summary = result.stdout.trim();
+      }
       return summary.length > 0
         ? summary
         : "Task executed (no output returned by Qoder)";
@@ -106,6 +128,13 @@ export class QoderClient {
       span.end();
     }
   }
+}
+
+function getSummaryFile(notesFile: string): string {
+  if (notesFile.endsWith("-Agent.md")) {
+    return `${notesFile.slice(0, -"-Agent.md".length)}-Agent-Summary.md`;
+  }
+  return `${notesFile}-Summary.md`;
 }
 
 function runCli(
