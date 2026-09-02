@@ -20,6 +20,7 @@ module.exports = {
         AGENT_NAME: "dev-agent",
         PLANNER_URL: "http://localhost:8080",
         PLANNER_API_KEY: "dev",
+        QODER_AUTH_CHECK: "false",
         OPENTELEMETRY_COLLECTOR_HTTP_TRACES: "http://localhost:9999/v1/traces",
         OPENTELEMETRY_COLLECTOR_HTTP_METRICS:
           "http://localhost:9999/v1/metrics",

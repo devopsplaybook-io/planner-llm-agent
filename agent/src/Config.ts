@@ -25,6 +25,10 @@ export class Config {
   public PLANNER_API_KEY: string;
   public TASK_POLLING_INTERVAL: number;
 
+  // Qoder CLI
+  public QODER_CLI: string;
+  public QODER_AUTH_CHECK: string;
+
   // OpenTelemetry
   public OPENTELEMETRY_COLLECTOR_HTTP_TRACES: string;
   public OPENTELEMETRY_COLLECTOR_HTTP_METRICS: string;
@@ -57,6 +61,9 @@ export class Config {
     this.PLANNER_API_KEY = "";
     this.TASK_POLLING_INTERVAL = 60;
 
+    this.QODER_CLI = "qoder";
+    this.QODER_AUTH_CHECK = "true";
+
     this.OPENTELEMETRY_COLLECTOR_HTTP_TRACES = "";
     this.OPENTELEMETRY_COLLECTOR_HTTP_METRICS = "";
     this.OPENTELEMETRY_COLLECTOR_HTTP_LOGS = "";
@@ -86,6 +93,12 @@ export class Config {
     }
     if (config.TASK_POLLING_INTERVAL) {
       this.TASK_POLLING_INTERVAL = config.TASK_POLLING_INTERVAL as number;
+    }
+    if (config.QODER_CLI) {
+      this.QODER_CLI = config.QODER_CLI as string;
+    }
+    if (config.QODER_AUTH_CHECK) {
+      this.QODER_AUTH_CHECK = config.QODER_AUTH_CHECK as string;
     }
 
     if (config.OPENTELEMETRY_COLLECTOR_HTTP_TRACES) {
@@ -125,6 +138,12 @@ export class Config {
     }
     if (process.env.TASK_POLLING_INTERVAL) {
       this.TASK_POLLING_INTERVAL = parseInt(process.env.TASK_POLLING_INTERVAL);
+    }
+    if (process.env.QODER_CLI) {
+      this.QODER_CLI = process.env.QODER_CLI;
+    }
+    if (process.env.QODER_AUTH_CHECK) {
+      this.QODER_AUTH_CHECK = process.env.QODER_AUTH_CHECK;
     }
     if (process.env.OPENTELEMETRY_COLLECTOR_HTTP_TRACES) {
       this.OPENTELEMETRY_COLLECTOR_HTTP_TRACES =

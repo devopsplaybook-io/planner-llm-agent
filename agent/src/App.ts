@@ -2,6 +2,7 @@ import { watchFile } from "fs-extra";
 import { Agent } from "./Agent";
 import { Config } from "./Config";
 import { OTelInit, OTelLogger, OTelTracer } from "./OTelContext";
+import { QoderClient } from "./QoderClient";
 
 const logger = OTelLogger().createModuleLogger("app");
 
@@ -50,6 +51,23 @@ Promise.resolve().then(async () => {
 
   const span = OTelTracer().startSpan("init");
   span.end();
+
+  // Check Qoder authentication
+  if (config.QODER_AUTH_CHECK === "true" || config.QODER_AUTH_CHECK === "1") {
+    const qoderClient = new QoderClient(config);
+    try {
+      await qoderClient.checkAuthentication();
+      logger.info("Qoder authentication verified");
+    } catch (error) {
+      logger.error("Qoder authentication check failed", error as Error);
+      logger.error(
+        "Ensure QODER_PERSONAL_ACCESS_TOKEN is set to a valid Personal Access Token (https://qoder.com/account/integrations)",
+      );
+      process.exit(1);
+    }
+  } else {
+    logger.info("Qoder authentication check disabled");
+  }
 
   // Agent
   const agent = new Agent(config);
