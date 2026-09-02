@@ -85,6 +85,16 @@ describe("PlannerClient", () => {
             id: "task-1",
             title: "Fix the build",
             status: "In Progress",
+            description: "The build is broken",
+            comments: [
+              {
+                id: "comment-1",
+                userId: "user-2",
+                userName: "Alice",
+                text: "Please add tests",
+                dateCreated: "2026-09-02T00:00:00.000Z",
+              },
+            ],
             assignees: [{ userId: "user-1" }],
           },
           {
@@ -111,13 +121,69 @@ describe("PlannerClient", () => {
     });
 
     expect(tasks).toEqual([
-      { id: "task-1", title: "Fix the build", status: "In Progress" },
+      {
+        id: "task-1",
+        title: "Fix the build",
+        status: "In Progress",
+        description: "The build is broken",
+        comments: [
+          {
+            id: "comment-1",
+            userId: "user-2",
+            userName: "Alice",
+            text: "Please add tests",
+            dateCreated: "2026-09-02T00:00:00.000Z",
+          },
+        ],
+      },
     ]);
     expect(fetchMock).toHaveBeenCalledWith(
       "http://planner.test:8080/api/tasks",
       expect.objectContaining({
         method: "GET",
         headers: expect.objectContaining({ "x-api-key": "test-api-key" }),
+      }),
+    );
+  });
+
+  it("should add a comment to a task", async () => {
+    fetchMock.mockResolvedValue(
+      new Response(JSON.stringify({ id: "comment-1" }), { status: 201 }),
+    );
+
+    const client = new PlannerClient(config);
+    await client.addTaskComment("task-1", "Feature implemented");
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://planner.test:8080/api/tasks/task-1/comments",
+      expect.objectContaining({
+        method: "POST",
+        headers: expect.objectContaining({
+          "x-api-key": "test-api-key",
+          "Content-Type": "application/json",
+        }),
+        body: JSON.stringify({ text: "Feature implemented" }),
+      }),
+    );
+  });
+
+  it("should update a task status", async () => {
+    fetchMock.mockResolvedValue(
+      new Response(JSON.stringify({ id: "task-1" }), { status: 201 }),
+    );
+
+    const client = new PlannerClient(config);
+    await client.updateTaskStatus("task-1", "Done");
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://planner.test:8080/api/tasks/task-1",
+      expect.objectContaining({
+        method: "PUT",
+        headers: expect.objectContaining({
+          "x-api-key": "test-api-key",
+          "Content-Type": "application/json",
+        }),
+        body: JSON.stringify({ status: "Done" }),
       }),
     );
   });

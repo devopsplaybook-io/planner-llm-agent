@@ -1,4 +1,6 @@
 import { execFile } from "child_process";
+import * as os from "os";
+import * as path from "path";
 import { QoderClient } from "./QoderClient";
 import { Config } from "./Config";
 
@@ -99,5 +101,102 @@ describe("QoderClient", () => {
     await expect(client.checkAuthentication()).rejects.toThrow(
       "Qoder CLI 'qoder' not found in PATH",
     );
+  });
+
+  it("should perform a task and return the summary", async () => {
+    mockExecFile.mockImplementation(
+      (
+        _command: string,
+        _args: string[],
+        _options: unknown,
+        callback: (error: Error | null, stdout: string, stderr: string) => void,
+      ) => callback(null, "  Implemented the feature  \n", ""),
+    );
+
+    const client = new QoderClient(config);
+    const notesFile = path.join(os.tmpdir(), "qoder-spec", "task-1-Agent.md");
+    const summary = await client.performTask(
+      {
+        id: "task-1",
+        title: "Implement feature",
+        status: "To Do",
+        description: "Add a feature",
+        comments: [],
+      },
+      notesFile,
+    );
+
+    expect(summary).toBe("Implemented the feature");
+    expect(mockExecFile).toHaveBeenCalledTimes(1);
+    const [command, args, options] = mockExecFile.mock.calls[0];
+    expect(command).toBe("qoder");
+    expect(args[0]).toBe("-p");
+    expect(String(args[1])).toContain(
+      `Task documentation file: ${notesFile}`,
+    );
+    expect(options).toMatchObject({
+      timeout: 1800000,
+      cwd: path.dirname(notesFile),
+    });
+  });
+
+  it("should return a fallback summary when qoder returns no output", async () => {
+    mockExecFile.mockImplementation(
+      (
+        _command: string,
+        _args: string[],
+        _options: unknown,
+        callback: (error: Error | null, stdout: string, stderr: string) => void,
+      ) => callback(null, "", ""),
+    );
+
+    const client = new QoderClient(config);
+    const summary = await client.performTask(
+      {
+        id: "task-1",
+        title: "Implement feature",
+        status: "To Do",
+        description: "",
+        comments: [],
+      },
+      "/tmp/qoder-spec/task-1-Agent.md",
+    );
+
+    expect(summary).toBe("Task executed (no output returned by Qoder)");
+  });
+
+  it("should include the CLI output when task execution fails", async () => {
+    mockExecFile.mockImplementation(
+      (
+        _command: string,
+        _args: string[],
+        _options: unknown,
+        callback: (error: Error | null, stdout: string, stderr: string) => void,
+      ) =>
+        callback(
+          Object.assign(new Error("Command failed"), {
+            code: 1,
+            killed: false,
+            stderr: "boom",
+            stdout: "",
+          }),
+          "",
+          "",
+        ),
+    );
+
+    const client = new QoderClient(config);
+    await expect(
+      client.performTask(
+        {
+          id: "task-1",
+          title: "Implement feature",
+          status: "To Do",
+          description: "",
+          comments: [],
+        },
+        "/tmp/qoder-spec/task-1-Agent.md",
+      ),
+    ).rejects.toThrow("Qoder task execution failed:\nboom");
   });
 });

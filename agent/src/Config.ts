@@ -24,6 +24,8 @@ export class Config {
   public PLANNER_URL: string;
   public PLANNER_API_KEY: string;
   public TASK_POLLING_INTERVAL: number;
+  public TASK_STATUS_START: string;
+  public TASK_STATUS_END: string;
 
   // Qoder CLI
   public QODER_CLI: string;
@@ -60,6 +62,8 @@ export class Config {
     this.PLANNER_URL = "http://localhost:8080";
     this.PLANNER_API_KEY = "";
     this.TASK_POLLING_INTERVAL = 60;
+    this.TASK_STATUS_START = "To Do";
+    this.TASK_STATUS_END = "Done";
 
     this.QODER_CLI = "qoder";
     this.QODER_AUTH_CHECK = "true";
@@ -93,6 +97,12 @@ export class Config {
     }
     if (config.TASK_POLLING_INTERVAL) {
       this.TASK_POLLING_INTERVAL = config.TASK_POLLING_INTERVAL as number;
+    }
+    if (config.TASK_STATUS_START) {
+      this.TASK_STATUS_START = config.TASK_STATUS_START as string;
+    }
+    if (config.TASK_STATUS_END) {
+      this.TASK_STATUS_END = config.TASK_STATUS_END as string;
     }
     if (config.QODER_CLI) {
       this.QODER_CLI = config.QODER_CLI as string;
@@ -138,6 +148,12 @@ export class Config {
     }
     if (process.env.TASK_POLLING_INTERVAL) {
       this.TASK_POLLING_INTERVAL = parseInt(process.env.TASK_POLLING_INTERVAL);
+    }
+    if (process.env.TASK_STATUS_START) {
+      this.TASK_STATUS_START = process.env.TASK_STATUS_START;
+    }
+    if (process.env.TASK_STATUS_END) {
+      this.TASK_STATUS_END = process.env.TASK_STATUS_END;
     }
     if (process.env.QODER_CLI) {
       this.QODER_CLI = process.env.QODER_CLI;
