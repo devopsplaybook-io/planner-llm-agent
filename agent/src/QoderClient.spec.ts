@@ -13,6 +13,13 @@ jest.mock("./OTelContext", () => ({
       recordException: jest.fn(),
     })),
   })),
+  OTelLogger: jest.fn(() => ({
+    createModuleLogger: jest.fn(() => ({
+      info: jest.fn(),
+      warn: jest.fn(),
+      error: jest.fn(),
+    })),
+  })),
 }));
 
 jest.mock("child_process", () => ({
@@ -44,7 +51,12 @@ describe("QoderClient", () => {
         _args: string[],
         _options: unknown,
         callback: (error: Error | null, stdout: string, stderr: string) => void,
-      ) => callback(null, "OK", ""),
+      ) =>
+        callback(
+          null,
+          JSON.stringify({ response: "OK", stats: { total: 1 } }),
+          "",
+        ),
     );
 
     const client = new QoderClient(config);
@@ -53,8 +65,29 @@ describe("QoderClient", () => {
     expect(mockExecFile).toHaveBeenCalledTimes(1);
     const [command, args, options] = mockExecFile.mock.calls[0];
     expect(command).toBe("qoder");
-    expect(args).toEqual(["-p", "Reply with exactly: OK"]);
+    expect(args).toEqual([
+      "-p",
+      "Reply with exactly: OK",
+      "--output-format",
+      "json",
+    ]);
     expect(options).toMatchObject({ timeout: 120000 });
+  });
+
+  it("should fail authentication when the probe reply is missing", async () => {
+    mockExecFile.mockImplementation(
+      (
+        _command: string,
+        _args: string[],
+        _options: unknown,
+        callback: (error: Error | null, stdout: string, stderr: string) => void,
+      ) => callback(null, "", ""),
+    );
+
+    const client = new QoderClient(config);
+    await expect(client.checkAuthentication()).rejects.toThrow(
+      "Qoder authentication probe did not return the expected reply. CLI output:\n(no output)",
+    );
   });
 
   it("should include the CLI output when authentication fails", async () => {
@@ -143,6 +176,12 @@ describe("QoderClient", () => {
       `Task documentation file: ${notesFile}`,
     );
     expect(String(args[1])).toContain(`to the file: ${summaryFile}`);
+    expect(args.slice(2)).toEqual([
+      "--output-format",
+      "json",
+      "--permission-mode",
+      "bypass_permissions",
+    ]);
     expect(options).toMatchObject({
       timeout: 1800000,
       cwd: taskDir,
@@ -150,7 +189,40 @@ describe("QoderClient", () => {
     expect(await fse.pathExists(summaryFile)).toBe(false);
   });
 
-  it("should fall back to stdout when qoder does not write a summary file", async () => {
+  it("should fall back to the json response when qoder does not write a summary file", async () => {
+    mockExecFile.mockImplementation(
+      (
+        _command: string,
+        _args: string[],
+        _options: unknown,
+        callback: (error: Error | null, stdout: string, stderr: string) => void,
+      ) =>
+        callback(
+          null,
+          JSON.stringify({
+            response: "  Implemented the feature  ",
+            stats: { total: 1 },
+          }),
+          "",
+        ),
+    );
+
+    const client = new QoderClient(config);
+    const summary = await client.performTask(
+      {
+        id: "task-1",
+        title: "Implement feature",
+        status: "To Do",
+        description: "Add a feature",
+        comments: [],
+      },
+      path.join(os.tmpdir(), "qoder-spec", "task-1-Agent.md"),
+    );
+
+    expect(summary).toBe("Implemented the feature");
+  });
+
+  it("should fall back to plain stdout when the output is not json", async () => {
     mockExecFile.mockImplementation(
       (
         _command: string,

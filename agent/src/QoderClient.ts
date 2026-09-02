@@ -3,8 +3,10 @@ import type { ExecFileOptionsWithStringEncoding } from "child_process";
 import * as fse from "fs-extra";
 import * as path from "path";
 import { Config } from "./Config";
-import { OTelTracer } from "./OTelContext";
+import { OTelLogger, OTelTracer } from "./OTelContext";
 import { PlannerTask } from "./PlannerClient";
+
+const logger = OTelLogger().createModuleLogger("qoder-client");
 
 const AUTH_CHECK_TIMEOUT_MS = 120000;
 const TASK_TIMEOUT_MS = 1800000;
@@ -26,10 +28,11 @@ export class QoderClient {
 
   public async checkAuthentication(): Promise<void> {
     const span = OTelTracer().startSpan("qoder-client.check-authentication");
+    let result: { stdout: string; stderr: string };
     try {
-      await runCli(
+      result = await runCli(
         this.config.QODER_CLI,
-        ["-p", PROBE_PROMPT],
+        ["-p", PROBE_PROMPT, "--output-format", "json"],
         { timeout: AUTH_CHECK_TIMEOUT_MS, windowsHide: true },
       );
     } catch (error) {
@@ -53,6 +56,14 @@ export class QoderClient {
       );
     } finally {
       span.end();
+    }
+    // A zero exit code is not enough: verify that the probe actually
+    // produced a reply so an empty-output CLI fails visibly at startup.
+    const reply = extractJsonResponse(result.stdout) ?? result.stdout;
+    if (!reply.includes("OK")) {
+      throw new Error(
+        `Qoder authentication probe did not return the expected reply. CLI output:\n${formatCliOutput(result)}`,
+      );
     }
   }
 
@@ -80,7 +91,14 @@ export class QoderClient {
       ].join("\n");
       const result = await runCli(
         this.config.QODER_CLI,
-        ["-p", prompt],
+        [
+          "-p",
+          prompt,
+          "--output-format",
+          "json",
+          "--permission-mode",
+          "bypass_permissions",
+        ],
         {
           timeout: TASK_TIMEOUT_MS,
           windowsHide: true,
@@ -88,23 +106,45 @@ export class QoderClient {
           maxBuffer: 10 * 1024 * 1024,
         },
       );
-      // Prefer the summary file qoder was asked to write; headless CLI
-      // output on stdout is not reliable and is only a fallback.
+      // Prefer the summary file qoder was asked to write, then the JSON
+      // response field, then the raw stdout as a last resort.
       let summary = "";
+      let source = "";
       try {
         if (await fse.pathExists(summaryFile)) {
           summary = (await fse.readFile(summaryFile, "utf8")).trim();
           await fse.remove(summaryFile);
+          source = "summary file";
         }
       } catch {
-        // Fall back to stdout when the summary file cannot be read.
+        // Fall back to the CLI output when the file cannot be read.
       }
       if (summary.length === 0) {
-        summary = result.stdout.trim();
+        const jsonResponse = extractJsonResponse(result.stdout);
+        if (jsonResponse !== null && jsonResponse.length > 0) {
+          summary = jsonResponse;
+          source = "json response";
+        } else {
+          summary = result.stdout.trim();
+          source = summary.length > 0 ? "stdout" : "";
+        }
       }
-      return summary.length > 0
-        ? summary
-        : "Task executed (no output returned by Qoder)";
+      if (summary.length === 0) {
+        logger.error(
+          `Qoder produced no summary (stdout: ${result.stdout.length} chars, stderr: ${result.stderr.length} chars)`,
+        );
+        if (result.stdout.trim().length > 0) {
+          logger.error(`Qoder stdout: ${result.stdout.trim().slice(0, 500)}`);
+        }
+        if (result.stderr.trim().length > 0) {
+          logger.error(`Qoder stderr: ${result.stderr.trim().slice(0, 500)}`);
+        }
+        return "Task executed (no output returned by Qoder)";
+      }
+      logger.info(
+        `Qoder summary captured from ${source} (${summary.length} chars)`,
+      );
+      return summary;
     } catch (error) {
       const execError = error as ExecFileError;
       span.recordException(execError);
@@ -151,6 +191,34 @@ function runCli(
       }
     });
   });
+}
+
+function extractJsonResponse(stdout: string): string | null {
+  const trimmed = stdout.trim();
+  if (!trimmed.startsWith("{")) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(trimmed) as { response?: unknown };
+    if (typeof parsed.response === "string") {
+      return parsed.response.trim();
+    }
+    return null;
+  } catch {
+    // Not JSON - treat the output as plain text.
+    return null;
+  }
+}
+
+function formatCliOutput(result: { stdout: string; stderr: string }): string {
+  const parts: string[] = [];
+  if (result.stdout.trim().length > 0) {
+    parts.push(`stdout: ${result.stdout.trim().slice(0, 500)}`);
+  }
+  if (result.stderr.trim().length > 0) {
+    parts.push(`stderr: ${result.stderr.trim().slice(0, 500)}`);
+  }
+  return parts.length > 0 ? parts.join("\n") : "(no output)";
 }
 
 function extractErrorDetail(error: ExecFileError): string {
