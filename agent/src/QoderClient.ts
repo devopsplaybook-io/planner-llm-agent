@@ -1,8 +1,7 @@
-import { execFile } from "child_process";
-import type { ExecFileOptionsWithStringEncoding } from "child_process";
 import * as fse from "fs-extra";
 import * as path from "path";
 import { Config } from "./Config";
+import { ExecFileError, extractErrorDetail, runCli } from "./CliUtils";
 import { OTelLogger, OTelTracer } from "./OTelContext";
 import { PlannerTask } from "./PlannerClient";
 
@@ -11,13 +10,6 @@ const logger = OTelLogger().createModuleLogger("qoder-client");
 const AUTH_CHECK_TIMEOUT_MS = 120000;
 const TASK_TIMEOUT_MS = 1800000;
 const PROBE_PROMPT = "Reply with exactly: OK";
-
-interface ExecFileError extends Error {
-  code?: string | number;
-  killed?: boolean;
-  stderr?: string;
-  stdout?: string;
-}
 
 export class QoderClient {
   private config: Config;
@@ -85,6 +77,7 @@ export class QoderClient {
         "You are an autonomous agent working on an assigned task.",
         `Task documentation file: ${notesFile}`,
         "Read the documentation file first: it contains the task description and all comments.",
+        "Git and the GitHub CLI (gh) are already configured with authentication for Git and GitHub operations.",
         "1. Perform the task described in the documentation file.",
         '2. Keep the "Agent Notes" section of the documentation file updated with what you did and learned, so future runs know the state of the task.',
         `3. Write a concise summary of what has been done to the file: ${summaryFile}. The summary will be posted as a comment on the task.`,
@@ -177,22 +170,6 @@ function getSummaryFile(notesFile: string): string {
   return `${notesFile}-Summary.md`;
 }
 
-function runCli(
-  command: string,
-  args: string[],
-  options: ExecFileOptionsWithStringEncoding,
-): Promise<{ stdout: string; stderr: string }> {
-  return new Promise((resolve, reject) => {
-    execFile(command, args, options, (error, stdout, stderr) => {
-      if (error) {
-        reject(error);
-      } else {
-        resolve({ stdout: stdout, stderr: stderr });
-      }
-    });
-  });
-}
-
 function extractJsonResponse(stdout: string): string | null {
   const trimmed = stdout.trim();
   if (!trimmed.startsWith("{")) {
@@ -219,22 +196,4 @@ function formatCliOutput(result: { stdout: string; stderr: string }): string {
     parts.push(`stderr: ${result.stderr.trim().slice(0, 500)}`);
   }
   return parts.length > 0 ? parts.join("\n") : "(no output)";
-}
-
-function extractErrorDetail(error: ExecFileError): string {
-  const output = [error.stderr, error.stdout]
-    .filter((value) => value && value.trim().length > 0)
-    .join("\n");
-  const lines = output
-    .split("\n")
-    .map((line) => line.trim())
-    .filter(
-      (line) =>
-        line.length > 0 &&
-        !line.startsWith("at ") &&
-        !line.startsWith("DeprecationWarning") &&
-        !line.includes("--trace-deprecation"),
-    )
-    .slice(0, 5);
-  return lines.length > 0 ? lines.join("\n") : error.message;
 }

@@ -31,6 +31,16 @@ export class Config {
   public QODER_CLI: string;
   public QODER_AUTH_CHECK: string;
 
+  // Git and GitHub integration
+  public GIT_USER_NAME: string;
+  public GIT_USER_EMAIL: string;
+  public GITHUB_TOKEN: string;
+  public GIT_SSH_PRIVATE_KEY: string;
+  public GIT_SSH_SIGNING: string;
+  public GIT_GPG_PRIVATE_KEY: string;
+  public GIT_GPG_KEY_ID: string;
+  public GIT_GPG_PASSPHRASE: string;
+
   // OpenTelemetry
   public OPENTELEMETRY_COLLECTOR_HTTP_TRACES: string;
   public OPENTELEMETRY_COLLECTOR_HTTP_METRICS: string;
@@ -67,6 +77,15 @@ export class Config {
 
     this.QODER_CLI = "qoder";
     this.QODER_AUTH_CHECK = "true";
+
+    this.GIT_USER_NAME = "planner-llm-agent";
+    this.GIT_USER_EMAIL = "planner-llm-agent@users.noreply.github.com";
+    this.GITHUB_TOKEN = "";
+    this.GIT_SSH_PRIVATE_KEY = "";
+    this.GIT_SSH_SIGNING = "false";
+    this.GIT_GPG_PRIVATE_KEY = "";
+    this.GIT_GPG_KEY_ID = "";
+    this.GIT_GPG_PASSPHRASE = "";
 
     this.OPENTELEMETRY_COLLECTOR_HTTP_TRACES = "";
     this.OPENTELEMETRY_COLLECTOR_HTTP_METRICS = "";
@@ -109,6 +128,30 @@ export class Config {
     }
     if (config.QODER_AUTH_CHECK) {
       this.QODER_AUTH_CHECK = config.QODER_AUTH_CHECK as string;
+    }
+    if (config.GIT_USER_NAME) {
+      this.GIT_USER_NAME = config.GIT_USER_NAME as string;
+    }
+    if (config.GIT_USER_EMAIL) {
+      this.GIT_USER_EMAIL = config.GIT_USER_EMAIL as string;
+    }
+    if (config.GITHUB_TOKEN) {
+      this.GITHUB_TOKEN = config.GITHUB_TOKEN as string;
+    }
+    if (config.GIT_SSH_PRIVATE_KEY) {
+      this.GIT_SSH_PRIVATE_KEY = config.GIT_SSH_PRIVATE_KEY as string;
+    }
+    if (config.GIT_SSH_SIGNING) {
+      this.GIT_SSH_SIGNING = config.GIT_SSH_SIGNING as string;
+    }
+    if (config.GIT_GPG_PRIVATE_KEY) {
+      this.GIT_GPG_PRIVATE_KEY = config.GIT_GPG_PRIVATE_KEY as string;
+    }
+    if (config.GIT_GPG_KEY_ID) {
+      this.GIT_GPG_KEY_ID = config.GIT_GPG_KEY_ID as string;
+    }
+    if (config.GIT_GPG_PASSPHRASE) {
+      this.GIT_GPG_PASSPHRASE = config.GIT_GPG_PASSPHRASE as string;
     }
 
     if (config.OPENTELEMETRY_COLLECTOR_HTTP_TRACES) {
@@ -160,6 +203,30 @@ export class Config {
     }
     if (process.env.QODER_AUTH_CHECK) {
       this.QODER_AUTH_CHECK = process.env.QODER_AUTH_CHECK;
+    }
+    if (process.env.GIT_USER_NAME) {
+      this.GIT_USER_NAME = process.env.GIT_USER_NAME;
+    }
+    if (process.env.GIT_USER_EMAIL) {
+      this.GIT_USER_EMAIL = process.env.GIT_USER_EMAIL;
+    }
+    if (process.env.GITHUB_TOKEN) {
+      this.GITHUB_TOKEN = process.env.GITHUB_TOKEN;
+    }
+    if (process.env.GIT_SSH_PRIVATE_KEY) {
+      this.GIT_SSH_PRIVATE_KEY = process.env.GIT_SSH_PRIVATE_KEY;
+    }
+    if (process.env.GIT_SSH_SIGNING) {
+      this.GIT_SSH_SIGNING = process.env.GIT_SSH_SIGNING;
+    }
+    if (process.env.GIT_GPG_PRIVATE_KEY) {
+      this.GIT_GPG_PRIVATE_KEY = process.env.GIT_GPG_PRIVATE_KEY;
+    }
+    if (process.env.GIT_GPG_KEY_ID) {
+      this.GIT_GPG_KEY_ID = process.env.GIT_GPG_KEY_ID;
+    }
+    if (process.env.GIT_GPG_PASSPHRASE) {
+      this.GIT_GPG_PASSPHRASE = process.env.GIT_GPG_PASSPHRASE;
     }
     if (process.env.OPENTELEMETRY_COLLECTOR_HTTP_TRACES) {
       this.OPENTELEMETRY_COLLECTOR_HTTP_TRACES =

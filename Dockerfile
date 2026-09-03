@@ -14,7 +14,8 @@ FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Basic development essentials
+# Basic development essentials (including Git and GitHub tooling: git, gh,
+# gnupg for commit signing and openssh-client for SSH authentication)
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
       bash \
@@ -22,8 +23,10 @@ RUN apt-get update && \
       ca-certificates \
       curl \
       git \
+      gnupg \
       gzip \
       jq \
+      openssh-client \
       perl \
       python3 \
       unzip \

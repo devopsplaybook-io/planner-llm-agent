@@ -1,6 +1,7 @@
 import { watchFile } from "fs-extra";
 import { Agent } from "./Agent";
 import { Config } from "./Config";
+import { GitEnvironment } from "./GitEnvironment";
 import { OTelInit, OTelLogger, OTelTracer } from "./OTelContext";
 import { QoderClient } from "./QoderClient";
 
@@ -51,6 +52,15 @@ Promise.resolve().then(async () => {
 
   const span = OTelTracer().startSpan("init");
   span.end();
+
+  // Prepare the Git and GitHub environment (authentication, signing keys)
+  const gitEnvironment = new GitEnvironment(config);
+  try {
+    await gitEnvironment.prepare();
+  } catch (error) {
+    logger.error("Git environment preparation failed", error as Error);
+    process.exit(1);
+  }
 
   // Check Qoder authentication
   if (config.QODER_AUTH_CHECK === "true" || config.QODER_AUTH_CHECK === "1") {
