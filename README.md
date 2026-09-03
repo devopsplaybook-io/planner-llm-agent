@@ -52,6 +52,15 @@ All Git and GitHub settings are optional: the agent automatically prepares the e
 
 Multi-line values (SSH and GPG keys) can be provided either with real newlines or with literal `\n` escape sequences.
 
+### Agent config repository
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `AGENT_CONFIG_REPOSITORY` | (empty) | Git URL of the agent config repository (empty disables the feature) |
+| `AGENT_CONFIG_BRANCH` | `main` | Branch to sync |
+| `AGENT_CONFIG_FOLDER` | (empty) | Only sync this folder of the repository (sparse checkout) |
+| `AGENT_CONFIG_SYNC_INTERVAL` | `300` | Seconds between refreshes of the local copy |
+
 ## Git and GitHub authentication
 
 ### Personal Access Token (recommended)
@@ -89,6 +98,27 @@ When deployed with Flux (see `didier-home`), these values are provided as enviro
   "GIT_USER_NAME": "planner-agent",
   "GIT_USER_EMAIL": "agent@users.noreply.github.com",
   "GIT_SSH_PRIVATE_KEY": "-----BEGIN OPENSSH PRIVATE KEY-----\n...\n-----END OPENSSH PRIVATE KEY-----\n"
+}
+```
+
+## Agent config repository
+
+Skills, configuration files and other resources the agent should use are defined in a dedicated Git repository (the *agent config repository*). The agent clones it at startup, keeps a local copy under `/data/agent-config` (`/data/agent-config/<folder>` when `AGENT_CONFIG_FOLDER` is set) and refreshes it every `AGENT_CONFIG_SYNC_INTERVAL` seconds.
+
+- The startup clone fails fast: the agent does not start when the repository cannot be cloned.
+- A failed periodic refresh keeps the last synced copy and only logs an error.
+- The working tree is forced to match the remote branch on every refresh, so the local copy is always a faithful mirror of the repository.
+- Authentication uses the Git and GitHub settings above (GitHub token or SSH key); public repositories need no authentication.
+- Every task prompt tells the agent where the configuration is synced, so skills and resources are directly usable during task execution.
+
+Example:
+
+```json
+{
+  "AGENT_CONFIG_REPOSITORY": "https://github.com/acme/agent-config.git",
+  "AGENT_CONFIG_BRANCH": "main",
+  "AGENT_CONFIG_FOLDER": "config",
+  "AGENT_CONFIG_SYNC_INTERVAL": 300
 }
 ```
 

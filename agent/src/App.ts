@@ -1,5 +1,6 @@
 import { watchFile } from "fs-extra";
 import { Agent } from "./Agent";
+import { AgentConfigRepository } from "./AgentConfigRepository";
 import { Config } from "./Config";
 import { GitEnvironment } from "./GitEnvironment";
 import { OTelInit, OTelLogger, OTelTracer } from "./OTelContext";
@@ -60,6 +61,32 @@ Promise.resolve().then(async () => {
   } catch (error) {
     logger.error("Git environment preparation failed", error as Error);
     process.exit(1);
+  }
+
+  // Sync the agent config repository (skills, configuration files, resources)
+  const agentConfigRepository = new AgentConfigRepository(config);
+  if (agentConfigRepository.isEnabled()) {
+    // Fail fast when the configured repository cannot be cloned: the agent
+    // would otherwise run with missing skills or configuration.
+    try {
+      await agentConfigRepository.sync();
+    } catch (error) {
+      logger.error("Agent config repository sync failed", error as Error);
+      process.exit(1);
+    }
+    // Refresh the local copy periodically; a failed refresh keeps the last
+    // synced copy and is logged, but never stops the agent.
+    const configSyncTimer = setInterval(() => {
+      void agentConfigRepository.sync().catch((error: Error) => {
+        logger.error(
+          "Agent config repository refresh failed (keeping the last synced copy)",
+          error,
+        );
+      });
+    }, config.AGENT_CONFIG_SYNC_INTERVAL * 1000);
+    configSyncTimer.unref();
+  } else {
+    logger.info("Agent config repository not configured");
   }
 
   // Check Qoder authentication

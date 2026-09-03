@@ -41,6 +41,12 @@ export class Config {
   public GIT_GPG_KEY_ID: string;
   public GIT_GPG_PASSPHRASE: string;
 
+  // Agent config repository
+  public AGENT_CONFIG_REPOSITORY: string;
+  public AGENT_CONFIG_BRANCH: string;
+  public AGENT_CONFIG_FOLDER: string;
+  public AGENT_CONFIG_SYNC_INTERVAL: number;
+
   // OpenTelemetry
   public OPENTELEMETRY_COLLECTOR_HTTP_TRACES: string;
   public OPENTELEMETRY_COLLECTOR_HTTP_METRICS: string;
@@ -86,6 +92,11 @@ export class Config {
     this.GIT_GPG_PRIVATE_KEY = "";
     this.GIT_GPG_KEY_ID = "";
     this.GIT_GPG_PASSPHRASE = "";
+
+    this.AGENT_CONFIG_REPOSITORY = "";
+    this.AGENT_CONFIG_BRANCH = "main";
+    this.AGENT_CONFIG_FOLDER = "";
+    this.AGENT_CONFIG_SYNC_INTERVAL = 300;
 
     this.OPENTELEMETRY_COLLECTOR_HTTP_TRACES = "";
     this.OPENTELEMETRY_COLLECTOR_HTTP_METRICS = "";
@@ -152,6 +163,20 @@ export class Config {
     }
     if (config.GIT_GPG_PASSPHRASE) {
       this.GIT_GPG_PASSPHRASE = config.GIT_GPG_PASSPHRASE as string;
+    }
+
+    if (config.AGENT_CONFIG_REPOSITORY) {
+      this.AGENT_CONFIG_REPOSITORY = config.AGENT_CONFIG_REPOSITORY as string;
+    }
+    if (config.AGENT_CONFIG_BRANCH) {
+      this.AGENT_CONFIG_BRANCH = config.AGENT_CONFIG_BRANCH as string;
+    }
+    if (config.AGENT_CONFIG_FOLDER) {
+      this.AGENT_CONFIG_FOLDER = config.AGENT_CONFIG_FOLDER as string;
+    }
+    if (config.AGENT_CONFIG_SYNC_INTERVAL) {
+      this.AGENT_CONFIG_SYNC_INTERVAL =
+        config.AGENT_CONFIG_SYNC_INTERVAL as number;
     }
 
     if (config.OPENTELEMETRY_COLLECTOR_HTTP_TRACES) {
@@ -228,6 +253,20 @@ export class Config {
     if (process.env.GIT_GPG_PASSPHRASE) {
       this.GIT_GPG_PASSPHRASE = process.env.GIT_GPG_PASSPHRASE;
     }
+    if (process.env.AGENT_CONFIG_REPOSITORY) {
+      this.AGENT_CONFIG_REPOSITORY = process.env.AGENT_CONFIG_REPOSITORY;
+    }
+    if (process.env.AGENT_CONFIG_BRANCH) {
+      this.AGENT_CONFIG_BRANCH = process.env.AGENT_CONFIG_BRANCH;
+    }
+    if (process.env.AGENT_CONFIG_FOLDER) {
+      this.AGENT_CONFIG_FOLDER = process.env.AGENT_CONFIG_FOLDER;
+    }
+    if (process.env.AGENT_CONFIG_SYNC_INTERVAL) {
+      this.AGENT_CONFIG_SYNC_INTERVAL = parseInt(
+        process.env.AGENT_CONFIG_SYNC_INTERVAL,
+      );
+    }
     if (process.env.OPENTELEMETRY_COLLECTOR_HTTP_TRACES) {
       this.OPENTELEMETRY_COLLECTOR_HTTP_TRACES =
         process.env.OPENTELEMETRY_COLLECTOR_HTTP_TRACES;
@@ -272,6 +311,22 @@ export class Config {
       errors.push(
         `TASK_POLLING_INTERVAL must be a positive integer (current value: '${this.TASK_POLLING_INTERVAL}')`,
       );
+    }
+
+    if (this.AGENT_CONFIG_REPOSITORY.trim().length > 0) {
+      if (this.AGENT_CONFIG_BRANCH.trim().length === 0) {
+        errors.push(
+          "AGENT_CONFIG_BRANCH must not be empty when AGENT_CONFIG_REPOSITORY is set",
+        );
+      }
+      if (
+        !Number.isInteger(this.AGENT_CONFIG_SYNC_INTERVAL) ||
+        this.AGENT_CONFIG_SYNC_INTERVAL <= 0
+      ) {
+        errors.push(
+          `AGENT_CONFIG_SYNC_INTERVAL must be a positive integer (current value: '${this.AGENT_CONFIG_SYNC_INTERVAL}')`,
+        );
+      }
     }
 
     return errors;

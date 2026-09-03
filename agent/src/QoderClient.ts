@@ -1,6 +1,7 @@
 import * as fse from "fs-extra";
 import * as path from "path";
 import { Config } from "./Config";
+import { getAgentConfigContentPath } from "./AgentConfigRepository";
 import { ExecFileError, extractErrorDetail, runCli } from "./CliUtils";
 import { OTelLogger, OTelTracer } from "./OTelContext";
 import { PlannerTask } from "./PlannerClient";
@@ -73,15 +74,23 @@ export class QoderClient {
       } catch {
         // Non-fatal: qoder overwrites the file anyway.
       }
-      const prompt = [
+      const promptLines = [
         "You are an autonomous agent working on an assigned task.",
         `Task documentation file: ${notesFile}`,
         "Read the documentation file first: it contains the task description and all comments.",
         "Git and the GitHub CLI (gh) are already configured with authentication for Git and GitHub operations.",
+      ];
+      if (this.config.AGENT_CONFIG_REPOSITORY.trim().length > 0) {
+        promptLines.push(
+          `Agent configuration (skills, configuration files and other resources) is synced locally at: ${getAgentConfigContentPath(this.config)}. Use it whenever it is relevant to the task.`,
+        );
+      }
+      promptLines.push(
         "1. Perform the task described in the documentation file.",
         '2. Keep the "Agent Notes" section of the documentation file updated with what you did and learned, so future runs know the state of the task.',
         `3. Write a concise summary of what has been done to the file: ${summaryFile}. The summary will be posted as a comment on the task.`,
-      ].join("\n");
+      );
+      const prompt = promptLines.join("\n");
       const result = await runCli(
         this.config.QODER_CLI,
         [
