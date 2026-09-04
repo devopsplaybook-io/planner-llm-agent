@@ -34,6 +34,24 @@ Configuration values are resolved with the following priority:
 | --- | --- | --- |
 | `QODER_CLI` | `qoder` | Qoder CLI command |
 | `QODER_AUTH_CHECK` | `true` | Verify Qoder authentication at startup (fail fast) |
+| `QODER_MODEL` | (empty) | Default model passed to the Qoder CLI (`--model`); empty uses the CLI default |
+
+### Model selection
+
+The model used for a task is resolved with the following priority:
+
+1. A `qoder-model: <model>` line in the task description (per-task override)
+2. The `QODER_MODEL` configuration value (default model)
+3. The Qoder CLI default model (when neither is set)
+
+Example task description requesting a specific model:
+
+```
+Fix the failing unit tests in the payment module and update the documentation.
+qoder-model: claude-sonnet-4-5
+```
+
+When `QODER_MODEL` is set, the startup authentication probe also runs with that model, so a misconfigured model fails fast at startup instead of on the first task.
 
 ### Git and GitHub
 

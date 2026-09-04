@@ -22,12 +22,18 @@ export class QoderClient {
   public async checkAuthentication(): Promise<void> {
     const span = OTelTracer().startSpan("qoder-client.check-authentication");
     let result: { stdout: string; stderr: string };
+    // Apply the default model to the probe too, so a misconfigured model
+    // fails fast at startup instead of on the first task.
+    const args = ["-p", PROBE_PROMPT];
+    if (this.config.QODER_MODEL.trim().length > 0) {
+      args.push("--model", this.config.QODER_MODEL.trim());
+    }
+    args.push("--output-format", "json");
     try {
-      result = await runCli(
-        this.config.QODER_CLI,
-        ["-p", PROBE_PROMPT, "--output-format", "json"],
-        { timeout: AUTH_CHECK_TIMEOUT_MS, windowsHide: true },
-      );
+      result = await runCli(this.config.QODER_CLI, args, {
+        timeout: AUTH_CHECK_TIMEOUT_MS,
+        windowsHide: true,
+      });
     } catch (error) {
       const execError = error as ExecFileError;
       span.recordException(execError);
@@ -91,23 +97,24 @@ export class QoderClient {
         `3. Write a concise summary of what has been done to the file: ${summaryFile}. The summary will be posted as a comment on the task.`,
       );
       const prompt = promptLines.join("\n");
-      const result = await runCli(
-        this.config.QODER_CLI,
-        [
-          "-p",
-          prompt,
-          "--output-format",
-          "json",
-          "--permission-mode",
-          "bypass_permissions",
-        ],
-        {
-          timeout: TASK_TIMEOUT_MS,
-          windowsHide: true,
-          cwd: path.dirname(notesFile),
-          maxBuffer: 10 * 1024 * 1024,
-        },
+      const args = ["-p", prompt];
+      const model = resolveModel(task, this.config.QODER_MODEL);
+      if (model !== null) {
+        logger.info(`Qoder model: ${model.model} (from ${model.source})`);
+        args.push("--model", model.model);
+      }
+      args.push(
+        "--output-format",
+        "json",
+        "--permission-mode",
+        "bypass_permissions",
       );
+      const result = await runCli(this.config.QODER_CLI, args, {
+        timeout: TASK_TIMEOUT_MS,
+        windowsHide: true,
+        cwd: path.dirname(notesFile),
+        maxBuffer: 10 * 1024 * 1024,
+      });
       // Prefer the summary file qoder was asked to write, then the JSON
       // response field, then the raw stdout as a last resort.
       let summary = "";
@@ -177,6 +184,29 @@ function getSummaryFile(notesFile: string): string {
     return `${notesFile.slice(0, -"-Agent.md".length)}-Agent-Summary.md`;
   }
   return `${notesFile}-Summary.md`;
+}
+
+// The model is resolved with the task description taking priority over the
+// configured default: a task can request a specific model with a
+// 'qoder-model: <model>' line in its description.
+function resolveModel(
+  task: PlannerTask,
+  defaultModel: string,
+): { model: string; source: string } | null {
+  const fromTask = extractTaskModel(task.description);
+  if (fromTask !== null) {
+    return { model: fromTask, source: "task description" };
+  }
+  const trimmed = defaultModel.trim();
+  if (trimmed.length > 0) {
+    return { model: trimmed, source: "default" };
+  }
+  return null;
+}
+
+function extractTaskModel(description: string): string | null {
+  const match = description.match(/^\s*qoder-model:\s*(\S+)/im);
+  return match ? match[1] : null;
 }
 
 function extractJsonResponse(stdout: string): string | null {

@@ -74,6 +74,31 @@ describe("QoderClient", () => {
     expect(options).toMatchObject({ timeout: 120000 });
   });
 
+  it("should use the default model for the authentication probe", async () => {
+    config.QODER_MODEL = "claude-sonnet-4-5";
+    mockExecFile.mockImplementation(
+      (
+        _command: string,
+        _args: string[],
+        _options: unknown,
+        callback: (error: Error | null, stdout: string, stderr: string) => void,
+      ) => callback(null, JSON.stringify({ response: "OK" }), ""),
+    );
+
+    const client = new QoderClient(config);
+    await expect(client.checkAuthentication()).resolves.toBeUndefined();
+
+    const [, args] = mockExecFile.mock.calls[0];
+    expect(args).toEqual([
+      "-p",
+      "Reply with exactly: OK",
+      "--model",
+      "claude-sonnet-4-5",
+      "--output-format",
+      "json",
+    ]);
+  });
+
   it("should fail authentication when the probe reply is missing", async () => {
     mockExecFile.mockImplementation(
       (
@@ -220,6 +245,107 @@ describe("QoderClient", () => {
     );
 
     expect(summary).toBe("Implemented the feature");
+  });
+
+  it("should run the task with the model requested in the task description", async () => {
+    mockExecFile.mockImplementation(
+      (
+        _command: string,
+        _args: string[],
+        _options: unknown,
+        callback: (error: Error | null, stdout: string, stderr: string) => void,
+      ) => callback(null, JSON.stringify({ result: "Done" }), ""),
+    );
+
+    const client = new QoderClient(config);
+    await client.performTask(
+      {
+        id: "task-1",
+        title: "Implement feature",
+        status: "To Do",
+        description: "Add a feature\nqoder-model: claude-opus-4-1\n",
+        comments: [],
+      },
+      path.join(os.tmpdir(), "qoder-spec", "task-1-Agent.md"),
+    );
+
+    const [, args] = mockExecFile.mock.calls[0];
+    expect(args.slice(-6)).toEqual([
+      "--model",
+      "claude-opus-4-1",
+      "--output-format",
+      "json",
+      "--permission-mode",
+      "bypass_permissions",
+    ]);
+  });
+
+  it("should run the task with the default model when the description has no request", async () => {
+    config.QODER_MODEL = "claude-sonnet-4-5";
+    mockExecFile.mockImplementation(
+      (
+        _command: string,
+        _args: string[],
+        _options: unknown,
+        callback: (error: Error | null, stdout: string, stderr: string) => void,
+      ) => callback(null, JSON.stringify({ result: "Done" }), ""),
+    );
+
+    const client = new QoderClient(config);
+    await client.performTask(
+      {
+        id: "task-1",
+        title: "Implement feature",
+        status: "To Do",
+        description: "Add a feature",
+        comments: [],
+      },
+      path.join(os.tmpdir(), "qoder-spec", "task-1-Agent.md"),
+    );
+
+    const [, args] = mockExecFile.mock.calls[0];
+    expect(args.slice(-6)).toEqual([
+      "--model",
+      "claude-sonnet-4-5",
+      "--output-format",
+      "json",
+      "--permission-mode",
+      "bypass_permissions",
+    ]);
+  });
+
+  it("should prioritize the task description model over the default model", async () => {
+    config.QODER_MODEL = "claude-sonnet-4-5";
+    mockExecFile.mockImplementation(
+      (
+        _command: string,
+        _args: string[],
+        _options: unknown,
+        callback: (error: Error | null, stdout: string, stderr: string) => void,
+      ) => callback(null, JSON.stringify({ result: "Done" }), ""),
+    );
+
+    const client = new QoderClient(config);
+    await client.performTask(
+      {
+        id: "task-1",
+        title: "Implement feature",
+        status: "To Do",
+        description: "Add a feature\nQoder-Model: claude-opus-4-1",
+        comments: [],
+      },
+      path.join(os.tmpdir(), "qoder-spec", "task-1-Agent.md"),
+    );
+
+    const [, args] = mockExecFile.mock.calls[0];
+    expect(args.slice(-6)).toEqual([
+      "--model",
+      "claude-opus-4-1",
+      "--output-format",
+      "json",
+      "--permission-mode",
+      "bypass_permissions",
+    ]);
   });
 
   it("should accept the probe reply from the json result field", async () => {
