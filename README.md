@@ -53,6 +53,17 @@ qoder-model: claude-sonnet-4-5
 
 When `QODER_MODEL` is set, the startup authentication probe also runs with that model, so a misconfigured model fails fast at startup instead of on the first task.
 
+### Task execution report
+
+Every task comment posted to Planner ends with a footer that displays the model used and the qoder account credits before and after the task execution:
+
+```
+---
+Model: claude-sonnet-4-5 · Qoder credits: 16.41 -> 16.35
+```
+
+The credit balance comes from the qoder CLI JSON output (`total_credits`) and is persisted in `<DATA_DIR>/qoder-credits.json` — captured at startup by the authentication probe and after each task — so the next task can display the "before" value. The model is displayed as `auto` when no model is configured for the task, and values not reported by the CLI are shown as `unknown`.
+
 ### Git and GitHub
 
 All Git and GitHub settings are optional: the agent automatically prepares the environment based on what is configured, and skips the setup entirely when none of `GITHUB_TOKEN`, `GIT_SSH_PRIVATE_KEY` or `GIT_GPG_PRIVATE_KEY` is provided. The environment is prepared at startup, before the first task runs, and any invalid value makes the agent fail fast with a clear message.

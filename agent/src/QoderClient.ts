@@ -64,6 +64,13 @@ export class QoderClient {
         `Qoder authentication probe did not return the expected reply. CLI output:\n${formatCliOutput(result)}`,
       );
     }
+    // Capture the account credit balance reported by the probe so the first
+    // task can display the "before" value.
+    const credits = extractCredits(result.stdout);
+    if (credits !== null) {
+      await writeCredits(this.config, credits);
+      logger.info(`Qoder credits at startup: ${formatCredits(credits)}`);
+    }
   }
 
   public async performTask(
@@ -109,12 +116,19 @@ export class QoderClient {
         "--permission-mode",
         "bypass_permissions",
       );
+      const creditsBefore = await readCredits(this.config);
+      logger.info(`Qoder credits before task: ${formatCredits(creditsBefore)}`);
       const result = await runCli(this.config.QODER_CLI, args, {
         timeout: TASK_TIMEOUT_MS,
         windowsHide: true,
         cwd: path.dirname(notesFile),
         maxBuffer: 10 * 1024 * 1024,
       });
+      const creditsAfter = extractCredits(result.stdout);
+      if (creditsAfter !== null) {
+        await writeCredits(this.config, creditsAfter);
+      }
+      logger.info(`Qoder credits after task: ${formatCredits(creditsAfter)}`);
       // Prefer the summary file qoder was asked to write, then the JSON
       // response field, then the raw stdout as a last resort.
       let summary = "";
@@ -148,12 +162,16 @@ export class QoderClient {
         if (result.stderr.trim().length > 0) {
           logger.error(`Qoder stderr: ${result.stderr.trim().slice(0, 500)}`);
         }
-        return "Task executed (no output returned by Qoder)";
+        const emptyFooter = buildFooter(model, creditsBefore, creditsAfter);
+        return emptyFooter.length > 0
+          ? emptyFooter
+          : "Task executed (no output returned by Qoder)";
       }
       logger.info(
         `Qoder summary captured from ${source} (${summary.length} chars)`,
       );
-      return summary;
+      const footer = buildFooter(model, creditsBefore, creditsAfter);
+      return footer.length > 0 ? `${summary}\n\n${footer}` : summary;
     } catch (error) {
       const execError = error as ExecFileError;
       span.recordException(execError);
@@ -209,7 +227,57 @@ function extractTaskModel(description: string): string | null {
   return match ? match[1] : null;
 }
 
-function extractJsonResponse(stdout: string): string | null {
+// The qoder account credit balance is persisted so each task can display
+// the balance before and after its execution.
+function getCreditsFile(config: Config): string {
+  return path.join(config.DATA_DIR, "qoder-credits.json");
+}
+
+async function readCredits(config: Config): Promise<number | null> {
+  try {
+    const content = await fse.readJson(getCreditsFile(config));
+    const credits = content?.credits;
+    return typeof credits === "number" && Number.isFinite(credits)
+      ? credits
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+async function writeCredits(config: Config, credits: number): Promise<void> {
+  try {
+    await fse.outputJson(getCreditsFile(config), { credits });
+  } catch {
+    // Non-fatal: the credits display is best-effort.
+  }
+}
+
+function formatCredits(credits: number | null): string {
+  return credits !== null ? credits.toFixed(2) : "unknown";
+}
+
+// The footer appended to every task comment displays the model used and the
+// qoder account credits before and after the task execution.
+function buildFooter(
+  model: { model: string; source: string } | null,
+  creditsBefore: number | null,
+  creditsAfter: number | null,
+): string {
+  const creditsKnown = creditsBefore !== null || creditsAfter !== null;
+  if (model === null && !creditsKnown) {
+    return "";
+  }
+  const parts = [`Model: ${model !== null ? model.model : "auto"}`];
+  if (creditsKnown) {
+    parts.push(
+      `Qoder credits: ${formatCredits(creditsBefore)} -> ${formatCredits(creditsAfter)}`,
+    );
+  }
+  return `---\n${parts.join(" · ")}`;
+}
+
+function parseJsonEnvelope(stdout: string): Record<string, unknown> | null {
   const trimmed = stdout.trim();
   if (!trimmed.includes("{")) {
     return null;
@@ -224,23 +292,40 @@ function extractJsonResponse(stdout: string): string | null {
   }
   for (const candidate of candidates) {
     try {
-      const parsed = JSON.parse(candidate) as {
-        result?: unknown;
-        response?: unknown;
-      };
-      // The qoder CLI reports the reply in the 'result' field; 'response'
-      // is kept for compatibility with older CLI versions.
-      for (const field of ["result", "response"]) {
-        const value = parsed[field];
-        if (typeof value === "string" && value.trim().length > 0) {
-          return value.trim();
-        }
+      const parsed: unknown = JSON.parse(candidate);
+      if (parsed !== null && typeof parsed === "object") {
+        return parsed as Record<string, unknown>;
       }
     } catch {
       // Try the next candidate.
     }
   }
   return null;
+}
+
+function extractJsonResponse(stdout: string): string | null {
+  const parsed = parseJsonEnvelope(stdout);
+  if (parsed === null) {
+    return null;
+  }
+  // The qoder CLI reports the reply in the 'result' field; 'response' is
+  // kept for compatibility with older CLI versions.
+  for (const field of ["result", "response"]) {
+    const value = parsed[field];
+    if (typeof value === "string" && value.trim().length > 0) {
+      return value.trim();
+    }
+  }
+  return null;
+}
+
+function extractCredits(stdout: string): number | null {
+  const parsed = parseJsonEnvelope(stdout);
+  if (parsed === null) {
+    return null;
+  }
+  const value = parsed.total_credits;
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
 function formatCliOutput(result: { stdout: string; stderr: string }): string {

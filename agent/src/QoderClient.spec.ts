@@ -36,6 +36,7 @@ describe("QoderClient", () => {
     delete process.env.QODER_CLI;
     config = new Config();
     config.QODER_CLI = "qoder";
+    config.DATA_DIR = path.join(os.tmpdir(), "qoder-spec", "data");
     mockExecFile.mockReset();
   });
 
@@ -97,6 +98,33 @@ describe("QoderClient", () => {
       "--output-format",
       "json",
     ]);
+  });
+
+  it("should capture the account credits from the authentication probe", async () => {
+    mockExecFile.mockImplementation(
+      (
+        _command: string,
+        _args: string[],
+        _options: unknown,
+        callback: (error: Error | null, stdout: string, stderr: string) => void,
+      ) =>
+        callback(
+          null,
+          JSON.stringify({ response: "OK", total_credits: 16.41 }),
+          "",
+        ),
+    );
+
+    const client = new QoderClient(config);
+    await expect(client.checkAuthentication()).resolves.toBeUndefined();
+
+    const creditsFile = path.join(
+      os.tmpdir(),
+      "qoder-spec",
+      "data",
+      "qoder-credits.json",
+    );
+    expect(await fse.readJson(creditsFile)).toEqual({ credits: 16.41 });
   });
 
   it("should fail authentication when the probe reply is missing", async () => {
@@ -346,6 +374,77 @@ describe("QoderClient", () => {
       "--permission-mode",
       "bypass_permissions",
     ]);
+  });
+
+  it("should append the model and credits footer to the task summary", async () => {
+    const dataDir = path.join(os.tmpdir(), "qoder-spec", "data");
+    await fse.outputJson(path.join(dataDir, "qoder-credits.json"), {
+      credits: 16.41,
+    });
+    mockExecFile.mockImplementation(
+      (
+        _command: string,
+        _args: string[],
+        _options: unknown,
+        callback: (error: Error | null, stdout: string, stderr: string) => void,
+      ) =>
+        callback(
+          null,
+          JSON.stringify({ result: "Done", total_credits: 16.35 }),
+          "",
+        ),
+    );
+
+    const client = new QoderClient(config);
+    const summary = await client.performTask(
+      {
+        id: "task-1",
+        title: "Implement feature",
+        status: "To Do",
+        description: "Add a feature\nqoder-model: claude-opus-4-1",
+        comments: [],
+      },
+      path.join(os.tmpdir(), "qoder-spec", "task-1-Agent.md"),
+    );
+
+    expect(summary).toBe(
+      "Done\n\n---\nModel: claude-opus-4-1 · Qoder credits: 16.41 -> 16.35",
+    );
+    expect(await fse.readJson(path.join(dataDir, "qoder-credits.json"))).toEqual(
+      { credits: 16.35 },
+    );
+  });
+
+  it("should display the auto model and unknown previous credits on the first task", async () => {
+    mockExecFile.mockImplementation(
+      (
+        _command: string,
+        _args: string[],
+        _options: unknown,
+        callback: (error: Error | null, stdout: string, stderr: string) => void,
+      ) =>
+        callback(
+          null,
+          JSON.stringify({ result: "Done", total_credits: 16.35 }),
+          "",
+        ),
+    );
+
+    const client = new QoderClient(config);
+    const summary = await client.performTask(
+      {
+        id: "task-1",
+        title: "Implement feature",
+        status: "To Do",
+        description: "Add a feature",
+        comments: [],
+      },
+      path.join(os.tmpdir(), "qoder-spec", "task-1-Agent.md"),
+    );
+
+    expect(summary).toBe(
+      "Done\n\n---\nModel: auto · Qoder credits: unknown -> 16.35",
+    );
   });
 
   it("should accept the probe reply from the json result field", async () => {
