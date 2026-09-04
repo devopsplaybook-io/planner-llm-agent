@@ -181,19 +181,36 @@ function getSummaryFile(notesFile: string): string {
 
 function extractJsonResponse(stdout: string): string | null {
   const trimmed = stdout.trim();
-  if (!trimmed.startsWith("{")) {
+  if (!trimmed.includes("{")) {
     return null;
   }
-  try {
-    const parsed = JSON.parse(trimmed) as { response?: unknown };
-    if (typeof parsed.response === "string") {
-      return parsed.response.trim();
+  // The CLI may print extra lines around the JSON envelope, so also try the
+  // slice between the outermost braces.
+  const candidates = [trimmed];
+  const start = trimmed.indexOf("{");
+  const end = trimmed.lastIndexOf("}");
+  if (start >= 0 && end > start) {
+    candidates.push(trimmed.slice(start, end + 1));
+  }
+  for (const candidate of candidates) {
+    try {
+      const parsed = JSON.parse(candidate) as {
+        result?: unknown;
+        response?: unknown;
+      };
+      // The qoder CLI reports the reply in the 'result' field; 'response'
+      // is kept for compatibility with older CLI versions.
+      for (const field of ["result", "response"]) {
+        const value = parsed[field];
+        if (typeof value === "string" && value.trim().length > 0) {
+          return value.trim();
+        }
+      }
+    } catch {
+      // Try the next candidate.
     }
-    return null;
-  } catch {
-    // Not JSON - treat the output as plain text.
-    return null;
   }
+  return null;
 }
 
 function formatCliOutput(result: { stdout: string; stderr: string }): string {

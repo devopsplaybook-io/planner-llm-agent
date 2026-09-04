@@ -222,6 +222,102 @@ describe("QoderClient", () => {
     expect(summary).toBe("Implemented the feature");
   });
 
+  it("should accept the probe reply from the json result field", async () => {
+    mockExecFile.mockImplementation(
+      (
+        _command: string,
+        _args: string[],
+        _options: unknown,
+        callback: (error: Error | null, stdout: string, stderr: string) => void,
+      ) =>
+        callback(
+          null,
+          JSON.stringify({
+            type: "result",
+            subtype: "success",
+            is_error: false,
+            result: "OK",
+          }),
+          "",
+        ),
+    );
+
+    const client = new QoderClient(config);
+    await expect(client.checkAuthentication()).resolves.toBeUndefined();
+  });
+
+  it("should fall back to the json result field when qoder does not write a summary file", async () => {
+    mockExecFile.mockImplementation(
+      (
+        _command: string,
+        _args: string[],
+        _options: unknown,
+        callback: (error: Error | null, stdout: string, stderr: string) => void,
+      ) =>
+        callback(
+          null,
+          JSON.stringify({
+            type: "result",
+            subtype: "success",
+            duration_ms: 118561,
+            is_error: false,
+            num_turns: 21,
+            result:
+              "Documented eight prioritized skill recommendations in the task's Agent Notes.",
+            stop_reason: "end_turn",
+            session_id: "2e853ece-ff3b-42b4-8e2d-61a9fee59f3e",
+          }),
+          "",
+        ),
+    );
+
+    const client = new QoderClient(config);
+    const summary = await client.performTask(
+      {
+        id: "task-1",
+        title: "Suggest skills",
+        status: "To Do",
+        description: "",
+        comments: [],
+      },
+      path.join(os.tmpdir(), "qoder-spec", "task-1-Agent.md"),
+    );
+
+    expect(summary).toBe(
+      "Documented eight prioritized skill recommendations in the task's Agent Notes.",
+    );
+  });
+
+  it("should extract the reply when the json envelope is surrounded by other output", async () => {
+    mockExecFile.mockImplementation(
+      (
+        _command: string,
+        _args: string[],
+        _options: unknown,
+        callback: (error: Error | null, stdout: string, stderr: string) => void,
+      ) =>
+        callback(
+          null,
+          `Warning: deprecated flag\n${JSON.stringify({ result: "Implemented the feature" })}\n`,
+          "",
+        ),
+    );
+
+    const client = new QoderClient(config);
+    const summary = await client.performTask(
+      {
+        id: "task-1",
+        title: "Implement feature",
+        status: "To Do",
+        description: "",
+        comments: [],
+      },
+      path.join(os.tmpdir(), "qoder-spec", "task-1-Agent.md"),
+    );
+
+    expect(summary).toBe("Implemented the feature");
+  });
+
   it("should fall back to plain stdout when the output is not json", async () => {
     mockExecFile.mockImplementation(
       (
