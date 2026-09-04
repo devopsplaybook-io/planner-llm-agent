@@ -1,0 +1,21 @@
+{
+  "name": "planner-llm-agent",
+  "version": "0.1.0",
+  "description": "LLM agent that connects to a Planner instance and executes assigned tasks",
+  "main": "ecosystem.config.js",
+  "scripts": {
+    "dev": "./docs/dev/run-dev-env.sh",
+    "dependencies": "./docs/dev/run-dev-dependencies-rebuild.sh"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/devopsplaybook-io/planner-llm-agent.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/devopsplaybook-io/planner-llm-agent/issues"
+  },
+  "homepage": "https://github.com/devopsplaybook-io/planner-llm-agent#readme"
+}
