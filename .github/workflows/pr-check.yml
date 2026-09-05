@@ -12,9 +12,7 @@ concurrency:
 
 jobs:
   pr-verify:
-    # Temporary pin while the immutable build strategy is validated end-to-end.
-    # Revert to @main once devopsplaybook-io/common-utils#16 is merged.
-    uses: devopsplaybook-io/common-utils/.github/workflows/reusable-pr-verify.yml@feature/2026.09-immutable-docker-build
+    uses: devopsplaybook-io/common-utils/.github/workflows/reusable-pr-verify.yml@main
     with:
       node_app_directories: '["agent"]'
     secrets:
