@@ -27,6 +27,18 @@ export interface PlannerTask {
   comments: PlannerTaskComment[];
 }
 
+export interface PlannerProject {
+  id: string;
+  name: string;
+}
+
+export interface PlannerNote {
+  id: string;
+  projectId: string;
+  title: string;
+  description: string;
+}
+
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type PlannerTaskJson = any;
 
@@ -127,6 +139,104 @@ export class PlannerClient {
     try {
       await this.request(`/api/tasks/${taskId}`, "PUT", span, {
         status: status,
+      });
+    } catch (error) {
+      span.recordException(error as Error);
+      throw error;
+    } finally {
+      span.end();
+    }
+  }
+
+  public async listProjects(): Promise<PlannerProject[]> {
+    const span = OTelTracer().startSpan("planner-client.list-projects");
+    try {
+      const body = await this.request("/api/projects", "GET", span);
+      if (!Array.isArray(body)) {
+        throw new Error("Planner projects response is not a list");
+      }
+      return (body as PlannerTaskJson[])
+        .filter((project) => project?.id && project?.name)
+        .map((project) => ({
+          id: String(project.id),
+          name: String(project.name),
+        }));
+    } catch (error) {
+      span.recordException(error as Error);
+      throw error;
+    } finally {
+      span.end();
+    }
+  }
+
+  public async listNotes(projectId: string): Promise<PlannerNote[]> {
+    const span = OTelTracer().startSpan("planner-client.list-notes");
+    try {
+      const body = await this.request(
+        `/api/notes?projectId=${encodeURIComponent(projectId)}`,
+        "GET",
+        span,
+      );
+      if (!Array.isArray(body)) {
+        throw new Error("Planner notes response is not a list");
+      }
+      return (body as PlannerTaskJson[]).map((note) => ({
+        id: String(note.id),
+        projectId: String(note.projectId),
+        title: String(note.title),
+        description:
+          note.description === undefined || note.description === null
+            ? ""
+            : String(note.description),
+      }));
+    } catch (error) {
+      span.recordException(error as Error);
+      throw error;
+    } finally {
+      span.end();
+    }
+  }
+
+  public async createNote(
+    projectId: string,
+    title: string,
+    description: string,
+  ): Promise<PlannerNote> {
+    const span = OTelTracer().startSpan("planner-client.create-note");
+    try {
+      const body = await this.request("/api/notes", "POST", span, {
+        projectId: projectId,
+        title: title,
+        description: description,
+      });
+      if (!body?.id) {
+        throw new Error("Planner note creation response is missing the note id");
+      }
+      return {
+        id: String(body.id),
+        projectId: String(body.projectId ?? projectId),
+        title: String(body.title ?? title),
+        description:
+          body.description === undefined || body.description === null
+            ? ""
+            : String(body.description),
+      };
+    } catch (error) {
+      span.recordException(error as Error);
+      throw error;
+    } finally {
+      span.end();
+    }
+  }
+
+  public async updateNote(
+    noteId: string,
+    description: string,
+  ): Promise<void> {
+    const span = OTelTracer().startSpan("planner-client.update-note");
+    try {
+      await this.request(`/api/notes/${noteId}`, "PUT", span, {
+        description: description,
       });
     } catch (error) {
       span.recordException(error as Error);

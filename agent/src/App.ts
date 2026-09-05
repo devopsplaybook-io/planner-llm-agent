@@ -1,9 +1,11 @@
 import { watchFile } from "fs-extra";
 import { Agent } from "./Agent";
 import { AgentConfigRepository } from "./AgentConfigRepository";
+import { AgentNote } from "./AgentNote";
 import { Config } from "./Config";
 import { GitEnvironment } from "./GitEnvironment";
 import { OTelInit, OTelLogger, OTelTracer } from "./OTelContext";
+import { PlannerClient } from "./PlannerClient";
 import { QoderClient } from "./QoderClient";
 
 const logger = OTelLogger().createModuleLogger("app");
@@ -89,9 +91,11 @@ Promise.resolve().then(async () => {
     logger.info("Agent config repository not configured");
   }
 
+  // Qoder client shared by the authentication check and the agent note
+  const qoderClient = new QoderClient(config);
+
   // Check Qoder authentication
   if (config.QODER_AUTH_CHECK === "true" || config.QODER_AUTH_CHECK === "1") {
-    const qoderClient = new QoderClient(config);
     try {
       await qoderClient.checkAuthentication();
       logger.info("Qoder authentication verified");
@@ -104,6 +108,31 @@ Promise.resolve().then(async () => {
     }
   } else {
     logger.info("Qoder authentication check disabled");
+  }
+
+  // Agent note: a single Planner note named after the agent, regularly
+  // refreshed with LLM-generated content.
+  const agentNote = new AgentNote(
+    config,
+    new PlannerClient(config),
+    qoderClient,
+  );
+  if (agentNote.isEnabled()) {
+    const updateAgentNote = () => {
+      void agentNote.update().catch((error: Error) => {
+        logger.error("Agent note update failed (will retry on schedule)", error);
+      });
+    };
+    // Publish the first note immediately, then refresh on the configured
+    // interval. Failures are logged and retried on the next tick.
+    updateAgentNote();
+    const agentNoteTimer = setInterval(
+      updateAgentNote,
+      config.AGENT_NOTE_INTERVAL * 1000,
+    );
+    agentNoteTimer.unref();
+  } else {
+    logger.info("Agent note not configured");
   }
 
   // Agent

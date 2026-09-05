@@ -26,6 +26,8 @@ export class Config {
   public TASK_POLLING_INTERVAL: number;
   public TASK_STATUS_START: string;
   public TASK_STATUS_END: string;
+  public AGENT_NOTE_PROJECT: string;
+  public AGENT_NOTE_INTERVAL: number;
 
   // Qoder CLI
   public QODER_CLI: string;
@@ -81,6 +83,8 @@ export class Config {
     this.TASK_POLLING_INTERVAL = 60;
     this.TASK_STATUS_START = "To Do";
     this.TASK_STATUS_END = "Done";
+    this.AGENT_NOTE_PROJECT = "";
+    this.AGENT_NOTE_INTERVAL = 86400;
 
     this.QODER_CLI = "qoder";
     this.QODER_AUTH_CHECK = "true";
@@ -135,6 +139,12 @@ export class Config {
     }
     if (config.TASK_STATUS_END) {
       this.TASK_STATUS_END = config.TASK_STATUS_END as string;
+    }
+    if (config.AGENT_NOTE_PROJECT) {
+      this.AGENT_NOTE_PROJECT = config.AGENT_NOTE_PROJECT as string;
+    }
+    if (config.AGENT_NOTE_INTERVAL) {
+      this.AGENT_NOTE_INTERVAL = config.AGENT_NOTE_INTERVAL as number;
     }
     if (config.QODER_CLI) {
       this.QODER_CLI = config.QODER_CLI as string;
@@ -227,6 +237,12 @@ export class Config {
     }
     if (process.env.TASK_STATUS_END) {
       this.TASK_STATUS_END = process.env.TASK_STATUS_END;
+    }
+    if (process.env.AGENT_NOTE_PROJECT) {
+      this.AGENT_NOTE_PROJECT = process.env.AGENT_NOTE_PROJECT;
+    }
+    if (process.env.AGENT_NOTE_INTERVAL) {
+      this.AGENT_NOTE_INTERVAL = parseInt(process.env.AGENT_NOTE_INTERVAL);
     }
     if (process.env.QODER_CLI) {
       this.QODER_CLI = process.env.QODER_CLI;
@@ -333,6 +349,20 @@ export class Config {
       ) {
         errors.push(
           `AGENT_CONFIG_SYNC_INTERVAL must be a positive integer (current value: '${this.AGENT_CONFIG_SYNC_INTERVAL}')`,
+        );
+      }
+    }
+
+    // The agent note is enabled by setting AGENT_NOTE_PROJECT (the interval
+    // then defaults to a daily update); without a project the feature stays
+    // disabled and no configuration error is raised.
+    if (this.AGENT_NOTE_PROJECT.trim().length > 0) {
+      if (
+        !Number.isInteger(this.AGENT_NOTE_INTERVAL) ||
+        this.AGENT_NOTE_INTERVAL < 0
+      ) {
+        errors.push(
+          `AGENT_NOTE_INTERVAL must be a positive integer or 0 to disable (current value: '${this.AGENT_NOTE_INTERVAL}')`,
         );
       }
     }

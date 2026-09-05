@@ -101,6 +101,24 @@ describe("Config", () => {
       await fs.remove(tmpDir);
     });
 
+    it("should load the agent note settings from the config file", async () => {
+      const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-config-"));
+      const configFile = path.join(tmpDir, "config.json");
+      await fs.writeJson(configFile, {
+        AGENT_NOTE_PROJECT: "File Project",
+        AGENT_NOTE_INTERVAL: 3600,
+      });
+      process.env.CONFIG_FILE = configFile;
+      process.env.AGENT_NOTE_INTERVAL = "1800";
+
+      const config = new Config();
+      await config.reload();
+      expect(config.AGENT_NOTE_PROJECT).toBe("File Project");
+      expect(config.AGENT_NOTE_INTERVAL).toBe(1800);
+
+      await fs.remove(tmpDir);
+    });
+
     it("should keep defaults when the config file does not exist", async () => {
       process.env.CONFIG_FILE = path.join(os.tmpdir(), "does-not-exist.json");
 
@@ -157,6 +175,41 @@ describe("Config", () => {
       const errors = config.validate();
       expect(errors).toEqual([
         "TASK_POLLING_INTERVAL must be a positive integer (current value: 'NaN')",
+      ]);
+    });
+
+    it("should not require agent note configuration by default", () => {
+      const config = new Config();
+      config.PLANNER_API_KEY = "key";
+      expect(config.AGENT_NOTE_PROJECT).toBe("");
+      expect(config.AGENT_NOTE_INTERVAL).toBe(86400);
+      expect(config.validate()).toEqual([]);
+    });
+
+    it("should accept the agent note with the daily default interval", () => {
+      const config = new Config();
+      config.PLANNER_API_KEY = "key";
+      config.AGENT_NOTE_PROJECT = "Agent";
+      expect(config.validate()).toEqual([]);
+    });
+
+    it("should accept an explicitly disabled agent note interval", () => {
+      const config = new Config();
+      config.PLANNER_API_KEY = "key";
+      config.AGENT_NOTE_PROJECT = "Agent";
+      config.AGENT_NOTE_INTERVAL = 0;
+      expect(config.validate()).toEqual([]);
+    });
+
+    it("should report an invalid agent note interval", () => {
+      const config = new Config();
+      config.PLANNER_API_KEY = "key";
+      config.AGENT_NOTE_PROJECT = "Agent";
+      config.AGENT_NOTE_INTERVAL = NaN;
+
+      const errors = config.validate();
+      expect(errors).toEqual([
+        "AGENT_NOTE_INTERVAL must be a positive integer or 0 to disable (current value: 'NaN')",
       ]);
     });
   });

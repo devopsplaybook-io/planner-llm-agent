@@ -627,4 +627,130 @@ describe("QoderClient", () => {
       ),
     ).rejects.toThrow("Qoder task execution failed:\nboom");
   });
+
+  it("should run a standalone prompt and return the reply", async () => {
+    mockExecFile.mockImplementation(
+      (
+        _command: string,
+        _args: string[],
+        _options: unknown,
+        callback: (error: Error | null, stdout: string, stderr: string) => void,
+      ) =>
+        callback(
+          null,
+          JSON.stringify({ result: "Generated note", total_credits: 15.5 }),
+          "",
+        ),
+    );
+
+    const client = new QoderClient(config);
+    const reply = await client.runPrompt("Write a note about the agent");
+
+    expect(reply).toBe("Generated note");
+    expect(mockExecFile).toHaveBeenCalledTimes(1);
+    const [command, args, options] = mockExecFile.mock.calls[0];
+    expect(command).toBe("qoder");
+    expect(args).toEqual([
+      "-p",
+      "Write a note about the agent",
+      "--output-format",
+      "json",
+      "--permission-mode",
+      "bypass_permissions",
+    ]);
+    expect(options).toMatchObject({ timeout: 600000 });
+  });
+
+  it("should apply the default model to standalone prompts", async () => {
+    config.QODER_MODEL = "claude-sonnet-4-5";
+    mockExecFile.mockImplementation(
+      (
+        _command: string,
+        _args: string[],
+        _options: unknown,
+        callback: (error: Error | null, stdout: string, stderr: string) => void,
+      ) => callback(null, JSON.stringify({ result: "reply" }), ""),
+    );
+
+    const client = new QoderClient(config);
+    await expect(client.runPrompt("hello")).resolves.toBe("reply");
+
+    const [, args] = mockExecFile.mock.calls[0];
+    expect(args).toEqual([
+      "-p",
+      "hello",
+      "--model",
+      "claude-sonnet-4-5",
+      "--output-format",
+      "json",
+      "--permission-mode",
+      "bypass_permissions",
+    ]);
+  });
+
+  it("should persist the credits reported by standalone prompts", async () => {
+    mockExecFile.mockImplementation(
+      (
+        _command: string,
+        _args: string[],
+        _options: unknown,
+        callback: (error: Error | null, stdout: string, stderr: string) => void,
+      ) =>
+        callback(
+          null,
+          JSON.stringify({ result: "reply", total_credits: 14.25 }),
+          "",
+        ),
+    );
+
+    const client = new QoderClient(config);
+    await client.runPrompt("hello");
+
+    const creditsFile = path.join(
+      os.tmpdir(),
+      "qoder-spec",
+      "data",
+      "qoder-credits.json",
+    );
+    expect(await fse.readJson(creditsFile)).toEqual({ credits: 14.25 });
+  });
+
+  it("should fall back to the raw stdout for standalone prompts without a JSON envelope", async () => {
+    mockExecFile.mockImplementation(
+      (
+        _command: string,
+        _args: string[],
+        _options: unknown,
+        callback: (error: Error | null, stdout: string, stderr: string) => void,
+      ) => callback(null, "plain text reply", ""),
+    );
+
+    const client = new QoderClient(config);
+    await expect(client.runPrompt("hello")).resolves.toBe(
+      "plain text reply",
+    );
+  });
+
+  it("should report a missing CLI for standalone prompts", async () => {
+    mockExecFile.mockImplementation(
+      (
+        _command: string,
+        _args: string[],
+        _options: unknown,
+        callback: (error: Error | null, stdout: string, stderr: string) => void,
+      ) =>
+        callback(
+          Object.assign(new Error("spawn qoder ENOENT"), {
+            code: "ENOENT",
+          }),
+          "",
+          "",
+        ),
+    );
+
+    const client = new QoderClient(config);
+    await expect(client.runPrompt("hello")).rejects.toThrow(
+      "Qoder CLI 'qoder' not found in PATH",
+    );
+  });
 });
