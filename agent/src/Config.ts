@@ -39,6 +39,7 @@ export class Config {
   public GIT_USER_NAME: string;
   public GIT_USER_EMAIL: string;
   public GITHUB_TOKEN: string;
+  public GITHUB_TOKENS: string;
   public GIT_SSH_PRIVATE_KEY: string;
   public GIT_SSH_SIGNING: string;
   public GIT_GPG_PRIVATE_KEY: string;
@@ -95,6 +96,7 @@ export class Config {
     this.GIT_USER_NAME = "planner-llm-agent";
     this.GIT_USER_EMAIL = "planner-llm-agent@users.noreply.github.com";
     this.GITHUB_TOKEN = "";
+    this.GITHUB_TOKENS = "";
     this.GIT_SSH_PRIVATE_KEY = "";
     this.GIT_SSH_SIGNING = "false";
     this.GIT_GPG_PRIVATE_KEY = "";
@@ -168,6 +170,9 @@ export class Config {
     }
     if (config.GITHUB_TOKEN) {
       this.GITHUB_TOKEN = config.GITHUB_TOKEN as string;
+    }
+    if (config.GITHUB_TOKENS) {
+      this.GITHUB_TOKENS = config.GITHUB_TOKENS as string;
     }
     if (config.GIT_SSH_PRIVATE_KEY) {
       this.GIT_SSH_PRIVATE_KEY = config.GIT_SSH_PRIVATE_KEY as string;
@@ -270,6 +275,9 @@ export class Config {
     if (process.env.GITHUB_TOKEN) {
       this.GITHUB_TOKEN = process.env.GITHUB_TOKEN;
     }
+    if (process.env.GITHUB_TOKENS) {
+      this.GITHUB_TOKENS = process.env.GITHUB_TOKENS;
+    }
     if (process.env.GIT_SSH_PRIVATE_KEY) {
       this.GIT_SSH_PRIVATE_KEY = process.env.GIT_SSH_PRIVATE_KEY;
     }
@@ -317,6 +325,14 @@ export class Config {
     }
   }
 
+  /**
+   * The GitHub organization tokens parsed from GITHUB_TOKENS; malformed
+   * entries are skipped (validation reports them).
+   */
+  public githubTokenEntries(): GithubTokenEntry[] {
+    return parseGithubTokens(this.GITHUB_TOKENS);
+  }
+
   public validate(): string[] {
     const errors: string[] = [];
 
@@ -354,6 +370,54 @@ export class Config {
       );
     }
 
+    // The organization tokens are optional; when set, every entry must be a
+    // well-formed 'organization=token' pair so that a misconfiguration fails
+    // fast at startup instead of surfacing inside a task.
+    if (this.GITHUB_TOKENS.trim().length > 0) {
+      const seen = new Set<string>();
+      for (const part of this.GITHUB_TOKENS.split(",")) {
+        const trimmed = part.trim();
+        if (trimmed.length === 0) {
+          continue;
+        }
+        const separator = trimmed.indexOf("=");
+        if (separator <= 0) {
+          errors.push(
+            `GITHUB_TOKENS entry '${trimmed}' must be in the format 'organization=token'`,
+          );
+          continue;
+        }
+        const organization = trimmed.slice(0, separator).trim();
+        const token = trimmed.slice(separator + 1).trim();
+        if (!/^[A-Za-z0-9-]+$/.test(organization)) {
+          errors.push(
+            `GITHUB_TOKENS organization '${organization}' is not a valid GitHub organization name (alphanumeric characters and hyphens only)`,
+          );
+          continue;
+        }
+        if (token.length === 0) {
+          errors.push(
+            `GITHUB_TOKENS token must not be empty for organization '${organization}'`,
+          );
+          continue;
+        }
+        if (/[\s"'\\]/.test(token)) {
+          errors.push(
+            `GITHUB_TOKENS token for organization '${organization}' contains unsupported characters (whitespace, quotes or backslashes)`,
+          );
+          continue;
+        }
+        const key = organization.toLowerCase();
+        if (seen.has(key)) {
+          errors.push(
+            `GITHUB_TOKENS contains a duplicate organization '${organization}'`,
+          );
+          continue;
+        }
+        seen.add(key);
+      }
+    }
+
     if (this.AGENT_CONFIG_REPOSITORY.trim().length > 0) {
       if (this.AGENT_CONFIG_BRANCH.trim().length === 0) {
         errors.push(
@@ -386,4 +450,32 @@ export class Config {
 
     return errors;
   }
+}
+
+export interface GithubTokenEntry {
+  organization: string;
+  token: string;
+}
+
+/**
+ * Parses the GITHUB_TOKENS value: a comma-separated list of
+ * 'organization=token' entries. Malformed entries are skipped; the
+ * configuration validation reports them.
+ */
+export function parseGithubTokens(value: string): GithubTokenEntry[] {
+  const entries: GithubTokenEntry[] = [];
+  for (const part of value.split(",")) {
+    const trimmed = part.trim();
+    const separator = trimmed.indexOf("=");
+    if (separator <= 0) {
+      continue;
+    }
+    const organization = trimmed.slice(0, separator).trim();
+    const token = trimmed.slice(separator + 1).trim();
+    if (organization.length === 0 || token.length === 0) {
+      continue;
+    }
+    entries.push({ organization, token });
+  }
+  return entries;
 }

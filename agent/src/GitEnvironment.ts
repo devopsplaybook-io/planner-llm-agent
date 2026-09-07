@@ -31,6 +31,8 @@ const GPG_PRESET_PASSPHRASE_CANDIDATES = [
  * - git identity (user name / email)
  * - GitHub token exposed as GH_TOKEN and used by git as an HTTPS credential
  *   helper through the gh CLI
+ * - additional GitHub tokens scoped by organization (GITHUB_TOKENS), applied
+ *   as per-organization HTTPS credential helpers
  * - SSH private key for git@github.com SSH authentication, with the GitHub
  *   host keys pinned in known_hosts
  * - GPG private key imported for headless commit signing (passphrase cached
@@ -53,12 +55,14 @@ export class GitEnvironment {
     const span = OTelTracer().startSpan("git-environment.prepare");
     try {
       const githubToken = this.config.GITHUB_TOKEN.trim();
+      const githubTokenEntries = this.config.githubTokenEntries();
       const sshKey = normalizeKeyContent(this.config.GIT_SSH_PRIVATE_KEY);
       const gpgKey = normalizeKeyContent(this.config.GIT_GPG_PRIVATE_KEY);
       const sshSigning = this.config.GIT_SSH_SIGNING === "true";
 
       if (
         githubToken.length === 0 &&
+        githubTokenEntries.length === 0 &&
         sshKey.length === 0 &&
         gpgKey.length === 0
       ) {
@@ -72,6 +76,13 @@ export class GitEnvironment {
       // misconfiguration from inside a task execution.
       if (githubToken.length > 0 && githubToken.length < 20) {
         throw new Error("GITHUB_TOKEN is too short to be a valid GitHub token");
+      }
+      for (const entry of githubTokenEntries) {
+        if (entry.token.length < 20) {
+          throw new Error(
+            `GITHUB_TOKENS token for organization '${entry.organization}' is too short to be a valid GitHub token`,
+          );
+        }
       }
       if (sshKey.length > 0 && !sshKey.includes("PRIVATE KEY-----")) {
         throw new Error(
@@ -103,6 +114,14 @@ export class GitEnvironment {
         }
         await this.checkGhCli();
         configured.push("GitHub token (gh CLI and git HTTPS credentials)");
+      }
+
+      if (githubTokenEntries.length > 0) {
+        configured.push(
+          `GitHub organization tokens (${githubTokenEntries
+            .map((entry) => entry.organization)
+            .join(", ")})`,
+        );
       }
 
       let sshPublicKey = "";
@@ -344,6 +363,7 @@ export class GitEnvironment {
     // GPG signing takes precedence over SSH signing when both are configured.
     const gpgSigning = gpgKeyId.length > 0;
     const sshSigningKeyFile = path.join(this.homeDir, ".ssh", `${SSH_KEY_FILE_NAME}.pub`);
+    const githubTokenEntries = this.config.githubTokenEntries();
 
     const lines: string[] = [];
     lines.push("[user]");
@@ -358,13 +378,27 @@ export class GitEnvironment {
     lines.push("\tdefaultBranch = main");
     lines.push("[safe]");
     lines.push("\tdirectory = /data");
+    if (githubTokenEntries.length > 0) {
+      // The path component must be considered for the organization scoping,
+      // and the organization helpers must be written before the host-wide
+      // helper: git stops at the first helper that returns a complete
+      // credential.
+      lines.push("[credential]");
+      lines.push("\tuseHttpPath = true");
+      for (const entry of githubTokenEntries) {
+        lines.push(`[credential "https://github.com/${entry.organization}"]`);
+        lines.push(
+          `\thelper = "!f() { echo username=x-access-token; echo password=${entry.token}; }; f"`,
+        );
+      }
+    }
     if (githubToken.length > 0) {
       lines.push('[credential "https://github.com"]');
       lines.push("\thelper = !gh auth git-credential");
     }
-    if (githubToken.length > 0 && sshPublicKey.length === 0) {
+    if ((githubToken.length > 0 || githubTokenEntries.length > 0) && sshPublicKey.length === 0) {
       // Without an SSH key, rewrite SSH clone URLs to HTTPS so pushes still
-      // authenticate with the token.
+      // authenticate with the tokens.
       lines.push('[url "https://github.com/"]');
       lines.push("\tinsteadOf = git@github.com:");
     }

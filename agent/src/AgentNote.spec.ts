@@ -240,6 +240,8 @@ describe("AgentNote", () => {
         credits: 12.5,
       });
       config.GITHUB_TOKEN = "github-token";
+      config.GITHUB_TOKENS =
+        "org-one=github_pat_aaaaaaaaaaaaaaaaaaaa,org-two=github_pat_bbbbbbbbbbbbbbbbbbbb";
 
       planner.listProjects.mockResolvedValue([project]);
       planner.listNotes.mockResolvedValue([]);
@@ -257,6 +259,9 @@ describe("AgentNote", () => {
       expect(prompt).toContain("Second task");
       expect(prompt).toContain("12.50");
       expect(prompt).toContain("Git and GitHub integration: configured");
+      expect(prompt).toContain(
+        "GitHub organizations with dedicated tokens: org-one, org-two",
+      );
     });
   });
 

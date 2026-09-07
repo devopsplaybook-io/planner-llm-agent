@@ -39,6 +39,7 @@ describe("Config", () => {
       expect(config.PLANNER_URL).toBe("http://localhost:8080");
       expect(config.PLANNER_API_KEY).toBe("");
       expect(config.TASK_POLLING_INTERVAL).toBe(60);
+      expect(config.GITHUB_TOKENS).toBe("");
       expect(config.OPENTELEMETRY_COLLECTOR_HTTP_TRACES).toBe("");
       expect(config.OPENTELEMETRY_COLLECTOR_HTTP_METRICS).toBe("");
       expect(config.OPENTELEMETRY_COLLECTOR_HTTP_LOGS).toBe("");
@@ -119,6 +120,22 @@ describe("Config", () => {
       await fs.remove(tmpDir);
     });
 
+    it("should give priority to the environment for the GitHub organization tokens", async () => {
+      const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-config-"));
+      const configFile = path.join(tmpDir, "config.json");
+      await fs.writeJson(configFile, {
+        GITHUB_TOKENS: "file-org=github_pat_aaaaaaaaaaaaaaaaaaaa",
+      });
+      process.env.CONFIG_FILE = configFile;
+      process.env.GITHUB_TOKENS = "env-org=github_pat_bbbbbbbbbbbbbbbbbbbb";
+
+      const config = new Config();
+      await config.reload();
+      expect(config.GITHUB_TOKENS).toBe("env-org=github_pat_bbbbbbbbbbbbbbbbbbbb");
+
+      await fs.remove(tmpDir);
+    });
+
     it("should keep defaults when the config file does not exist", async () => {
       process.env.CONFIG_FILE = path.join(os.tmpdir(), "does-not-exist.json");
 
@@ -186,6 +203,73 @@ describe("Config", () => {
       const errors = config.validate();
       expect(errors).toEqual([
         "TASK_MAX_PARALLEL must be a positive integer (current value: '0')",
+      ]);
+    });
+
+    it("should accept well-formed GitHub organization tokens", () => {
+      const config = new Config();
+      config.PLANNER_API_KEY = "key";
+      config.GITHUB_TOKENS =
+        "org-a=github_pat_aaaaaaaaaaaaaaaaaaaa, org-b=github_pat_bbbbbbbbbbbbbbbbbbbb";
+
+      expect(config.validate()).toEqual([]);
+      expect(config.githubTokenEntries()).toEqual([
+        { organization: "org-a", token: "github_pat_aaaaaaaaaaaaaaaaaaaa" },
+        { organization: "org-b", token: "github_pat_bbbbbbbbbbbbbbbbbbbb" },
+      ]);
+    });
+
+    it("should skip malformed entries when parsing the GitHub organization tokens", () => {
+      const config = new Config();
+      config.PLANNER_API_KEY = "key";
+      config.GITHUB_TOKENS = "just-a-token,,org=github_pat_aaaaaaaaaaaaaaaaaaaa";
+
+      expect(config.githubTokenEntries()).toEqual([
+        { organization: "org", token: "github_pat_aaaaaaaaaaaaaaaaaaaa" },
+      ]);
+      expect(config.validate()).toEqual([
+        "GITHUB_TOKENS entry 'just-a-token' must be in the format 'organization=token'",
+      ]);
+    });
+
+    it("should report an empty GITHUB_TOKENS token", () => {
+      const config = new Config();
+      config.PLANNER_API_KEY = "key";
+      config.GITHUB_TOKENS = "org-a=";
+
+      expect(config.validate()).toEqual([
+        "GITHUB_TOKENS token must not be empty for organization 'org-a'",
+      ]);
+    });
+
+    it("should report an invalid GITHUB_TOKENS organization name", () => {
+      const config = new Config();
+      config.PLANNER_API_KEY = "key";
+      config.GITHUB_TOKENS = "not an org=github_pat_aaaaaaaaaaaaaaaaaaaa";
+
+      expect(config.validate()).toEqual([
+        "GITHUB_TOKENS organization 'not an org' is not a valid GitHub organization name (alphanumeric characters and hyphens only)",
+      ]);
+    });
+
+    it("should report a GITHUB_TOKENS token with unsupported characters", () => {
+      const config = new Config();
+      config.PLANNER_API_KEY = "key";
+      config.GITHUB_TOKENS = 'org-a=github_pat_"token"';
+
+      expect(config.validate()).toEqual([
+        "GITHUB_TOKENS token for organization 'org-a' contains unsupported characters (whitespace, quotes or backslashes)",
+      ]);
+    });
+
+    it("should report a duplicate GITHUB_TOKENS organization", () => {
+      const config = new Config();
+      config.PLANNER_API_KEY = "key";
+      config.GITHUB_TOKENS =
+        "org-a=github_pat_aaaaaaaaaaaaaaaaaaaa,ORG-A=github_pat_bbbbbbbbbbbbbbbbbbbb";
+
+      expect(config.validate()).toEqual([
+        "GITHUB_TOKENS contains a duplicate organization 'ORG-A'",
       ]);
     });
 

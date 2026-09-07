@@ -145,6 +145,53 @@ describe("GitEnvironment", () => {
     expect(process.env.GH_TOKEN).toBe("existing-token");
   });
 
+  it("configures per-organization credential helpers without a default token", async () => {
+    config.GITHUB_TOKENS =
+      "org-a=github_pat_aaaaaaaaaaaaaaaaaaaa,org-b=github_pat_bbbbbbbbbbbbbbbbbbbb";
+    mockCli(() => "");
+
+    await expect(run()).resolves.toBeUndefined();
+
+    const gitconfig = await readFile(".gitconfig");
+    expect(gitconfig).toContain("[credential]");
+    expect(gitconfig).toContain("\tuseHttpPath = true");
+    expect(gitconfig).toContain('[credential "https://github.com/org-a"]');
+    expect(gitconfig).toContain('[credential "https://github.com/org-b"]');
+    expect(gitconfig).toContain(
+      `\thelper = "!f() { echo username=x-access-token; echo password=github_pat_aaaaaaaaaaaaaaaaaaaa; }; f"`,
+    );
+    // No default token: no host-wide helper and no GH_TOKEN, but SSH clone
+    // URLs are still rewritten so the organization tokens apply.
+    expect(gitconfig).not.toContain('[credential "https://github.com"]');
+    expect(gitconfig).toContain('[url "https://github.com/"]');
+    expect(process.env.GH_TOKEN).toBeUndefined();
+  });
+
+  it("writes the organization helpers before the host-wide helper", async () => {
+    config.GITHUB_TOKEN = GITHUB_TOKEN;
+    config.GITHUB_TOKENS = "myorg=github_pat_cccccccccccccccccccc";
+    mockCli(() => "");
+
+    await expect(run()).resolves.toBeUndefined();
+
+    const gitconfig = await readFile(".gitconfig");
+    // Git stops at the first helper that returns a complete credential, so
+    // the organization helper must come first to take precedence.
+    expect(gitconfig.indexOf('[credential "https://github.com/myorg"]')).toBeLessThan(
+      gitconfig.indexOf('[credential "https://github.com"]'),
+    );
+    expect(process.env.GH_TOKEN).toBe(GITHUB_TOKEN);
+  });
+
+  it("rejects an organization token that is too short", async () => {
+    config.GITHUB_TOKENS = "myorg=short";
+    mockCli(() => "");
+
+    await expect(run()).rejects.toThrow(
+      /GITHUB_TOKENS token for organization 'myorg' is too short/,
+    );
+  });
+
   it("writes the SSH key and pins the GitHub host keys", async () => {
     config.GIT_SSH_PRIVATE_KEY = SSH_KEY;
     mockCli((command, args) => {

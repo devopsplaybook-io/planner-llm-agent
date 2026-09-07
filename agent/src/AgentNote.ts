@@ -151,8 +151,10 @@ export class AgentNote {
     const skills = await this.listSkills();
     const tasks = await this.listRecentTasks();
     const credits = await readCredits(config);
+    const githubTokenEntries = config.githubTokenEntries();
     const gitEnabled =
       config.GITHUB_TOKEN.trim().length > 0 ||
+      githubTokenEntries.length > 0 ||
       config.GIT_SSH_PRIVATE_KEY.trim().length > 0;
     const signing =
       config.GIT_SSH_SIGNING === "true"
@@ -177,6 +179,11 @@ export class AgentNote {
       `- Current session uptime: ${uptime}`,
       `- Default model: ${config.QODER_MODEL.trim().length > 0 ? config.QODER_MODEL.trim() : "auto (CLI default)"}`,
       `- Git and GitHub integration: ${gitEnabled ? "configured" : "not configured"}`,
+      `- GitHub organizations with dedicated tokens: ${
+        githubTokenEntries.length > 0
+          ? githubTokenEntries.map((entry) => entry.organization).join(", ")
+          : "none"
+      }`,
       `- Commit signing: ${signing}`,
       `- Agent configuration repository: ${configRepoFact}`,
       `- Skills available: ${skills.length > 0 ? skills.join(", ") : "none"}`,
