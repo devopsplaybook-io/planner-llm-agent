@@ -112,7 +112,7 @@ describe("Agent", () => {
     agent.stop();
   });
 
-  it("should log the assigned tasks with their status", async () => {
+  it("should not log when assigned tasks are not ready to be processed", async () => {
     jest.useFakeTimers();
     mockPlanner.listAssignedTasks.mockResolvedValue([
       {
@@ -135,26 +135,24 @@ describe("Agent", () => {
     agent.start();
     await jest.advanceTimersByTimeAsync(0);
 
-    expect(console.log).toHaveBeenCalledWith(
-      expect.stringContaining("Tasks assigned to 'Test User' (2):"),
+    expect(console.log).not.toHaveBeenCalledWith(
+      expect.stringContaining("Tasks assigned"),
     );
-    expect(console.log).toHaveBeenCalledWith(
-      expect.stringContaining("[In Progress] Fix the build"),
-    );
-    expect(console.log).toHaveBeenCalledWith(
-      expect.stringContaining("[Blocked] Review PR"),
-    );
+    expect(mockQoder.performTask).not.toHaveBeenCalled();
     agent.stop();
   });
 
-  it("should log when no tasks are assigned", async () => {
+  it("should not log when no tasks are assigned", async () => {
     jest.useFakeTimers();
     const agent = new Agent(config);
     agent.start();
     await jest.advanceTimersByTimeAsync(0);
 
-    expect(console.log).toHaveBeenCalledWith(
-      expect.stringContaining("No tasks currently assigned to 'Test User'"),
+    expect(console.log).not.toHaveBeenCalledWith(
+      expect.stringContaining("No tasks currently assigned"),
+    );
+    expect(console.log).not.toHaveBeenCalledWith(
+      expect.stringContaining("Tasks assigned"),
     );
     agent.stop();
   });

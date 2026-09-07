@@ -44,24 +44,11 @@ export class Agent {
     try {
       const user = await this.planner.getCurrentUser();
       const tasks = await this.planner.listAssignedTasks(user);
-      if (tasks.length === 0) {
-        logger.info(`No tasks currently assigned to '${user.name}'`);
-        return;
-      }
-      logger.info(`Tasks assigned to '${user.name}' (${tasks.length}):`);
-      for (const task of tasks) {
-        logger.info(`  - [${task.status}] ${task.title}`);
-      }
-
+      // Only tasks in the start status are ready: nothing is logged until a
+      // task is actually ready to be processed, to keep the logs quiet.
       const actionableTasks = tasks.filter(
         (task) => task.status === this.config.TASK_STATUS_START,
       );
-      if (actionableTasks.length === 0) {
-        logger.info(
-          `No tasks in status '${this.config.TASK_STATUS_START}' to process`,
-        );
-        return;
-      }
       for (const task of actionableTasks) {
         await this.processTask(task);
       }
