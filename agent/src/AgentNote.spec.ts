@@ -233,4 +233,40 @@ describe("AgentNote", () => {
       expect(prompt).toContain("Git and GitHub integration: configured");
     });
   });
+
+  describe("ensureNote", () => {
+    it("should create the note at startup when it does not exist", async () => {
+      planner.listProjects.mockResolvedValue([project]);
+      planner.listNotes.mockResolvedValue([]);
+      qoder.runPrompt.mockResolvedValue("initial content");
+      planner.createNote.mockResolvedValue({ id: "n1" });
+
+      await agentNote.ensureNote();
+
+      expect(planner.createNote).toHaveBeenCalledWith(
+        "p1",
+        "test-agent",
+        "initial content",
+      );
+      expect(planner.updateNote).not.toHaveBeenCalled();
+    });
+
+    it("should leave an existing note untouched at startup", async () => {
+      planner.listProjects.mockResolvedValue([project]);
+      planner.listNotes.mockResolvedValue([
+        {
+          id: "n1",
+          projectId: "p1",
+          title: "test-agent",
+          description: "existing content",
+        },
+      ]);
+
+      await agentNote.ensureNote();
+
+      expect(qoder.runPrompt).not.toHaveBeenCalled();
+      expect(planner.createNote).not.toHaveBeenCalled();
+      expect(planner.updateNote).not.toHaveBeenCalled();
+    });
+  });
 });

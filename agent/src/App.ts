@@ -110,8 +110,14 @@ Promise.resolve().then(async () => {
     logger.info("Qoder authentication check disabled");
   }
 
+  // Agent
+  const agent = new Agent(config);
+  agent.start();
+
   // Agent note: a single Planner note named after the agent, regularly
-  // refreshed with LLM-generated content.
+  // refreshed with LLM-generated content. At the end of the startup the
+  // note is checked and created when missing; the content is then refreshed
+  // on the configured interval.
   const agentNote = new AgentNote(
     config,
     new PlannerClient(config),
@@ -123,9 +129,12 @@ Promise.resolve().then(async () => {
         logger.error("Agent note update failed (will retry on schedule)", error);
       });
     };
-    // Publish the first note immediately, then refresh on the configured
-    // interval. Failures are logged and retried on the next tick.
-    updateAgentNote();
+    void agentNote.ensureNote().catch((error: Error) => {
+      logger.error(
+        "Agent note startup check failed (will retry on schedule)",
+        error,
+      );
+    });
     const agentNoteTimer = setInterval(
       updateAgentNote,
       config.AGENT_NOTE_INTERVAL * 1000,
@@ -134,10 +143,6 @@ Promise.resolve().then(async () => {
   } else {
     logger.info("Agent note not configured");
   }
-
-  // Agent
-  const agent = new Agent(config);
-  agent.start();
 
   const shutdown = () => {
     logger.info("Shutting down");

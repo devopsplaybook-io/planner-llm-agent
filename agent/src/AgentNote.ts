@@ -3,7 +3,7 @@ import * as path from "path";
 import { getAgentConfigContentPath } from "./AgentConfigRepository";
 import { Config } from "./Config";
 import { OTelLogger, OTelTracer } from "./OTelContext";
-import { PlannerClient, PlannerProject } from "./PlannerClient";
+import { PlannerClient, PlannerNote, PlannerProject } from "./PlannerClient";
 import { QoderClient, readCredits } from "./QoderClient";
 
 const logger = OTelLogger().createModuleLogger("agent-note");
@@ -32,6 +32,40 @@ export class AgentNote {
     );
   }
 
+  // At the end of the startup, make sure the note exists: it is created
+  // when missing, while an existing note is left untouched until its next
+  // scheduled update.
+  public async ensureNote(): Promise<void> {
+    if (this.updating) {
+      return;
+    }
+    const span = OTelTracer().startSpan("agent-note.ensure");
+    this.updating = true;
+    try {
+      const project = await this.resolveProject();
+      const existing = await this.findAgentNote(project);
+      if (existing) {
+        logger.info(
+          `Agent note already exists in project '${project.name}' (next update on schedule)`,
+        );
+        return;
+      }
+      const content = await this.generateContent();
+      await this.planner.createNote(
+        project.id,
+        this.config.AGENT_NAME.trim(),
+        content,
+      );
+      logger.info(`Agent note created in project '${project.name}'`);
+    } catch (error) {
+      span.recordException(error as Error);
+      throw error;
+    } finally {
+      this.updating = false;
+      span.end();
+    }
+  }
+
   // Generate the note content with the LLM and create or update the single
   // note named after the agent in the configured project.
   public async update(): Promise<void> {
@@ -44,8 +78,7 @@ export class AgentNote {
       const project = await this.resolveProject();
       const content = await this.generateContent();
       const agentName = this.config.AGENT_NAME.trim();
-      const notes = await this.planner.listNotes(project.id);
-      const existing = notes.find((note) => note.title === agentName);
+      const existing = await this.findAgentNote(project);
       if (existing) {
         await this.planner.updateNote(existing.id, content);
         logger.info(`Agent note updated in project '${project.name}'`);
@@ -60,6 +93,16 @@ export class AgentNote {
       this.updating = false;
       span.end();
     }
+  }
+
+  // The single note named after the agent in the given project.
+  private async findAgentNote(
+    project: PlannerProject,
+  ): Promise<PlannerNote | undefined> {
+    const notes = await this.planner.listNotes(project.id);
+    return notes.find(
+      (note) => note.title === this.config.AGENT_NAME.trim(),
+    );
   }
 
   // The configured project is matched by id first, then by name
