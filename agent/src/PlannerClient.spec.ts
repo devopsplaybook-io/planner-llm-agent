@@ -322,4 +322,24 @@ describe("PlannerClient", () => {
       }),
     );
   });
+
+  it("should update the title and description of an existing note", async () => {
+    fetchMock.mockResolvedValue(
+      new Response(JSON.stringify({ id: "note-1" }), { status: 200 }),
+    );
+
+    const client = new PlannerClient(config);
+    await client.updateNote("note-1", "updated content", "New title");
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://planner.test:8080/api/notes/note-1",
+      expect.objectContaining({
+        method: "PUT",
+        body: JSON.stringify({
+          description: "updated content",
+          title: "New title",
+        }),
+      }),
+    );
+  });
 });

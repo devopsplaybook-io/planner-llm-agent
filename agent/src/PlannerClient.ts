@@ -232,12 +232,17 @@ export class PlannerClient {
   public async updateNote(
     noteId: string,
     description: string,
+    title?: string,
   ): Promise<void> {
     const span = OTelTracer().startSpan("planner-client.update-note");
     try {
-      await this.request(`/api/notes/${noteId}`, "PUT", span, {
+      const body: { description: string; title?: string } = {
         description: description,
-      });
+      };
+      if (title !== undefined) {
+        body.title = title;
+      }
+      await this.request(`/api/notes/${noteId}`, "PUT", span, body);
     } catch (error) {
       span.recordException(error as Error);
       throw error;

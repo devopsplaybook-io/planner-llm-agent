@@ -10,6 +10,7 @@ const logger = OTelLogger().createModuleLogger("agent-note");
 
 const MAX_SKILLS_LISTED = 20;
 const MAX_RECENT_TASKS = 10;
+const NOTE_TITLE_PREFIX = "Planner LLM Agent: ";
 
 export class AgentNote {
   private config: Config;
@@ -21,6 +22,11 @@ export class AgentNote {
     this.config = config;
     this.planner = planner;
     this.qoder = qoder;
+  }
+
+  // The note title is user-friendly and contains the agent name.
+  private get noteTitle(): string {
+    return `${NOTE_TITLE_PREFIX}${this.config.AGENT_NAME.trim()}`;
   }
 
   // The note is enabled when an interval is configured and the target
@@ -51,11 +57,7 @@ export class AgentNote {
         return;
       }
       const content = await this.generateContent();
-      await this.planner.createNote(
-        project.id,
-        this.config.AGENT_NAME.trim(),
-        content,
-      );
+      await this.planner.createNote(project.id, this.noteTitle, content);
       logger.info(`Agent note created in project '${project.name}'`);
     } catch (error) {
       span.recordException(error as Error);
@@ -77,13 +79,14 @@ export class AgentNote {
     try {
       const project = await this.resolveProject();
       const content = await this.generateContent();
-      const agentName = this.config.AGENT_NAME.trim();
       const existing = await this.findAgentNote(project);
       if (existing) {
-        await this.planner.updateNote(existing.id, content);
+        // The title is kept canonical on every update, so a note created
+        // with the previous plain-name title is retitled as well.
+        await this.planner.updateNote(existing.id, content, this.noteTitle);
         logger.info(`Agent note updated in project '${project.name}'`);
       } else {
-        await this.planner.createNote(project.id, agentName, content);
+        await this.planner.createNote(project.id, this.noteTitle, content);
         logger.info(`Agent note created in project '${project.name}'`);
       }
     } catch (error) {
@@ -95,13 +98,16 @@ export class AgentNote {
     }
   }
 
-  // The single note named after the agent in the given project.
+  // The single agent note in the given project, matched by its title. A
+  // note titled with the plain agent name (previous format) is also
+  // recognized and adopted.
   private async findAgentNote(
     project: PlannerProject,
   ): Promise<PlannerNote | undefined> {
+    const agentName = this.config.AGENT_NAME.trim();
     const notes = await this.planner.listNotes(project.id);
     return notes.find(
-      (note) => note.title === this.config.AGENT_NAME.trim(),
+      (note) => note.title === this.noteTitle || note.title === agentName,
     );
   }
 

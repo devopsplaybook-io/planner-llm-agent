@@ -94,7 +94,7 @@ describe("AgentNote", () => {
 
       expect(planner.createNote).toHaveBeenCalledWith(
         "p1",
-        "test-agent",
+        "Planner LLM Agent: test-agent",
         "# About\n\nGenerated content.",
       );
       expect(planner.updateNote).not.toHaveBeenCalled();
@@ -102,6 +102,28 @@ describe("AgentNote", () => {
     });
 
     it("should update the existing note named after the agent", async () => {
+      planner.listProjects.mockResolvedValue([project]);
+      planner.listNotes.mockResolvedValue([
+        {
+          id: "n1",
+          projectId: "p1",
+          title: "Planner LLM Agent: test-agent",
+          description: "old content",
+        },
+      ]);
+      qoder.runPrompt.mockResolvedValue("new content");
+
+      await agentNote.update();
+
+      expect(planner.updateNote).toHaveBeenCalledWith(
+        "n1",
+        "new content",
+        "Planner LLM Agent: test-agent",
+      );
+      expect(planner.createNote).not.toHaveBeenCalled();
+    });
+
+    it("should adopt a note created with the previous plain agent name title", async () => {
       planner.listProjects.mockResolvedValue([project]);
       planner.listNotes.mockResolvedValue([
         {
@@ -115,7 +137,11 @@ describe("AgentNote", () => {
 
       await agentNote.update();
 
-      expect(planner.updateNote).toHaveBeenCalledWith("n1", "new content");
+      expect(planner.updateNote).toHaveBeenCalledWith(
+        "n1",
+        "new content",
+        "Planner LLM Agent: test-agent",
+      );
       expect(planner.createNote).not.toHaveBeenCalled();
     });
 
@@ -245,7 +271,7 @@ describe("AgentNote", () => {
 
       expect(planner.createNote).toHaveBeenCalledWith(
         "p1",
-        "test-agent",
+        "Planner LLM Agent: test-agent",
         "initial content",
       );
       expect(planner.updateNote).not.toHaveBeenCalled();
@@ -257,7 +283,7 @@ describe("AgentNote", () => {
         {
           id: "n1",
           projectId: "p1",
-          title: "test-agent",
+          title: "Planner LLM Agent: test-agent",
           description: "existing content",
         },
       ]);
