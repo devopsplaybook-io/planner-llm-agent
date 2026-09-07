@@ -26,6 +26,7 @@ export class Config {
   public TASK_POLLING_INTERVAL: number;
   public TASK_STATUS_START: string;
   public TASK_STATUS_END: string;
+  public TASK_MAX_PARALLEL: number;
   public AGENT_NOTE_PROJECT: string;
   public AGENT_NOTE_INTERVAL: number;
 
@@ -83,6 +84,7 @@ export class Config {
     this.TASK_POLLING_INTERVAL = 60;
     this.TASK_STATUS_START = "To Do";
     this.TASK_STATUS_END = "Done";
+    this.TASK_MAX_PARALLEL = 1;
     this.AGENT_NOTE_PROJECT = "";
     this.AGENT_NOTE_INTERVAL = 86400;
 
@@ -139,6 +141,9 @@ export class Config {
     }
     if (config.TASK_STATUS_END) {
       this.TASK_STATUS_END = config.TASK_STATUS_END as string;
+    }
+    if (config.TASK_MAX_PARALLEL) {
+      this.TASK_MAX_PARALLEL = config.TASK_MAX_PARALLEL as number;
     }
     if (config.AGENT_NOTE_PROJECT) {
       this.AGENT_NOTE_PROJECT = config.AGENT_NOTE_PROJECT as string;
@@ -238,6 +243,9 @@ export class Config {
     if (process.env.TASK_STATUS_END) {
       this.TASK_STATUS_END = process.env.TASK_STATUS_END;
     }
+    if (process.env.TASK_MAX_PARALLEL) {
+      this.TASK_MAX_PARALLEL = parseInt(process.env.TASK_MAX_PARALLEL);
+    }
     if (process.env.AGENT_NOTE_PROJECT) {
       this.AGENT_NOTE_PROJECT = process.env.AGENT_NOTE_PROJECT;
     }
@@ -334,6 +342,15 @@ export class Config {
     ) {
       errors.push(
         `TASK_POLLING_INTERVAL must be a positive integer (current value: '${this.TASK_POLLING_INTERVAL}')`,
+      );
+    }
+
+    if (
+      !Number.isInteger(this.TASK_MAX_PARALLEL) ||
+      this.TASK_MAX_PARALLEL <= 0
+    ) {
+      errors.push(
+        `TASK_MAX_PARALLEL must be a positive integer (current value: '${this.TASK_MAX_PARALLEL}')`,
       );
     }
 

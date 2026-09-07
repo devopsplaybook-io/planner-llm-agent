@@ -6,6 +6,8 @@ The agent polls the Planner API for tasks assigned to its user, executes the tas
 
 Polling stays quiet: log entries are only emitted when a task is ready to be processed and during its processing (plus errors), not on every poll cycle.
 
+Tasks are processed with a bounded parallelism: at most `TASK_MAX_PARALLEL` tasks (default `1`) run at the same time, and a task already being processed is never picked again by a subsequent poll. A task that fails to process is not retried forever: it is moved to the end status with a comment explaining the error (kept concise in the comment; see the agent logs for full details), so it does not block the queue.
+
 The container ships all the toolchains needed to perform the tasks (Node.js, Python, Go, Rust, Java, shellcheck, jq, yq, kubectl, helm) as well as a complete Git and GitHub tooling set (`git`, `gh`, `gnupg`, `openssh-client`).
 
 ## Configuration
@@ -26,6 +28,7 @@ Configuration values are resolved with the following priority:
 | `TASK_POLLING_INTERVAL` | `60` | Seconds between polls of assigned tasks |
 | `TASK_STATUS_START` | `To Do` | Only tasks with this status are executed |
 | `TASK_STATUS_END` | `Done` | Status set after a task is executed |
+| `TASK_MAX_PARALLEL` | `1` | Maximum number of tasks processed in parallel |
 | `DATA_DIR` | `/data` | Persistent data directory (task documentation files) |
 | `TMP_DIR` | `/tmp` | Temporary directory |
 | `DEV_MODE` | `false` | Development mode flag |

@@ -10,11 +10,17 @@ const logger = OTelLogger().createModuleLogger("agent");
 const AGENT_NOTES_MARKER =
   "<!-- AGENT-NOTES: the content below is maintained by the Qoder agent. Do not remove this marker. -->";
 
+// Maximum length of the failure explanation posted on a task.
+const MAX_FAILURE_EXPLANATION_LENGTH = 1000;
+
 export class Agent {
   private config: Config;
   private planner: PlannerClient;
   private qoder: QoderClient;
   private pollingTimer?: NodeJS.Timeout;
+  // Tasks currently being processed: they are never picked again by a
+  // subsequent poll while their processing is still running.
+  private processingTasks = new Set<string>();
 
   constructor(config: Config) {
     this.config = config;
@@ -44,14 +50,26 @@ export class Agent {
     try {
       const user = await this.planner.getCurrentUser();
       const tasks = await this.planner.listAssignedTasks(user);
-      // Only tasks in the start status are ready: nothing is logged until a
-      // task is actually ready to be processed, to keep the logs quiet.
+      // Only tasks in the start status are ready, and a task already being
+      // processed is never picked again by a subsequent poll.
       const actionableTasks = tasks.filter(
-        (task) => task.status === this.config.TASK_STATUS_START,
+        (task) =>
+          task.status === this.config.TASK_STATUS_START &&
+          !this.processingTasks.has(task.id),
       );
-      for (const task of actionableTasks) {
-        await this.processTask(task);
+      const freeSlots =
+        this.config.TASK_MAX_PARALLEL - this.processingTasks.size;
+      if (freeSlots <= 0 || actionableTasks.length === 0) {
+        return;
       }
+      const tasksToProcess = actionableTasks.slice(0, freeSlots);
+      for (const task of tasksToProcess) {
+        this.processingTasks.add(task.id);
+      }
+      // Each task manages its own error handling and in-flight cleanup.
+      await Promise.all(
+        tasksToProcess.map((task) => this.processTask(task)),
+      );
     } catch (error) {
       logger.error(
         `Failed to poll tasks from Planner: ${(error as Error).message}`,
@@ -73,9 +91,28 @@ export class Agent {
         `Task '${task.title}' (${task.id}) completed and moved to status '${this.config.TASK_STATUS_END}'`,
       );
     } catch (error) {
+      const message = (error as Error).message;
       logger.error(
-        `Failed to process task '${task.title}' (${task.id}): ${(error as Error).message}`,
+        `Failed to process task '${task.title}' (${task.id}): ${message}`,
       );
+      // A failing task must not block the agent by staying in the start
+      // status forever: it is moved to the end status with an explanation.
+      try {
+        await this.planner.addTaskComment(
+          task.id,
+          buildFailureComment(message, this.config.TASK_STATUS_END),
+        );
+        await this.planner.updateTaskStatus(task.id, this.config.TASK_STATUS_END);
+        logger.info(
+          `Task '${task.title}' (${task.id}) moved to status '${this.config.TASK_STATUS_END}' after a processing failure`,
+        );
+      } catch (cleanupError) {
+        logger.error(
+          `Failed to move task '${task.title}' (${task.id}) to status '${this.config.TASK_STATUS_END}' after the processing failure: ${(cleanupError as Error).message}`,
+        );
+      }
+    } finally {
+      this.processingTasks.delete(task.id);
     }
   }
 
@@ -124,4 +161,19 @@ export class Agent {
     await fse.ensureDir(path.dirname(notesFile));
     await fse.writeFile(notesFile, brief + agentNotes);
   }
+}
+
+// The comment posted on a task that failed to process: the explanation of
+// the error, kept concise, and the resulting status change.
+function buildFailureComment(message: string, endStatus: string): string {
+  const explanation =
+    message.length > MAX_FAILURE_EXPLANATION_LENGTH
+      ? `${message.slice(0, MAX_FAILURE_EXPLANATION_LENGTH)}...`
+      : message;
+  return [
+    "Task processing failed:",
+    explanation,
+    "",
+    `The task was moved to '${endStatus}' so it does not block the agent. Check the agent logs for more details.`,
+  ].join("\n");
 }

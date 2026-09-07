@@ -178,6 +178,17 @@ describe("Config", () => {
       ]);
     });
 
+    it("should report an invalid TASK_MAX_PARALLEL", () => {
+      const config = new Config();
+      config.PLANNER_API_KEY = "key";
+      config.TASK_MAX_PARALLEL = 0;
+
+      const errors = config.validate();
+      expect(errors).toEqual([
+        "TASK_MAX_PARALLEL must be a positive integer (current value: '0')",
+      ]);
+    });
+
     it("should not require agent note configuration by default", () => {
       const config = new Config();
       config.PLANNER_API_KEY = "key";
