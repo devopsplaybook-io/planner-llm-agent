@@ -4,6 +4,10 @@ LLM agent that connects to a [Planner](https://github.com/devopsplaybook-io/plan
 
 The agent polls the Planner API for tasks assigned to its user, executes the tasks in the start status (default `To Do`) with the [Qoder CLI](https://qoder.com), posts the result as a task comment and moves the task to the end status (default `Done`). For each task it maintains a documentation file at `/data/tasks/[id]-Agent.md` that keeps the context of the task across runs.
 
+Polling stays quiet: log entries are only emitted when a task is ready to be processed and during its processing (plus errors), not on every poll cycle.
+
+Tasks are processed with a bounded parallelism: at most `TASK_MAX_PARALLEL` tasks (default `1`) run at the same time, and a task already being processed is never picked again by a subsequent poll. A task that fails to process is not retried forever: it is moved to the end status with a comment explaining the error (kept concise in the comment; see the agent logs for full details), so it does not block the queue.
+
 The container ships all the toolchains needed to perform the tasks (Node.js, Python, Go, Rust, Java, shellcheck, jq, yq, kubectl, helm) as well as a complete Git and GitHub tooling set (`git`, `gh`, `gnupg`, `openssh-client`).
 
 ## Configuration
@@ -18,12 +22,13 @@ Configuration values are resolved with the following priority:
 
 | Variable | Default | Description |
 | --- | --- | --- |
-| `AGENT_NAME` | `planner-llm-agent` | Planner user name the agent acts as |
+| `AGENT_NAME` | `planner-llm-agent` | Planner user name the agent acts as (also used in the agent note title) |
 | `PLANNER_URL` | `http://localhost:8080` | Planner instance base URL |
 | `PLANNER_API_KEY` | (empty) | Planner API key (required) |
 | `TASK_POLLING_INTERVAL` | `60` | Seconds between polls of assigned tasks |
 | `TASK_STATUS_START` | `To Do` | Only tasks with this status are executed |
 | `TASK_STATUS_END` | `Done` | Status set after a task is executed |
+| `TASK_MAX_PARALLEL` | `1` | Maximum number of tasks processed in parallel |
 | `DATA_DIR` | `/data` | Persistent data directory (task documentation files) |
 | `TMP_DIR` | `/tmp` | Temporary directory |
 | `DEV_MODE` | `false` | Development mode flag |
@@ -72,7 +77,8 @@ All Git and GitHub settings are optional: the agent automatically prepares the e
 | --- | --- | --- |
 | `GIT_USER_NAME` | `planner-llm-agent` | Git committer name |
 | `GIT_USER_EMAIL` | `planner-llm-agent@users.noreply.github.com` | Git committer email |
-| `GITHUB_TOKEN` | (empty) | GitHub Personal Access Token |
+| `GITHUB_TOKEN` | (empty) | GitHub Personal Access Token used as the default token |
+| `GITHUB_TOKENS` | (empty) | Additional tokens scoped by organization, format `org1=token1,org2=token2` |
 | `GIT_SSH_PRIVATE_KEY` | (empty) | SSH private key for `git@github.com` (OpenSSH or PEM) |
 | `GIT_SSH_SIGNING` | `false` | Use the SSH key for commit signing instead of GPG |
 | `GIT_GPG_PRIVATE_KEY` | (empty) | Armored GPG private key for commit signing |
@@ -80,6 +86,27 @@ All Git and GitHub settings are optional: the agent automatically prepares the e
 | `GIT_GPG_PASSPHRASE` | (empty) | GPG key passphrase (cached in gpg-agent for headless signing) |
 
 Multi-line values (SSH and GPG keys) can be provided either with real newlines or with literal `\n` escape sequences.
+
+### Multiple organization tokens
+
+Tasks can involve repositories from several GitHub organizations, while each token is scoped to a single organization. Set `GITHUB_TOKENS` to a comma-separated list of `organization=token` pairs (in the environment or in `config.json`):
+
+```json
+{
+  "GITHUB_TOKEN": "github_pat_default_token",
+  "GITHUB_TOKENS": "my-org=github_pat_org1token,other-org=github_pat_org2token"
+}
+```
+
+Git HTTPS operations against `https://github.com/<organization>/...` automatically use the matching organization token (per-organization credential helpers, with the path component considered); everything else keeps using the default `GITHUB_TOKEN` through the `gh` credential helper. Organization names are matched exactly as they appear in the repository URLs, so configure them in the casing used by the repositories (lowercase is typical). The default token stays optional when every accessed organization has its own token, and the tokens are validated at startup (format, duplicate organizations, obviously too-short values).
+
+Each organization token is also exposed to the tasks as a `GH_TOKEN_<ORG>` environment variable (e.g. `my-org` becomes `GH_TOKEN_MY_ORG`), because the `gh` CLI only reads the default `GH_TOKEN`, which is not guaranteed to have the rights required for every organization. Tasks are instructed to prefix `gh` commands with the matching variable for the organization they operate on:
+
+```sh
+GH_TOKEN="$GH_TOKEN_MY_ORG" gh pr create ...
+```
+
+When no default token is configured and exactly one organization token exists, that token is additionally used as the default `GH_TOKEN`.
 
 ### Agent config repository
 
@@ -89,6 +116,13 @@ Multi-line values (SSH and GPG keys) can be provided either with real newlines o
 | `AGENT_CONFIG_BRANCH` | `main` | Branch to sync |
 | `AGENT_CONFIG_FOLDER` | (empty) | Only sync this folder of the repository (sparse checkout) |
 | `AGENT_CONFIG_SYNC_INTERVAL` | `300` | Seconds between refreshes of the local copy |
+
+### Agent note
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `AGENT_NOTE_PROJECT` | (empty) | Planner project where the agent note is published (id or name; empty disables the feature) |
+| `AGENT_NOTE_INTERVAL` | `86400` | Seconds between agent note updates (default: daily); `0` disables the updates |
 
 ## Git and GitHub authentication
 
@@ -148,6 +182,29 @@ Example:
   "AGENT_CONFIG_BRANCH": "main",
   "AGENT_CONFIG_FOLDER": "config",
   "AGENT_CONFIG_SYNC_INTERVAL": 300
+}
+```
+
+## Agent note
+
+When `AGENT_NOTE_PROJECT` is set, the agent maintains a single Planner note in that project, titled `Planner LLM Agent: <AGENT_NAME>`. The note is created when missing and updated in place afterwards — it is never duplicated. An existing note titled with the plain agent name (previous format) is adopted and retitled on the next update.
+
+The note content is generated by the LLM from facts collected by the agent:
+
+- Agent identity: name, version, current date and session uptime
+- Capabilities: the skills available from the agent config repository and the configured default model
+- Git and GitHub integration: authentication and commit signing setup, including the organizations with dedicated tokens
+- Activity: the number of tasks executed and the titles of the most recent ones
+- Account status: the remaining qoder credits
+
+At the end of the startup the agent checks that the note exists and creates it when missing (an existing note is left untouched); the content is then refreshed every `AGENT_NOTE_INTERVAL` seconds (86400 = daily by default, set `3600` for hourly updates). A failed update is logged and retried on the next interval; it never stops the agent.
+
+Example configuration (hourly updates):
+
+```json
+{
+  "AGENT_NOTE_PROJECT": "Agent Workspace",
+  "AGENT_NOTE_INTERVAL": 3600
 }
 ```
 

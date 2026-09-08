@@ -85,6 +85,9 @@ describe("GitEnvironment", () => {
   afterEach(async () => {
     process.env = originalEnv;
     delete process.env.GH_TOKEN;
+    delete process.env.GH_TOKEN_ORG_A;
+    delete process.env.GH_TOKEN_ORG_B;
+    delete process.env.GH_TOKEN_MYORG;
     delete process.env.GIT_TERMINAL_PROMPT;
     delete process.env.GNUPGHOME;
     jest.restoreAllMocks();
@@ -143,6 +146,86 @@ describe("GitEnvironment", () => {
     await expect(run()).resolves.toBeUndefined();
 
     expect(process.env.GH_TOKEN).toBe("existing-token");
+  });
+
+  it("configures per-organization credential helpers without a default token", async () => {
+    config.GITHUB_TOKENS =
+      "org-a=github_pat_aaaaaaaaaaaaaaaaaaaa,org-b=github_pat_bbbbbbbbbbbbbbbbbbbb";
+    mockCli(() => "");
+
+    await expect(run()).resolves.toBeUndefined();
+
+    const gitconfig = await readFile(".gitconfig");
+    expect(gitconfig).toContain("[credential]");
+    expect(gitconfig).toContain("\tuseHttpPath = true");
+    expect(gitconfig).toContain('[credential "https://github.com/org-a"]');
+    expect(gitconfig).toContain('[credential "https://github.com/org-b"]');
+    expect(gitconfig).toContain(
+      `\thelper = "!f() { echo username=x-access-token; echo password=github_pat_aaaaaaaaaaaaaaaaaaaa; }; f"`,
+    );
+    // No default token: no host-wide helper and no GH_TOKEN, but SSH clone
+    // URLs are still rewritten so the organization tokens apply.
+    expect(gitconfig).not.toContain('[credential "https://github.com"]');
+    expect(gitconfig).toContain('[url "https://github.com/"]');
+    expect(process.env.GH_TOKEN).toBeUndefined();
+  });
+
+  it("writes the organization helpers before the host-wide helper", async () => {
+    config.GITHUB_TOKEN = GITHUB_TOKEN;
+    config.GITHUB_TOKENS = "myorg=github_pat_cccccccccccccccccccc";
+    mockCli(() => "");
+
+    await expect(run()).resolves.toBeUndefined();
+
+    const gitconfig = await readFile(".gitconfig");
+    // Git stops at the first helper that returns a complete credential, so
+    // the organization helper must come first to take precedence.
+    expect(gitconfig.indexOf('[credential "https://github.com/myorg"]')).toBeLessThan(
+      gitconfig.indexOf('[credential "https://github.com"]'),
+    );
+    expect(process.env.GH_TOKEN).toBe(GITHUB_TOKEN);
+  });
+
+  it("exposes organization tokens as GH_TOKEN_<ORG> environment variables", async () => {
+    config.GITHUB_TOKENS =
+      "org-a=github_pat_aaaaaaaaaaaaaaaaaaaa,org-b=github_pat_bbbbbbbbbbbbbbbbbbbb";
+    mockCli(() => "");
+
+    await expect(run()).resolves.toBeUndefined();
+
+    expect(process.env.GH_TOKEN_ORG_A).toBe("github_pat_aaaaaaaaaaaaaaaaaaaa");
+    expect(process.env.GH_TOKEN_ORG_B).toBe("github_pat_bbbbbbbbbbbbbbbbbbbb");
+    // Several organizations and no default token: no promotion.
+    expect(process.env.GH_TOKEN).toBeUndefined();
+  });
+
+  it("uses a single organization token as the default for the gh CLI", async () => {
+    config.GITHUB_TOKENS = "myorg=github_pat_cccccccccccccccccccc";
+    mockCli(() => "");
+
+    await expect(run()).resolves.toBeUndefined();
+
+    expect(process.env.GH_TOKEN_MYORG).toBe("github_pat_cccccccccccccccccccc");
+    expect(process.env.GH_TOKEN).toBe("github_pat_cccccccccccccccccccc");
+  });
+
+  it("does not overwrite existing organization token variables", async () => {
+    config.GITHUB_TOKENS = "myorg=github_pat_cccccccccccccccccccc";
+    process.env.GH_TOKEN_MYORG = "preset-token";
+    mockCli(() => "");
+
+    await expect(run()).resolves.toBeUndefined();
+
+    expect(process.env.GH_TOKEN_MYORG).toBe("preset-token");
+  });
+
+  it("rejects an organization token that is too short", async () => {
+    config.GITHUB_TOKENS = "myorg=short";
+    mockCli(() => "");
+
+    await expect(run()).rejects.toThrow(
+      /GITHUB_TOKENS token for organization 'myorg' is too short/,
+    );
   });
 
   it("writes the SSH key and pins the GitHub host keys", async () => {

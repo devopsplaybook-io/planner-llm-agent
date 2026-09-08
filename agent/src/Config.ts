@@ -26,6 +26,9 @@ export class Config {
   public TASK_POLLING_INTERVAL: number;
   public TASK_STATUS_START: string;
   public TASK_STATUS_END: string;
+  public TASK_MAX_PARALLEL: number;
+  public AGENT_NOTE_PROJECT: string;
+  public AGENT_NOTE_INTERVAL: number;
 
   // Qoder CLI
   public QODER_CLI: string;
@@ -36,6 +39,7 @@ export class Config {
   public GIT_USER_NAME: string;
   public GIT_USER_EMAIL: string;
   public GITHUB_TOKEN: string;
+  public GITHUB_TOKENS: string;
   public GIT_SSH_PRIVATE_KEY: string;
   public GIT_SSH_SIGNING: string;
   public GIT_GPG_PRIVATE_KEY: string;
@@ -81,6 +85,9 @@ export class Config {
     this.TASK_POLLING_INTERVAL = 60;
     this.TASK_STATUS_START = "To Do";
     this.TASK_STATUS_END = "Done";
+    this.TASK_MAX_PARALLEL = 1;
+    this.AGENT_NOTE_PROJECT = "";
+    this.AGENT_NOTE_INTERVAL = 86400;
 
     this.QODER_CLI = "qoder";
     this.QODER_AUTH_CHECK = "true";
@@ -89,6 +96,7 @@ export class Config {
     this.GIT_USER_NAME = "planner-llm-agent";
     this.GIT_USER_EMAIL = "planner-llm-agent@users.noreply.github.com";
     this.GITHUB_TOKEN = "";
+    this.GITHUB_TOKENS = "";
     this.GIT_SSH_PRIVATE_KEY = "";
     this.GIT_SSH_SIGNING = "false";
     this.GIT_GPG_PRIVATE_KEY = "";
@@ -136,6 +144,15 @@ export class Config {
     if (config.TASK_STATUS_END) {
       this.TASK_STATUS_END = config.TASK_STATUS_END as string;
     }
+    if (config.TASK_MAX_PARALLEL) {
+      this.TASK_MAX_PARALLEL = config.TASK_MAX_PARALLEL as number;
+    }
+    if (config.AGENT_NOTE_PROJECT) {
+      this.AGENT_NOTE_PROJECT = config.AGENT_NOTE_PROJECT as string;
+    }
+    if (config.AGENT_NOTE_INTERVAL) {
+      this.AGENT_NOTE_INTERVAL = config.AGENT_NOTE_INTERVAL as number;
+    }
     if (config.QODER_CLI) {
       this.QODER_CLI = config.QODER_CLI as string;
     }
@@ -153,6 +170,9 @@ export class Config {
     }
     if (config.GITHUB_TOKEN) {
       this.GITHUB_TOKEN = config.GITHUB_TOKEN as string;
+    }
+    if (config.GITHUB_TOKENS) {
+      this.GITHUB_TOKENS = config.GITHUB_TOKENS as string;
     }
     if (config.GIT_SSH_PRIVATE_KEY) {
       this.GIT_SSH_PRIVATE_KEY = config.GIT_SSH_PRIVATE_KEY as string;
@@ -228,6 +248,15 @@ export class Config {
     if (process.env.TASK_STATUS_END) {
       this.TASK_STATUS_END = process.env.TASK_STATUS_END;
     }
+    if (process.env.TASK_MAX_PARALLEL) {
+      this.TASK_MAX_PARALLEL = parseInt(process.env.TASK_MAX_PARALLEL);
+    }
+    if (process.env.AGENT_NOTE_PROJECT) {
+      this.AGENT_NOTE_PROJECT = process.env.AGENT_NOTE_PROJECT;
+    }
+    if (process.env.AGENT_NOTE_INTERVAL) {
+      this.AGENT_NOTE_INTERVAL = parseInt(process.env.AGENT_NOTE_INTERVAL);
+    }
     if (process.env.QODER_CLI) {
       this.QODER_CLI = process.env.QODER_CLI;
     }
@@ -245,6 +274,9 @@ export class Config {
     }
     if (process.env.GITHUB_TOKEN) {
       this.GITHUB_TOKEN = process.env.GITHUB_TOKEN;
+    }
+    if (process.env.GITHUB_TOKENS) {
+      this.GITHUB_TOKENS = process.env.GITHUB_TOKENS;
     }
     if (process.env.GIT_SSH_PRIVATE_KEY) {
       this.GIT_SSH_PRIVATE_KEY = process.env.GIT_SSH_PRIVATE_KEY;
@@ -293,6 +325,14 @@ export class Config {
     }
   }
 
+  /**
+   * The GitHub organization tokens parsed from GITHUB_TOKENS; malformed
+   * entries are skipped (validation reports them).
+   */
+  public githubTokenEntries(): GithubTokenEntry[] {
+    return parseGithubTokens(this.GITHUB_TOKENS);
+  }
+
   public validate(): string[] {
     const errors: string[] = [];
 
@@ -321,6 +361,63 @@ export class Config {
       );
     }
 
+    if (
+      !Number.isInteger(this.TASK_MAX_PARALLEL) ||
+      this.TASK_MAX_PARALLEL <= 0
+    ) {
+      errors.push(
+        `TASK_MAX_PARALLEL must be a positive integer (current value: '${this.TASK_MAX_PARALLEL}')`,
+      );
+    }
+
+    // The organization tokens are optional; when set, every entry must be a
+    // well-formed 'organization=token' pair so that a misconfiguration fails
+    // fast at startup instead of surfacing inside a task.
+    if (this.GITHUB_TOKENS.trim().length > 0) {
+      const seen = new Set<string>();
+      for (const part of this.GITHUB_TOKENS.split(",")) {
+        const trimmed = part.trim();
+        if (trimmed.length === 0) {
+          continue;
+        }
+        const separator = trimmed.indexOf("=");
+        if (separator <= 0) {
+          errors.push(
+            `GITHUB_TOKENS entry '${trimmed}' must be in the format 'organization=token'`,
+          );
+          continue;
+        }
+        const organization = trimmed.slice(0, separator).trim();
+        const token = trimmed.slice(separator + 1).trim();
+        if (!/^[A-Za-z0-9-]+$/.test(organization)) {
+          errors.push(
+            `GITHUB_TOKENS organization '${organization}' is not a valid GitHub organization name (alphanumeric characters and hyphens only)`,
+          );
+          continue;
+        }
+        if (token.length === 0) {
+          errors.push(
+            `GITHUB_TOKENS token must not be empty for organization '${organization}'`,
+          );
+          continue;
+        }
+        if (/[\s"'\\]/.test(token)) {
+          errors.push(
+            `GITHUB_TOKENS token for organization '${organization}' contains unsupported characters (whitespace, quotes or backslashes)`,
+          );
+          continue;
+        }
+        const key = organization.toLowerCase();
+        if (seen.has(key)) {
+          errors.push(
+            `GITHUB_TOKENS contains a duplicate organization '${organization}'`,
+          );
+          continue;
+        }
+        seen.add(key);
+      }
+    }
+
     if (this.AGENT_CONFIG_REPOSITORY.trim().length > 0) {
       if (this.AGENT_CONFIG_BRANCH.trim().length === 0) {
         errors.push(
@@ -337,6 +434,58 @@ export class Config {
       }
     }
 
+    // The agent note is enabled by setting AGENT_NOTE_PROJECT (the interval
+    // then defaults to a daily update); without a project the feature stays
+    // disabled and no configuration error is raised.
+    if (this.AGENT_NOTE_PROJECT.trim().length > 0) {
+      if (
+        !Number.isInteger(this.AGENT_NOTE_INTERVAL) ||
+        this.AGENT_NOTE_INTERVAL < 0
+      ) {
+        errors.push(
+          `AGENT_NOTE_INTERVAL must be a positive integer or 0 to disable (current value: '${this.AGENT_NOTE_INTERVAL}')`,
+        );
+      }
+    }
+
     return errors;
   }
+}
+
+export interface GithubTokenEntry {
+  organization: string;
+  token: string;
+}
+
+/**
+ * Parses the GITHUB_TOKENS value: a comma-separated list of
+ * 'organization=token' entries. Malformed entries are skipped; the
+ * configuration validation reports them.
+ */
+export function parseGithubTokens(value: string): GithubTokenEntry[] {
+  const entries: GithubTokenEntry[] = [];
+  for (const part of value.split(",")) {
+    const trimmed = part.trim();
+    const separator = trimmed.indexOf("=");
+    if (separator <= 0) {
+      continue;
+    }
+    const organization = trimmed.slice(0, separator).trim();
+    const token = trimmed.slice(separator + 1).trim();
+    if (organization.length === 0 || token.length === 0) {
+      continue;
+    }
+    entries.push({ organization, token });
+  }
+  return entries;
+}
+
+/**
+ * Environment variable name exposing the dedicated token of a GitHub
+ * organization to the agent and its task processes (e.g. the organization
+ * 'my-org' is exposed as GH_TOKEN_MY_ORG). The organization names accepted
+ * by validate() cannot contain underscores, so the mapping is unambiguous.
+ */
+export function githubTokenEnvName(organization: string): string {
+  return `GH_TOKEN_${organization.toUpperCase().replace(/[^A-Z0-9]/g, "_")}`;
 }

@@ -196,4 +196,150 @@ describe("PlannerClient", () => {
       "Failed to reach Planner at 'http://planner.test:8080/api/users/session'",
     );
   });
+
+  it("should list the visible projects", async () => {
+    fetchMock.mockResolvedValue(
+      new Response(
+        JSON.stringify([
+          { id: "p1", name: "Agent Workspace", other: "ignored" },
+          { id: "p2", name: "Personal" },
+        ]),
+        { status: 200 },
+      ),
+    );
+
+    const client = new PlannerClient(config);
+    const projects = await client.listProjects();
+
+    expect(projects).toEqual([
+      { id: "p1", name: "Agent Workspace" },
+      { id: "p2", name: "Personal" },
+    ]);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://planner.test:8080/api/projects",
+      expect.objectContaining({ method: "GET" }),
+    );
+  });
+
+  it("should list the notes of a project", async () => {
+    fetchMock.mockResolvedValue(
+      new Response(
+        JSON.stringify([
+          {
+            id: "note-1",
+            projectId: "p1",
+            title: "agent",
+            description: "note content",
+          },
+          { id: "note-2", projectId: "p1", title: "no description" },
+        ]),
+        { status: 200 },
+      ),
+    );
+
+    const client = new PlannerClient(config);
+    const notes = await client.listNotes("p1");
+
+    expect(notes).toEqual([
+      {
+        id: "note-1",
+        projectId: "p1",
+        title: "agent",
+        description: "note content",
+      },
+      {
+        id: "note-2",
+        projectId: "p1",
+        title: "no description",
+        description: "",
+      },
+    ]);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://planner.test:8080/api/notes?projectId=p1",
+      expect.objectContaining({ method: "GET" }),
+    );
+  });
+
+  it("should create a note in a project", async () => {
+    fetchMock.mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          id: "note-1",
+          projectId: "p1",
+          title: "agent",
+          description: "note content",
+        }),
+        { status: 201 },
+      ),
+    );
+
+    const client = new PlannerClient(config);
+    const note = await client.createNote("p1", "agent", "note content");
+
+    expect(note).toEqual({
+      id: "note-1",
+      projectId: "p1",
+      title: "agent",
+      description: "note content",
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://planner.test:8080/api/notes",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({
+          projectId: "p1",
+          title: "agent",
+          description: "note content",
+        }),
+      }),
+    );
+  });
+
+  it("should throw a clear error when the note creation response is invalid", async () => {
+    fetchMock.mockResolvedValue(
+      new Response(JSON.stringify({ error: "boom" }), { status: 200 }),
+    );
+
+    const client = new PlannerClient(config);
+    await expect(client.createNote("p1", "agent", "content")).rejects.toThrow(
+      "Planner note creation response is missing the note id",
+    );
+  });
+
+  it("should update the description of an existing note", async () => {
+    fetchMock.mockResolvedValue(
+      new Response(JSON.stringify({ id: "note-1" }), { status: 200 }),
+    );
+
+    const client = new PlannerClient(config);
+    await client.updateNote("note-1", "updated content");
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://planner.test:8080/api/notes/note-1",
+      expect.objectContaining({
+        method: "PUT",
+        body: JSON.stringify({ description: "updated content" }),
+      }),
+    );
+  });
+
+  it("should update the title and description of an existing note", async () => {
+    fetchMock.mockResolvedValue(
+      new Response(JSON.stringify({ id: "note-1" }), { status: 200 }),
+    );
+
+    const client = new PlannerClient(config);
+    await client.updateNote("note-1", "updated content", "New title");
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://planner.test:8080/api/notes/note-1",
+      expect.objectContaining({
+        method: "PUT",
+        body: JSON.stringify({
+          description: "updated content",
+          title: "New title",
+        }),
+      }),
+    );
+  });
 });

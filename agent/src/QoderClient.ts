@@ -1,6 +1,6 @@
 import * as fse from "fs-extra";
 import * as path from "path";
-import { Config } from "./Config";
+import { Config, githubTokenEnvName } from "./Config";
 import { getAgentConfigContentPath } from "./AgentConfigRepository";
 import { ExecFileError, extractErrorDetail, runCli } from "./CliUtils";
 import { OTelLogger, OTelTracer } from "./OTelContext";
@@ -10,6 +10,7 @@ const logger = OTelLogger().createModuleLogger("qoder-client");
 
 const AUTH_CHECK_TIMEOUT_MS = 120000;
 const TASK_TIMEOUT_MS = 1800000;
+const PROMPT_TIMEOUT_MS = 600000;
 const PROBE_PROMPT = "Reply with exactly: OK";
 
 export class QoderClient {
@@ -93,6 +94,19 @@ export class QoderClient {
         "Read the documentation file first: it contains the task description and all comments.",
         "Git and the GitHub CLI (gh) are already configured with authentication for Git and GitHub operations.",
       ];
+      const githubTokenEntries = this.config.githubTokenEntries();
+      if (githubTokenEntries.length > 0) {
+        promptLines.push(
+          'The default GH_TOKEN does not necessarily have the rights for every GitHub organization.',
+          'Dedicated tokens are available per organization: for gh operations on repositories of an organization listed below, prefix the command with its token variable, e.g. GH_TOKEN="$GH_TOKEN_MY_ORG" gh pr create.',
+          `Organizations and token variables: ${githubTokenEntries
+            .map(
+              (entry) =>
+                `${entry.organization} -> ${githubTokenEnvName(entry.organization)}`,
+            )
+            .join(", ")}.`,
+        );
+      }
       if (this.config.AGENT_CONFIG_REPOSITORY.trim().length > 0) {
         promptLines.push(
           `Agent configuration (skills, configuration files and other resources) is synced locally at: ${getAgentConfigContentPath(this.config)}. Use it whenever it is relevant to the task.`,
@@ -195,6 +209,63 @@ export class QoderClient {
       span.end();
     }
   }
+
+  // Run a standalone prompt through the qoder CLI and return the reply text.
+  // Used for content generation outside of task execution.
+  public async runPrompt(prompt: string): Promise<string> {
+    const span = OTelTracer().startSpan("qoder-client.run-prompt");
+    const args = ["-p", prompt];
+    if (this.config.QODER_MODEL.trim().length > 0) {
+      args.push("--model", this.config.QODER_MODEL.trim());
+    }
+    args.push(
+      "--output-format",
+      "json",
+      "--permission-mode",
+      "bypass_permissions",
+    );
+    try {
+      const creditsBefore = await readCredits(this.config);
+      logger.info(
+        `Qoder credits before prompt: ${formatCredits(creditsBefore)}`,
+      );
+      const result = await runCli(this.config.QODER_CLI, args, {
+        timeout: PROMPT_TIMEOUT_MS,
+        windowsHide: true,
+        maxBuffer: 10 * 1024 * 1024,
+      });
+      const creditsAfter = extractCredits(result.stdout);
+      if (creditsAfter !== null) {
+        await writeCredits(this.config, creditsAfter);
+      }
+      logger.info(`Qoder credits after prompt: ${formatCredits(creditsAfter)}`);
+      const reply = extractJsonResponse(result.stdout);
+      if (reply !== null && reply.length > 0) {
+        return reply;
+      }
+      return result.stdout.trim();
+    } catch (error) {
+      const execError = error as ExecFileError;
+      span.recordException(execError);
+      if (execError.code === "ENOENT") {
+        throw new Error(
+          `Qoder CLI '${this.config.QODER_CLI}' not found in PATH`,
+          { cause: error },
+        );
+      }
+      if (execError.killed) {
+        throw new Error(
+          `Qoder prompt timed out after ${PROMPT_TIMEOUT_MS / 1000} seconds`,
+          { cause: error },
+        );
+      }
+      throw new Error(`Qoder prompt failed:\n${extractErrorDetail(execError)}`, {
+        cause: error,
+      });
+    } finally {
+      span.end();
+    }
+  }
 }
 
 function getSummaryFile(notesFile: string): string {
@@ -233,7 +304,7 @@ function getCreditsFile(config: Config): string {
   return path.join(config.DATA_DIR, "qoder-credits.json");
 }
 
-async function readCredits(config: Config): Promise<number | null> {
+export async function readCredits(config: Config): Promise<number | null> {
   try {
     const content = await fse.readJson(getCreditsFile(config));
     const credits = content?.credits;

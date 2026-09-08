@@ -50,6 +50,33 @@ describe("Agent", () => {
   let config: Config;
   let dataDir: string;
   let logSpy: jest.SpyInstance;
+  // All agents created by a test are stopped in afterEach, so a failing
+  // assertion never leaks a polling interval into the next test.
+  let agents: Agent[] = [];
+
+  const createAgent = (): Agent => {
+    const agent = new Agent(config);
+    agents.push(agent);
+    return agent;
+  };
+
+  // Simulates the Planner state: updateTaskStatus changes the status of the
+  // task, so a processed task is not returned as ready anymore.
+  const mockPlannerTasks = (
+    tasks: { id: string; title: string; status: string; description: string; comments: unknown[] }[],
+  ) => {
+    mockPlanner.listAssignedTasks.mockImplementation(async () =>
+      tasks.map((task) => ({ ...task })),
+    );
+    mockPlanner.updateTaskStatus.mockImplementation(
+      async (id: string, status: string) => {
+        const task = tasks.find((candidate) => candidate.id === id);
+        if (task) {
+          task.status = status;
+        }
+      },
+    );
+  };
 
   beforeEach(() => {
     logSpy = jest.spyOn(console, "log").mockImplementation(jest.fn());
@@ -80,6 +107,10 @@ describe("Agent", () => {
   });
 
   afterEach(() => {
+    for (const agent of agents) {
+      agent.stop();
+    }
+    agents = [];
     jest.useRealTimers();
     jest.restoreAllMocks();
     fse.removeSync(dataDir);
@@ -89,7 +120,7 @@ describe("Agent", () => {
   it("should log the agent name and polling interval on start", () => {
     config.AGENT_NAME = "test-agent";
 
-    const agent = new Agent(config);
+    const agent = createAgent();
     agent.start();
 
     expect(console.log).toHaveBeenCalledWith(
@@ -103,7 +134,7 @@ describe("Agent", () => {
 
   it("should poll for tasks immediately and at the configured interval", async () => {
     jest.useFakeTimers();
-    const agent = new Agent(config);
+    const agent = createAgent();
     agent.start();
     expect(mockPlanner.getCurrentUser).toHaveBeenCalledTimes(1); // initial poll
 
@@ -112,7 +143,7 @@ describe("Agent", () => {
     agent.stop();
   });
 
-  it("should log the assigned tasks with their status", async () => {
+  it("should not log when assigned tasks are not ready to be processed", async () => {
     jest.useFakeTimers();
     mockPlanner.listAssignedTasks.mockResolvedValue([
       {
@@ -131,30 +162,28 @@ describe("Agent", () => {
       },
     ]);
 
-    const agent = new Agent(config);
+    const agent = createAgent();
     agent.start();
     await jest.advanceTimersByTimeAsync(0);
 
-    expect(console.log).toHaveBeenCalledWith(
-      expect.stringContaining("Tasks assigned to 'Test User' (2):"),
+    expect(console.log).not.toHaveBeenCalledWith(
+      expect.stringContaining("Tasks assigned"),
     );
-    expect(console.log).toHaveBeenCalledWith(
-      expect.stringContaining("[In Progress] Fix the build"),
-    );
-    expect(console.log).toHaveBeenCalledWith(
-      expect.stringContaining("[Blocked] Review PR"),
-    );
+    expect(mockQoder.performTask).not.toHaveBeenCalled();
     agent.stop();
   });
 
-  it("should log when no tasks are assigned", async () => {
+  it("should not log when no tasks are assigned", async () => {
     jest.useFakeTimers();
-    const agent = new Agent(config);
+    const agent = createAgent();
     agent.start();
     await jest.advanceTimersByTimeAsync(0);
 
-    expect(console.log).toHaveBeenCalledWith(
-      expect.stringContaining("No tasks currently assigned to 'Test User'"),
+    expect(console.log).not.toHaveBeenCalledWith(
+      expect.stringContaining("No tasks currently assigned"),
+    );
+    expect(console.log).not.toHaveBeenCalledWith(
+      expect.stringContaining("Tasks assigned"),
     );
     agent.stop();
   });
@@ -178,7 +207,7 @@ describe("Agent", () => {
     ]);
     mockQoder.performTask.mockResolvedValue("Feature implemented");
 
-    const agent = new Agent(config);
+    const agent = createAgent();
     agent.start();
     await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
 
@@ -218,7 +247,7 @@ describe("Agent", () => {
     ]);
     mockQoder.performTask.mockResolvedValue("Feature implemented");
 
-    const agent = new Agent(config);
+    const agent = createAgent();
     agent.start();
     await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
 
@@ -263,7 +292,7 @@ describe("Agent", () => {
     ]);
     mockQoder.performTask.mockResolvedValue("Feature implemented");
 
-    const agent = new Agent(config);
+    const agent = createAgent();
     agent.start();
     await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
 
@@ -274,7 +303,7 @@ describe("Agent", () => {
     agent.stop();
   });
 
-  it("should not comment or update status when qoder fails", async () => {
+  it("should move a failing task to the end status with an explanation", async () => {
     mockPlanner.listAssignedTasks.mockResolvedValue([
       {
         id: "task-1",
@@ -288,23 +317,217 @@ describe("Agent", () => {
       new Error("Qoder task execution failed:\nboom"),
     );
 
-    const agent = new Agent(config);
+    const agent = createAgent();
     agent.start();
-    await waitFor(() =>
-      logSpy.mock.calls.some((call) =>
-        String(call[0]).includes(
-          "Failed to process task 'Implement feature' (task-1)",
-        ),
-      ),
-    );
+    await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
 
     expect(console.log).toHaveBeenCalledWith(
       expect.stringContaining(
         "Failed to process task 'Implement feature' (task-1)",
       ),
     );
-    expect(mockPlanner.addTaskComment).not.toHaveBeenCalled();
+    expect(mockPlanner.addTaskComment).toHaveBeenCalledWith(
+      "task-1",
+      expect.stringContaining("Task processing failed:"),
+    );
+    expect(mockPlanner.addTaskComment).toHaveBeenCalledWith(
+      "task-1",
+      expect.stringContaining("boom"),
+    );
+    expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith("task-1", "Done");
+    agent.stop();
+  });
+
+  it("should truncate a long failure explanation", async () => {
+    mockPlanner.listAssignedTasks.mockResolvedValue([
+      {
+        id: "task-1",
+        title: "Implement feature",
+        status: "To Do",
+        description: "Add a feature",
+        comments: [],
+      },
+    ]);
+    mockQoder.performTask.mockRejectedValue(new Error("x".repeat(1500)));
+
+    const agent = createAgent();
+    agent.start();
+    await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
+
+    const comment = mockPlanner.addTaskComment.mock.calls[0][1] as string;
+    expect(comment).toContain("Task processing failed:");
+    expect(comment).toContain(`${"x".repeat(1000)}...`);
+    expect(comment).not.toContain("x".repeat(1001));
+    agent.stop();
+  });
+
+  it("should log an error when a failed task cannot be moved to the end status", async () => {
+    mockPlanner.listAssignedTasks.mockResolvedValue([
+      {
+        id: "task-1",
+        title: "Implement feature",
+        status: "To Do",
+        description: "Add a feature",
+        comments: [],
+      },
+    ]);
+    mockQoder.performTask.mockRejectedValue(new Error("boom"));
+    mockPlanner.addTaskComment.mockRejectedValue(
+      new Error("Planner is down"),
+    );
+
+    const agent = createAgent();
+    agent.start();
+    await waitFor(() =>
+      logSpy.mock.calls.some((call) =>
+        String(call[0]).includes(
+          "Failed to move task 'Implement feature' (task-1) to status 'Done'",
+        ),
+      ),
+    );
+
     expect(mockPlanner.updateTaskStatus).not.toHaveBeenCalled();
+    agent.stop();
+  });
+
+  it("should not pick a task again while it is still being processed", async () => {
+    config.TASK_POLLING_INTERVAL = 1;
+    let resolveTask: (value: string) => void = () => undefined;
+    mockPlannerTasks([
+      {
+        id: "task-1",
+        title: "Long task",
+        status: "To Do",
+        description: "Take your time",
+        comments: [],
+      },
+    ]);
+    mockQoder.performTask.mockImplementation(
+      () =>
+        new Promise<string>((resolve) => {
+          resolveTask = resolve;
+        }),
+    );
+
+    const agent = createAgent();
+    agent.start();
+    await waitFor(() => mockQoder.performTask.mock.calls.length === 1);
+
+    // Several polling cycles pass while the task is still processing.
+    await new Promise((resolve) => setTimeout(resolve, 2200));
+    expect(mockQoder.performTask).toHaveBeenCalledTimes(1);
+
+    resolveTask("Finally done");
+    await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
+    agent.stop();
+  });
+
+  it("should process only one task at a time by default", async () => {
+    config.TASK_POLLING_INTERVAL = 1;
+    let resolveFirst: (value: string) => void = () => undefined;
+    mockPlannerTasks([
+      {
+        id: "task-1",
+        title: "First task",
+        status: "To Do",
+        description: "",
+        comments: [],
+      },
+      {
+        id: "task-2",
+        title: "Second task",
+        status: "To Do",
+        description: "",
+        comments: [],
+      },
+    ]);
+    mockQoder.performTask
+      .mockImplementationOnce(
+        () =>
+          new Promise<string>((resolve) => {
+            resolveFirst = resolve;
+          }),
+      )
+      .mockResolvedValue("Second task done");
+
+    const agent = createAgent();
+    agent.start();
+    // Only the first task is picked while it is still being processed.
+    await waitFor(() => mockQoder.performTask.mock.calls.length === 1);
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    expect(mockQoder.performTask).toHaveBeenCalledTimes(1);
+    expect(mockQoder.performTask).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "task-1" }),
+      expect.any(String),
+    );
+
+    // Once it completes, the second task is picked on the next poll.
+    resolveFirst("First task done");
+    await waitFor(() => mockQoder.performTask.mock.calls.length === 2);
+    await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length === 2);
+    expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith("task-2", "Done");
+    agent.stop();
+  });
+
+  it("should process multiple tasks in parallel up to the configured limit", async () => {
+    config.TASK_POLLING_INTERVAL = 1;
+    config.TASK_MAX_PARALLEL = 2;
+    const resolvers: ((value: string) => void)[] = [];
+    mockPlannerTasks([
+      {
+        id: "task-1",
+        title: "First task",
+        status: "To Do",
+        description: "",
+        comments: [],
+      },
+      {
+        id: "task-2",
+        title: "Second task",
+        status: "To Do",
+        description: "",
+        comments: [],
+      },
+      {
+        id: "task-3",
+        title: "Third task",
+        status: "To Do",
+        description: "",
+        comments: [],
+      },
+    ]);
+    mockQoder.performTask.mockImplementation(
+      () =>
+        new Promise<string>((resolve) => {
+          resolvers.push(resolve);
+        }),
+    );
+
+    const agent = createAgent();
+    agent.start();
+    // Two tasks start processing in parallel, the third one waits.
+    await waitFor(() => mockQoder.performTask.mock.calls.length === 2);
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    expect(mockQoder.performTask).toHaveBeenCalledTimes(2);
+    expect(mockQoder.performTask).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "task-1" }),
+      expect.any(String),
+    );
+    expect(mockQoder.performTask).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "task-2" }),
+      expect.any(String),
+    );
+
+    // Once a slot frees up, the third task is picked on the next poll.
+    resolvers[0]("First done");
+    resolvers[1]("Second done");
+    await waitFor(() => mockQoder.performTask.mock.calls.length === 3);
+    expect(mockQoder.performTask).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "task-3" }),
+      expect.any(String),
+    );
+    resolvers[2]("Third done");
+    await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length === 3);
     agent.stop();
   });
 
@@ -316,7 +539,7 @@ describe("Agent", () => {
       ),
     );
 
-    const agent = new Agent(config);
+    const agent = createAgent();
     agent.start();
     await jest.advanceTimersByTimeAsync(0);
     expect(console.log).toHaveBeenCalledWith(
@@ -330,7 +553,7 @@ describe("Agent", () => {
 
   it("should stop polling when stopped", async () => {
     jest.useFakeTimers();
-    const agent = new Agent(config);
+    const agent = createAgent();
     agent.start();
     agent.stop();
     await jest.advanceTimersByTimeAsync(60000);
