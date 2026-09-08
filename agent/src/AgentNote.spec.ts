@@ -260,7 +260,7 @@ describe("AgentNote", () => {
       expect(prompt).toContain("12.50");
       expect(prompt).toContain("Git and GitHub integration: configured");
       expect(prompt).toContain(
-        "GitHub organizations with dedicated tokens: org-one, org-two",
+        "GitHub organizations with dedicated tokens: org-one (GH_TOKEN_ORG_ONE), org-two (GH_TOKEN_ORG_TWO)",
       );
     });
   });

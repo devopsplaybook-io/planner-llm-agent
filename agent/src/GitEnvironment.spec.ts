@@ -85,6 +85,9 @@ describe("GitEnvironment", () => {
   afterEach(async () => {
     process.env = originalEnv;
     delete process.env.GH_TOKEN;
+    delete process.env.GH_TOKEN_ORG_A;
+    delete process.env.GH_TOKEN_ORG_B;
+    delete process.env.GH_TOKEN_MYORG;
     delete process.env.GIT_TERMINAL_PROMPT;
     delete process.env.GNUPGHOME;
     jest.restoreAllMocks();
@@ -181,6 +184,39 @@ describe("GitEnvironment", () => {
       gitconfig.indexOf('[credential "https://github.com"]'),
     );
     expect(process.env.GH_TOKEN).toBe(GITHUB_TOKEN);
+  });
+
+  it("exposes organization tokens as GH_TOKEN_<ORG> environment variables", async () => {
+    config.GITHUB_TOKENS =
+      "org-a=github_pat_aaaaaaaaaaaaaaaaaaaa,org-b=github_pat_bbbbbbbbbbbbbbbbbbbb";
+    mockCli(() => "");
+
+    await expect(run()).resolves.toBeUndefined();
+
+    expect(process.env.GH_TOKEN_ORG_A).toBe("github_pat_aaaaaaaaaaaaaaaaaaaa");
+    expect(process.env.GH_TOKEN_ORG_B).toBe("github_pat_bbbbbbbbbbbbbbbbbbbb");
+    // Several organizations and no default token: no promotion.
+    expect(process.env.GH_TOKEN).toBeUndefined();
+  });
+
+  it("uses a single organization token as the default for the gh CLI", async () => {
+    config.GITHUB_TOKENS = "myorg=github_pat_cccccccccccccccccccc";
+    mockCli(() => "");
+
+    await expect(run()).resolves.toBeUndefined();
+
+    expect(process.env.GH_TOKEN_MYORG).toBe("github_pat_cccccccccccccccccccc");
+    expect(process.env.GH_TOKEN).toBe("github_pat_cccccccccccccccccccc");
+  });
+
+  it("does not overwrite existing organization token variables", async () => {
+    config.GITHUB_TOKENS = "myorg=github_pat_cccccccccccccccccccc";
+    process.env.GH_TOKEN_MYORG = "preset-token";
+    mockCli(() => "");
+
+    await expect(run()).resolves.toBeUndefined();
+
+    expect(process.env.GH_TOKEN_MYORG).toBe("preset-token");
   });
 
   it("rejects an organization token that is too short", async () => {

@@ -1,7 +1,7 @@
 import * as fse from "fs-extra";
 import * as path from "path";
 import { getAgentConfigContentPath } from "./AgentConfigRepository";
-import { Config } from "./Config";
+import { Config, githubTokenEnvName } from "./Config";
 import { OTelLogger, OTelTracer } from "./OTelContext";
 import { PlannerClient, PlannerNote, PlannerProject } from "./PlannerClient";
 import { QoderClient, readCredits } from "./QoderClient";
@@ -181,7 +181,12 @@ export class AgentNote {
       `- Git and GitHub integration: ${gitEnabled ? "configured" : "not configured"}`,
       `- GitHub organizations with dedicated tokens: ${
         githubTokenEntries.length > 0
-          ? githubTokenEntries.map((entry) => entry.organization).join(", ")
+          ? githubTokenEntries
+              .map(
+                (entry) =>
+                  `${entry.organization} (${githubTokenEnvName(entry.organization)})`,
+              )
+              .join(", ")
           : "none"
       }`,
       `- Commit signing: ${signing}`,

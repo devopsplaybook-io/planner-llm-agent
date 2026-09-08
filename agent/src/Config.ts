@@ -479,3 +479,13 @@ export function parseGithubTokens(value: string): GithubTokenEntry[] {
   }
   return entries;
 }
+
+/**
+ * Environment variable name exposing the dedicated token of a GitHub
+ * organization to the agent and its task processes (e.g. the organization
+ * 'my-org' is exposed as GH_TOKEN_MY_ORG). The organization names accepted
+ * by validate() cannot contain underscores, so the mapping is unambiguous.
+ */
+export function githubTokenEnvName(organization: string): string {
+  return `GH_TOKEN_${organization.toUpperCase().replace(/[^A-Z0-9]/g, "_")}`;
+}

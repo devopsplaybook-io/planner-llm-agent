@@ -98,7 +98,15 @@ Tasks can involve repositories from several GitHub organizations, while each tok
 }
 ```
 
-Git HTTPS operations against `https://github.com/<organization>/...` automatically use the matching organization token (per-organization credential helpers, with the path component considered); everything else keeps using the default `GITHUB_TOKEN` through the `gh` credential helper. Organization names are matched exactly as they appear in the repository URLs, so configure them in the casing used by the repositories (lowercase is typical). The `gh` CLI itself always authenticates with the default `GITHUB_TOKEN`. The default token stays optional when every accessed organization has its own token, and the tokens are validated at startup (format, duplicate organizations, obviously too-short values).
+Git HTTPS operations against `https://github.com/<organization>/...` automatically use the matching organization token (per-organization credential helpers, with the path component considered); everything else keeps using the default `GITHUB_TOKEN` through the `gh` credential helper. Organization names are matched exactly as they appear in the repository URLs, so configure them in the casing used by the repositories (lowercase is typical). The default token stays optional when every accessed organization has its own token, and the tokens are validated at startup (format, duplicate organizations, obviously too-short values).
+
+Each organization token is also exposed to the tasks as a `GH_TOKEN_<ORG>` environment variable (e.g. `my-org` becomes `GH_TOKEN_MY_ORG`), because the `gh` CLI only reads the default `GH_TOKEN`, which is not guaranteed to have the rights required for every organization. Tasks are instructed to prefix `gh` commands with the matching variable for the organization they operate on:
+
+```sh
+GH_TOKEN="$GH_TOKEN_MY_ORG" gh pr create ...
+```
+
+When no default token is configured and exactly one organization token exists, that token is additionally used as the default `GH_TOKEN`.
 
 ### Agent config repository
 

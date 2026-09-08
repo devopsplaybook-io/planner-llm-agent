@@ -242,6 +242,64 @@ describe("QoderClient", () => {
     expect(await fse.pathExists(summaryFile)).toBe(false);
   });
 
+  it("should document the organization token variables in the task prompt", async () => {
+    config.GITHUB_TOKENS =
+      "my-org=github_pat_aaaaaaaaaaaaaaaaaaaa,other-org=github_pat_bbbbbbbbbbbbbbbbbbbb";
+    mockExecFile.mockImplementation(
+      (
+        _command: string,
+        _args: string[],
+        _options: unknown,
+        callback: (error: Error | null, stdout: string, stderr: string) => void,
+      ) => callback(null, JSON.stringify({ result: "Done" }), ""),
+    );
+
+    const client = new QoderClient(config);
+    await client.performTask(
+      {
+        id: "task-1",
+        title: "Implement feature",
+        status: "To Do",
+        description: "Add a feature",
+        comments: [],
+      },
+      path.join(os.tmpdir(), "qoder-spec", "task-1-Agent.md"),
+    );
+
+    const [, args] = mockExecFile.mock.calls[0];
+    const prompt = String(args[1]);
+    expect(prompt).toContain('GH_TOKEN="$GH_TOKEN_MY_ORG" gh pr create');
+    expect(prompt).toContain(
+      "my-org -> GH_TOKEN_MY_ORG, other-org -> GH_TOKEN_OTHER_ORG",
+    );
+  });
+
+  it("should not document organization token variables when none are configured", async () => {
+    mockExecFile.mockImplementation(
+      (
+        _command: string,
+        _args: string[],
+        _options: unknown,
+        callback: (error: Error | null, stdout: string, stderr: string) => void,
+      ) => callback(null, JSON.stringify({ result: "Done" }), ""),
+    );
+
+    const client = new QoderClient(config);
+    await client.performTask(
+      {
+        id: "task-1",
+        title: "Implement feature",
+        status: "To Do",
+        description: "Add a feature",
+        comments: [],
+      },
+      path.join(os.tmpdir(), "qoder-spec", "task-1-Agent.md"),
+    );
+
+    const [, args] = mockExecFile.mock.calls[0];
+    expect(String(args[1])).not.toContain("GH_TOKEN_");
+  });
+
   it("should fall back to the json response when qoder does not write a summary file", async () => {
     mockExecFile.mockImplementation(
       (

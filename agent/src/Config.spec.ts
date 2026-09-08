@@ -1,7 +1,7 @@
 import * as fs from "fs-extra";
 import * as os from "os";
 import * as path from "path";
-import { Config } from "./Config";
+import { Config, githubTokenEnvName } from "./Config";
 
 describe("Config", () => {
   const originalEnv = process.env;
@@ -230,6 +230,13 @@ describe("Config", () => {
       expect(config.validate()).toEqual([
         "GITHUB_TOKENS entry 'just-a-token' must be in the format 'organization=token'",
       ]);
+    });
+
+    it("should derive unambiguous token environment variable names", () => {
+      expect(githubTokenEnvName("devopsplaybook-io")).toBe(
+        "GH_TOKEN_DEVOPSPLAYBOOK_IO",
+      );
+      expect(githubTokenEnvName("MyOrg")).toBe("GH_TOKEN_MYORG");
     });
 
     it("should report an empty GITHUB_TOKENS token", () => {

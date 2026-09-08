@@ -1,6 +1,6 @@
 import * as fse from "fs-extra";
 import * as path from "path";
-import { Config } from "./Config";
+import { Config, githubTokenEnvName } from "./Config";
 import { getAgentConfigContentPath } from "./AgentConfigRepository";
 import { ExecFileError, extractErrorDetail, runCli } from "./CliUtils";
 import { OTelLogger, OTelTracer } from "./OTelContext";
@@ -94,6 +94,19 @@ export class QoderClient {
         "Read the documentation file first: it contains the task description and all comments.",
         "Git and the GitHub CLI (gh) are already configured with authentication for Git and GitHub operations.",
       ];
+      const githubTokenEntries = this.config.githubTokenEntries();
+      if (githubTokenEntries.length > 0) {
+        promptLines.push(
+          'The default GH_TOKEN does not necessarily have the rights for every GitHub organization.',
+          'Dedicated tokens are available per organization: for gh operations on repositories of an organization listed below, prefix the command with its token variable, e.g. GH_TOKEN="$GH_TOKEN_MY_ORG" gh pr create.',
+          `Organizations and token variables: ${githubTokenEntries
+            .map(
+              (entry) =>
+                `${entry.organization} -> ${githubTokenEnvName(entry.organization)}`,
+            )
+            .join(", ")}.`,
+        );
+      }
       if (this.config.AGENT_CONFIG_REPOSITORY.trim().length > 0) {
         promptLines.push(
           `Agent configuration (skills, configuration files and other resources) is synced locally at: ${getAgentConfigContentPath(this.config)}. Use it whenever it is relevant to the task.`,

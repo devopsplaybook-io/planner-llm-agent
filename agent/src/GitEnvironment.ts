@@ -1,7 +1,7 @@
 import * as fse from "fs-extra";
 import * as os from "os";
 import * as path from "path";
-import { Config } from "./Config";
+import { Config, githubTokenEnvName } from "./Config";
 import { ExecFileError, extractErrorDetail, runCli } from "./CliUtils";
 import { OTelLogger, OTelTracer } from "./OTelContext";
 
@@ -32,7 +32,8 @@ const GPG_PRESET_PASSPHRASE_CANDIDATES = [
  * - GitHub token exposed as GH_TOKEN and used by git as an HTTPS credential
  *   helper through the gh CLI
  * - additional GitHub tokens scoped by organization (GITHUB_TOKENS), applied
- *   as per-organization HTTPS credential helpers
+ *   as per-organization HTTPS credential helpers and exposed as
+ *   GH_TOKEN_<ORG> environment variables
  * - SSH private key for git@github.com SSH authentication, with the GitHub
  *   host keys pinned in known_hosts
  * - GPG private key imported for headless commit signing (passphrase cached
@@ -112,16 +113,40 @@ export class GitEnvironment {
         if (!process.env.GH_TOKEN) {
           process.env.GH_TOKEN = githubToken;
         }
-        await this.checkGhCli();
         configured.push("GitHub token (gh CLI and git HTTPS credentials)");
       }
 
       if (githubTokenEntries.length > 0) {
+        // Expose each organization token as GH_TOKEN_<ORG> so tasks can pick
+        // the right token for the gh CLI: gh only reads GH_TOKEN, which is
+        // not guaranteed to have the rights required for every organization.
+        for (const entry of githubTokenEntries) {
+          const envName = githubTokenEnvName(entry.organization);
+          if (!process.env[envName]) {
+            process.env[envName] = entry.token;
+          }
+        }
+        // With a single organization and no default token, that token is
+        // also the default for the gh CLI.
+        if (
+          githubToken.length === 0 &&
+          githubTokenEntries.length === 1 &&
+          !process.env.GH_TOKEN
+        ) {
+          process.env.GH_TOKEN = githubTokenEntries[0].token;
+        }
         configured.push(
           `GitHub organization tokens (${githubTokenEntries
-            .map((entry) => entry.organization)
+            .map(
+              (entry) =>
+                `${entry.organization} as ${githubTokenEnvName(entry.organization)}`,
+            )
             .join(", ")})`,
         );
+      }
+
+      if (githubToken.length > 0 || githubTokenEntries.length > 0) {
+        await this.checkGhCli();
       }
 
       let sshPublicKey = "";
