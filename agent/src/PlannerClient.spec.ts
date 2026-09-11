@@ -135,6 +135,7 @@ describe("PlannerClient", () => {
             dateCreated: "2026-09-02T00:00:00.000Z",
           },
         ],
+        attachments: [],
       },
     ]);
     expect(fetchMock).toHaveBeenCalledWith(
@@ -143,6 +144,84 @@ describe("PlannerClient", () => {
         method: "GET",
         headers: expect.objectContaining({ "x-api-key": "test-api-key" }),
       }),
+    );
+  });
+
+  it("should map task attachments", async () => {
+    fetchMock.mockResolvedValue(
+      new Response(
+        JSON.stringify([
+          {
+            id: "task-1",
+            title: "Fix the build",
+            status: "In Progress",
+            description: "The build is broken",
+            comments: [],
+            attachments: [
+              {
+                id: "attachment-1",
+                fileName: "screenshot.png",
+                filePath: "/uploads/screenshot.png",
+                dateCreated: "2026-09-02T00:00:00.000Z",
+              },
+            ],
+            assignees: [{ userId: "user-1" }],
+          },
+        ]),
+        { status: 200 },
+      ),
+    );
+
+    const client = new PlannerClient(config);
+    const tasks = await client.listAssignedTasks({ id: "user-1", name: "Didier" });
+
+    expect(tasks).toEqual([
+      {
+        id: "task-1",
+        title: "Fix the build",
+        status: "In Progress",
+        description: "The build is broken",
+        comments: [],
+        attachments: [
+          {
+            id: "attachment-1",
+            fileName: "screenshot.png",
+            filePath: "/uploads/screenshot.png",
+            dateCreated: "2026-09-02T00:00:00.000Z",
+          },
+        ],
+      },
+    ]);
+  });
+
+  it("should download a task attachment", async () => {
+    fetchMock.mockResolvedValue(
+      new Response(Buffer.from("file-content"), { status: 200 }),
+    );
+
+    const client = new PlannerClient(config);
+    const data = await client.downloadTaskAttachment("task-1", "attachment-1");
+
+    expect(data.toString()).toBe("file-content");
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://planner.test:8080/api/tasks/task-1/attachments/attachment-1",
+      expect.objectContaining({
+        method: "GET",
+        headers: expect.objectContaining({ "x-api-key": "test-api-key" }),
+      }),
+    );
+  });
+
+  it("should throw a clear error when an attachment download fails", async () => {
+    fetchMock.mockResolvedValue(
+      new Response(JSON.stringify({ error: "Not found" }), { status: 404 }),
+    );
+
+    const client = new PlannerClient(config);
+    await expect(
+      client.downloadTaskAttachment("task-1", "attachment-1"),
+    ).rejects.toThrow(
+      "Planner request to '/api/tasks/task-1/attachments/attachment-1' failed with status 404",
     );
   });
 

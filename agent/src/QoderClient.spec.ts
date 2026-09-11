@@ -216,6 +216,7 @@ describe("QoderClient", () => {
         status: "To Do",
         description: "Add a feature",
         comments: [],
+        attachments: [],
       },
       notesFile,
     );
@@ -262,6 +263,7 @@ describe("QoderClient", () => {
         status: "To Do",
         description: "Add a feature",
         comments: [],
+        attachments: [],
       },
       path.join(os.tmpdir(), "qoder-spec", "task-1-Agent.md"),
     );
@@ -292,6 +294,7 @@ describe("QoderClient", () => {
         status: "To Do",
         description: "Add a feature",
         comments: [],
+        attachments: [],
       },
       path.join(os.tmpdir(), "qoder-spec", "task-1-Agent.md"),
     );
@@ -326,6 +329,7 @@ describe("QoderClient", () => {
         status: "To Do",
         description: "Add a feature",
         comments: [],
+        attachments: [],
       },
       path.join(os.tmpdir(), "qoder-spec", "task-1-Agent.md"),
     );
@@ -351,6 +355,7 @@ describe("QoderClient", () => {
         status: "To Do",
         description: "Add a feature\nqoder-model: claude-opus-4-1\n",
         comments: [],
+        attachments: [],
       },
       path.join(os.tmpdir(), "qoder-spec", "task-1-Agent.md"),
     );
@@ -385,6 +390,7 @@ describe("QoderClient", () => {
         status: "To Do",
         description: "Add a feature",
         comments: [],
+        attachments: [],
       },
       path.join(os.tmpdir(), "qoder-spec", "task-1-Agent.md"),
     );
@@ -419,6 +425,7 @@ describe("QoderClient", () => {
         status: "To Do",
         description: "Add a feature\nQoder-Model: claude-opus-4-1",
         comments: [],
+        attachments: [],
       },
       path.join(os.tmpdir(), "qoder-spec", "task-1-Agent.md"),
     );
@@ -461,6 +468,7 @@ describe("QoderClient", () => {
         status: "To Do",
         description: "Add a feature\nqoder-model: claude-opus-4-1",
         comments: [],
+        attachments: [],
       },
       path.join(os.tmpdir(), "qoder-spec", "task-1-Agent.md"),
     );
@@ -496,6 +504,7 @@ describe("QoderClient", () => {
         status: "To Do",
         description: "Add a feature",
         comments: [],
+        attachments: [],
       },
       path.join(os.tmpdir(), "qoder-spec", "task-1-Agent.md"),
     );
@@ -562,6 +571,7 @@ describe("QoderClient", () => {
         status: "To Do",
         description: "",
         comments: [],
+        attachments: [],
       },
       path.join(os.tmpdir(), "qoder-spec", "task-1-Agent.md"),
     );
@@ -594,6 +604,7 @@ describe("QoderClient", () => {
         status: "To Do",
         description: "",
         comments: [],
+        attachments: [],
       },
       path.join(os.tmpdir(), "qoder-spec", "task-1-Agent.md"),
     );
@@ -619,6 +630,7 @@ describe("QoderClient", () => {
         status: "To Do",
         description: "Add a feature",
         comments: [],
+        attachments: [],
       },
       path.join(os.tmpdir(), "qoder-spec", "task-1-Agent.md"),
     );
@@ -644,6 +656,7 @@ describe("QoderClient", () => {
         status: "To Do",
         description: "",
         comments: [],
+        attachments: [],
       },
       "/tmp/qoder-spec/task-1-Agent.md",
     );
@@ -680,6 +693,7 @@ describe("QoderClient", () => {
           status: "To Do",
           description: "",
           comments: [],
+          attachments: [],
         },
         "/tmp/qoder-spec/task-1-Agent.md",
       ),

@@ -39,6 +39,7 @@ describe("Config", () => {
       expect(config.PLANNER_URL).toBe("http://localhost:8080");
       expect(config.PLANNER_API_KEY).toBe("");
       expect(config.TASK_POLLING_INTERVAL).toBe(60);
+      expect(config.TASK_STATUS_CLEANUP).toBe("Done");
       expect(config.GITHUB_TOKENS).toBe("");
       expect(config.OPENTELEMETRY_COLLECTOR_HTTP_TRACES).toBe("");
       expect(config.OPENTELEMETRY_COLLECTOR_HTTP_METRICS).toBe("");
@@ -67,6 +68,7 @@ describe("Config", () => {
         PLANNER_URL: "http://planner:8080",
         PLANNER_API_KEY: "file-key",
         TASK_POLLING_INTERVAL: 120,
+        TASK_STATUS_CLEANUP: "Archived",
         OPENTELEMETRY_COLLECTOR_HTTP_TRACES: "http://otel:4318/v1/traces",
       });
       process.env.CONFIG_FILE = configFile;
@@ -77,6 +79,7 @@ describe("Config", () => {
       expect(config.PLANNER_URL).toBe("http://planner:8080");
       expect(config.PLANNER_API_KEY).toBe("file-key");
       expect(config.TASK_POLLING_INTERVAL).toBe(120);
+      expect(config.TASK_STATUS_CLEANUP).toBe("Archived");
       expect(config.OPENTELEMETRY_COLLECTOR_HTTP_TRACES).toBe(
         "http://otel:4318/v1/traces",
       );

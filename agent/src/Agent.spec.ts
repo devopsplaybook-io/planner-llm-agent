@@ -21,6 +21,7 @@ const mockPlanner = {
   listAssignedTasks: jest.fn(),
   addTaskComment: jest.fn(),
   updateTaskStatus: jest.fn(),
+  downloadTaskAttachment: jest.fn(),
 };
 const mockQoder = {
   checkAuthentication: jest.fn(),
@@ -63,7 +64,14 @@ describe("Agent", () => {
   // Simulates the Planner state: updateTaskStatus changes the status of the
   // task, so a processed task is not returned as ready anymore.
   const mockPlannerTasks = (
-    tasks: { id: string; title: string; status: string; description: string; comments: unknown[] }[],
+    tasks: {
+      id: string;
+      title: string;
+      status: string;
+      description: string;
+      comments: unknown[];
+      attachments: unknown[];
+    }[],
   ) => {
     mockPlanner.listAssignedTasks.mockImplementation(async () =>
       tasks.map((task) => ({ ...task })),
@@ -94,6 +102,7 @@ describe("Agent", () => {
       mockPlanner.listAssignedTasks,
       mockPlanner.addTaskComment,
       mockPlanner.updateTaskStatus,
+      mockPlanner.downloadTaskAttachment,
       mockQoder.checkAuthentication,
       mockQoder.performTask,
     ]) {
@@ -152,6 +161,7 @@ describe("Agent", () => {
         status: "In Progress",
         description: "",
         comments: [],
+        attachments: [],
       },
       {
         id: "task-2",
@@ -159,6 +169,7 @@ describe("Agent", () => {
         status: "Blocked",
         description: "",
         comments: [],
+        attachments: [],
       },
     ]);
 
@@ -196,6 +207,7 @@ describe("Agent", () => {
         status: "To Do",
         description: "Add a feature",
         comments: [],
+        attachments: [],
       },
       {
         id: "task-2",
@@ -203,6 +215,7 @@ describe("Agent", () => {
         status: "In Progress",
         description: "Another task",
         comments: [],
+        attachments: [],
       },
     ]);
     mockQoder.performTask.mockResolvedValue("Feature implemented");
@@ -228,6 +241,7 @@ describe("Agent", () => {
   });
 
   it("should write the task notes file with description and comments", async () => {
+    config.TASK_STATUS_CLEANUP = "Archived";
     mockPlanner.listAssignedTasks.mockResolvedValue([
       {
         id: "task-1",
@@ -243,6 +257,7 @@ describe("Agent", () => {
             dateCreated: "2026-09-02T00:00:00.000Z",
           },
         ],
+        attachments: [],
       },
     ]);
     mockQoder.performTask.mockResolvedValue("Feature implemented");
@@ -263,6 +278,7 @@ describe("Agent", () => {
   });
 
   it("should preserve existing agent notes across runs", async () => {
+    config.TASK_STATUS_CLEANUP = "Archived";
     const notesFile = path.join(dataDir, "tasks", "task-1-Agent.md");
     await fse.ensureDir(path.dirname(notesFile));
     await fse.writeFile(
@@ -288,6 +304,7 @@ describe("Agent", () => {
         status: "To Do",
         description: "New description",
         comments: [],
+        attachments: [],
       },
     ]);
     mockQoder.performTask.mockResolvedValue("Feature implemented");
@@ -311,6 +328,7 @@ describe("Agent", () => {
         status: "To Do",
         description: "Add a feature",
         comments: [],
+        attachments: [],
       },
     ]);
     mockQoder.performTask.mockRejectedValue(
@@ -346,6 +364,7 @@ describe("Agent", () => {
         status: "To Do",
         description: "Add a feature",
         comments: [],
+        attachments: [],
       },
     ]);
     mockQoder.performTask.mockRejectedValue(new Error("x".repeat(1500)));
@@ -369,6 +388,7 @@ describe("Agent", () => {
         status: "To Do",
         description: "Add a feature",
         comments: [],
+        attachments: [],
       },
     ]);
     mockQoder.performTask.mockRejectedValue(new Error("boom"));
@@ -400,6 +420,7 @@ describe("Agent", () => {
         status: "To Do",
         description: "Take your time",
         comments: [],
+        attachments: [],
       },
     ]);
     mockQoder.performTask.mockImplementation(
@@ -432,6 +453,7 @@ describe("Agent", () => {
         status: "To Do",
         description: "",
         comments: [],
+        attachments: [],
       },
       {
         id: "task-2",
@@ -439,6 +461,7 @@ describe("Agent", () => {
         status: "To Do",
         description: "",
         comments: [],
+        attachments: [],
       },
     ]);
     mockQoder.performTask
@@ -480,6 +503,7 @@ describe("Agent", () => {
         status: "To Do",
         description: "",
         comments: [],
+        attachments: [],
       },
       {
         id: "task-2",
@@ -487,6 +511,7 @@ describe("Agent", () => {
         status: "To Do",
         description: "",
         comments: [],
+        attachments: [],
       },
       {
         id: "task-3",
@@ -494,6 +519,7 @@ describe("Agent", () => {
         status: "To Do",
         description: "",
         comments: [],
+        attachments: [],
       },
     ]);
     mockQoder.performTask.mockImplementation(
@@ -559,5 +585,101 @@ describe("Agent", () => {
     await jest.advanceTimersByTimeAsync(60000);
 
     expect(mockPlanner.getCurrentUser).toHaveBeenCalledTimes(1); // initial poll only
+  });
+
+  it("should download task attachments and list them in the notes file", async () => {
+    config.TASK_STATUS_CLEANUP = "Archived";
+    mockPlanner.listAssignedTasks.mockResolvedValue([
+      {
+        id: "task-1",
+        title: "Implement feature",
+        status: "To Do",
+        description: "Add a feature",
+        comments: [],
+        attachments: [
+          {
+            id: "attachment-1",
+            fileName: "screenshot.png",
+            filePath: "/uploads/screenshot.png",
+            dateCreated: "2026-09-02T00:00:00.000Z",
+          },
+        ],
+      },
+    ]);
+    mockPlanner.downloadTaskAttachment.mockResolvedValue(Buffer.from("image"));
+    mockQoder.performTask.mockResolvedValue("Feature implemented");
+
+    const agent = createAgent();
+    agent.start();
+    await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
+
+    expect(mockPlanner.downloadTaskAttachment).toHaveBeenCalledWith(
+      "task-1",
+      "attachment-1",
+    );
+    const notesFile = path.join(dataDir, "tasks", "task-1-Agent.md");
+    const content = await fse.readFile(notesFile, "utf8");
+    expect(content).toContain("## Attachments");
+    expect(content).toContain("screenshot.png");
+    const attachmentFile = path.join(
+      dataDir,
+      "tasks",
+      "task-1",
+      "attachments",
+      "screenshot.png",
+    );
+    expect(await fse.pathExists(attachmentFile)).toBe(true);
+    expect(await fse.readFile(attachmentFile)).toEqual(Buffer.from("image"));
+    agent.stop();
+  });
+
+  it("should clean up the task folder immediately when the task reaches the cleanup status", async () => {
+    const taskId = "48c603af-4725-47f5-ac4e-628e027291e8";
+    mockPlanner.listAssignedTasks.mockResolvedValue([
+      {
+        id: taskId,
+        title: "Implement feature",
+        status: "To Do",
+        description: "Add a feature",
+        comments: [],
+        attachments: [],
+      },
+    ]);
+    mockQoder.performTask.mockResolvedValue("Feature implemented");
+
+    const agent = createAgent();
+    agent.start();
+    await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
+
+    expect(
+      await fse.pathExists(path.join(dataDir, "tasks", `${taskId}-Agent.md`)),
+    ).toBe(false);
+    expect(
+      await fse.pathExists(path.join(dataDir, "tasks", taskId)),
+    ).toBe(false);
+    agent.stop();
+  });
+
+  it("should clean up task folders during polling when tasks are no longer assigned", async () => {
+    const taskId = "48c603af-4725-47f5-ac4e-628e027291e8";
+    const tasksDir = path.join(dataDir, "tasks");
+    await fse.ensureDir(tasksDir);
+    await fse.writeFile(path.join(tasksDir, `${taskId}-Agent.md`), "# Task");
+    await fse.ensureDir(path.join(tasksDir, taskId, "attachments"));
+    mockPlanner.listAssignedTasks.mockResolvedValue([]);
+
+    const agent = createAgent();
+    agent.start();
+    await waitFor(
+      () =>
+        !fse.pathExistsSync(path.join(tasksDir, `${taskId}-Agent.md`)) &&
+        !fse.pathExistsSync(path.join(tasksDir, taskId)),
+    );
+
+    expect(
+      await fse.pathExists(path.join(tasksDir, `${taskId}-Agent.md`)),
+    ).toBe(false);
+    expect(await fse.pathExists(path.join(tasksDir, taskId))).toBe(false);
+    agent.stop();
   });
 });
