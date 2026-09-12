@@ -3,12 +3,12 @@ import * as fse from "fs-extra";
 import * as os from "os";
 import * as path from "path";
 import { QoderClient } from "./QoderClient";
-import { Config } from "./Config";
+import { Config } from "../Config";
 
 // The shared logger is created inside the factory because the mocked
 // module is first required during the import evaluation, before any
 // declaration of this file has run; it is retrieved with requireMock below.
-jest.mock("./OTelContext", () => {
+jest.mock("../OTelContext", () => {
   const logger = { info: jest.fn(), warn: jest.fn(), error: jest.fn() };
   return {
     __logger: logger,
@@ -26,7 +26,7 @@ jest.mock("./OTelContext", () => {
 });
 
 const mockLogger = (
-  jest.requireMock("./OTelContext") as {
+  jest.requireMock("../OTelContext") as {
     __logger: { info: jest.Mock; warn: jest.Mock; error: jest.Mock };
   }
 ).__logger;
@@ -428,6 +428,37 @@ describe("QoderClient", () => {
         title: "Implement feature",
         status: "To Do",
         description: "Add a feature\nqoder-model: claude-opus-4-1\n",
+        comments: [],
+        attachments: [],
+      },
+      path.join(os.tmpdir(), "qoder-spec", "task-1-Agent.md"),
+    );
+
+    const args = promptArgs();
+    expect(args.slice(-6)).toEqual([
+      "--model",
+      "claude-opus-4-1",
+      "--output-format",
+      "json",
+      "--permission-mode",
+      "bypass_permissions",
+    ]);
+  });
+
+  it("should run the task with the model requested with a generic agent-model line", async () => {
+    respondToCli(
+      JSON.stringify({ result: "Done" }),
+      "MODEL\nAuto\nclaude-opus-4-1\n",
+    );
+
+    const client = new QoderClient(config);
+    await client.performTask(
+      {
+        id: "task-1",
+        projectId: "project-1",
+        title: "Implement feature",
+        status: "To Do",
+        description: "Add a feature\nagent-model: claude-opus-4-1\n",
         comments: [],
         attachments: [],
       },

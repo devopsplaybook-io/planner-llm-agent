@@ -31,9 +31,16 @@ export class Config {
   public AGENT_NOTE_PROJECT: string;
   public AGENT_NOTE_INTERVAL: number;
 
+  // CLI agent
+  public AGENT_CLI: string;
+  public AGENT_AUTH_CHECK: string;
   // Qoder CLI
   public QODER_CLI: string;
-  public QODER_AUTH_CHECK: string;
+  // Per-CLI command overrides
+  public CLAUDE_CLI: string;
+  public COPILOT_CLI: string;
+  public CODEX_CLI: string;
+  public GEMINI_CLI: string;
 
   // Git and GitHub integration
   public GIT_USER_NAME: string;
@@ -88,8 +95,13 @@ export class Config {
     this.AGENT_NOTE_PROJECT = "";
     this.AGENT_NOTE_INTERVAL = 86400;
 
+    this.AGENT_CLI = "qoder";
+    this.AGENT_AUTH_CHECK = "true";
     this.QODER_CLI = "qoder";
-    this.QODER_AUTH_CHECK = "true";
+    this.CLAUDE_CLI = "claude";
+    this.COPILOT_CLI = "copilot";
+    this.CODEX_CLI = "codex";
+    this.GEMINI_CLI = "gemini";
 
     this.GIT_USER_NAME = "planner-llm-agent";
     this.GIT_USER_EMAIL = "planner-llm-agent@users.noreply.github.com";
@@ -154,11 +166,26 @@ export class Config {
     if (config.AGENT_NOTE_INTERVAL) {
       this.AGENT_NOTE_INTERVAL = config.AGENT_NOTE_INTERVAL as number;
     }
+    if (config.AGENT_CLI) {
+      this.AGENT_CLI = config.AGENT_CLI as string;
+    }
+    if (config.AGENT_AUTH_CHECK) {
+      this.AGENT_AUTH_CHECK = config.AGENT_AUTH_CHECK as string;
+    }
     if (config.QODER_CLI) {
       this.QODER_CLI = config.QODER_CLI as string;
     }
-    if (config.QODER_AUTH_CHECK) {
-      this.QODER_AUTH_CHECK = config.QODER_AUTH_CHECK as string;
+    if (config.CLAUDE_CLI) {
+      this.CLAUDE_CLI = config.CLAUDE_CLI as string;
+    }
+    if (config.COPILOT_CLI) {
+      this.COPILOT_CLI = config.COPILOT_CLI as string;
+    }
+    if (config.CODEX_CLI) {
+      this.CODEX_CLI = config.CODEX_CLI as string;
+    }
+    if (config.GEMINI_CLI) {
+      this.GEMINI_CLI = config.GEMINI_CLI as string;
     }
     if (config.GIT_USER_NAME) {
       this.GIT_USER_NAME = config.GIT_USER_NAME as string;
@@ -258,11 +285,26 @@ export class Config {
     if (process.env.AGENT_NOTE_INTERVAL) {
       this.AGENT_NOTE_INTERVAL = parseInt(process.env.AGENT_NOTE_INTERVAL);
     }
+    if (process.env.AGENT_CLI) {
+      this.AGENT_CLI = process.env.AGENT_CLI;
+    }
+    if (process.env.AGENT_AUTH_CHECK) {
+      this.AGENT_AUTH_CHECK = process.env.AGENT_AUTH_CHECK;
+    }
     if (process.env.QODER_CLI) {
       this.QODER_CLI = process.env.QODER_CLI;
     }
-    if (process.env.QODER_AUTH_CHECK) {
-      this.QODER_AUTH_CHECK = process.env.QODER_AUTH_CHECK;
+    if (process.env.CLAUDE_CLI) {
+      this.CLAUDE_CLI = process.env.CLAUDE_CLI;
+    }
+    if (process.env.COPILOT_CLI) {
+      this.COPILOT_CLI = process.env.COPILOT_CLI;
+    }
+    if (process.env.CODEX_CLI) {
+      this.CODEX_CLI = process.env.CODEX_CLI;
+    }
+    if (process.env.GEMINI_CLI) {
+      this.GEMINI_CLI = process.env.GEMINI_CLI;
     }
     if (process.env.GIT_USER_NAME) {
       this.GIT_USER_NAME = process.env.GIT_USER_NAME;
@@ -452,9 +494,30 @@ export class Config {
       }
     }
 
+    if (
+      !CLI_AGENT_NAMES.includes(
+        this.AGENT_CLI.trim().toLowerCase() as CliAgentName,
+      )
+    ) {
+      errors.push(
+        `AGENT_CLI '${this.AGENT_CLI}' is not supported (supported CLIs: ${CLI_AGENT_NAMES.join(", ")})`,
+      );
+    }
+
     return errors;
   }
 }
+
+// The coding-agent CLIs supported by the agent (AGENT_CLI values).
+export const CLI_AGENT_NAMES = [
+  "qoder",
+  "claude-code",
+  "copilot-cli",
+  "codex",
+  "gemini-cli",
+] as const;
+
+export type CliAgentName = (typeof CLI_AGENT_NAMES)[number];
 
 export interface GithubTokenEntry {
   organization: string;

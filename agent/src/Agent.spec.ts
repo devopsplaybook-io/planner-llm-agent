@@ -4,19 +4,19 @@ import * as fse from "fs-extra";
 import { Agent } from "./Agent";
 import { AgentActionsConfig } from "./AgentActions";
 import { Config } from "./Config";
+import { createCliAgent } from "./clients/CliAgentRegistry";
 import { PlannerClient } from "./PlannerClient";
-import { QoderClient } from "./QoderClient";
 
 jest.mock("./PlannerClient", () => ({
   PlannerClient: jest.fn(),
 }));
 
-jest.mock("./QoderClient", () => ({
-  QoderClient: jest.fn(),
+jest.mock("./clients/CliAgentRegistry", () => ({
+  createCliAgent: jest.fn(),
 }));
 
 const MockedPlannerClient = PlannerClient as unknown as jest.Mock;
-const MockedQoderClient = QoderClient as unknown as jest.Mock;
+const MockedCreateCliAgent = createCliAgent as unknown as jest.Mock;
 const mockPlanner = {
   getCurrentUser: jest.fn(),
   listAssignedTasks: jest.fn(),
@@ -31,7 +31,7 @@ const mockQoder = {
 };
 
 const AGENT_NOTES_MARKER =
-  "<!-- AGENT-NOTES: the content below is maintained by the Qoder agent. Do not remove this marker. -->";
+  "<!-- AGENT-NOTES: the content below is maintained by the planner agent. Do not remove this marker. -->";
 
 // Wildcard actions (empty project) matching every task in 'To Do' and
 // moving it to 'Done': the default used by the task processing tests.
@@ -117,7 +117,7 @@ describe("Agent", () => {
     config.DATA_DIR = dataDir;
 
     MockedPlannerClient.mockImplementation(() => mockPlanner);
-    MockedQoderClient.mockImplementation(() => mockQoder);
+    MockedCreateCliAgent.mockImplementation(() => mockQoder);
     for (const mock of [
       mockPlanner.getCurrentUser,
       mockPlanner.listAssignedTasks,

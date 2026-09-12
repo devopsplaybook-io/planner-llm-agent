@@ -85,15 +85,22 @@ ENV RUSTUP_HOME=/usr/local/rustup \
     PATH="/usr/local/cargo/bin:${PATH}"
 RUN curl -fsSL https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal
 
-# Qoder CLI
-RUN npm install -g @qoder-ai/qodercli
+# Coding agent CLIs (Qoder is the default; the others are selected with
+# AGENT_CLI: claude-code, copilot-cli, codex, gemini-cli)
+RUN npm install -g \
+      @qoder-ai/qodercli \
+      @anthropic-ai/claude-code \
+      @github/copilot \
+      @openai/codex \
+      @google/gemini-cli
 
 # Verify all tools are available
 RUN node --version && npm --version && git --version && gh --version && \
     kubectl version --client && helm version && yq --version && \
     jq --version && shellcheck --version | head -2 && \
     python3 --version && go version && java --version && \
-    cargo --version && rustc --version && qoder --version
+    cargo --version && rustc --version && qoder --version && \
+    claude --version && copilot --version && codex --version && gemini --version
 
 COPY --from=builder /opt/src/agent/node_modules /opt/app/planner-llm-agent/node_modules
 COPY --from=builder /opt/src/agent/dist /opt/app/planner-llm-agent/dist

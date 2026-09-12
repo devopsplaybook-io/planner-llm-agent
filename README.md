@@ -2,13 +2,13 @@
 
 LLM agent that connects to a [Planner](https://github.com/devopsplaybook-io/planner) instance and can be assigned tasks to execute.
 
-The agent polls the Planner API for tasks assigned to its user and executes the tasks selected by its _actions_ configuration (a YAML file, see [Agent actions](#agent-actions)). It runs the tasks with the [Qoder CLI](https://qoder.com), posts the result as a task comment and moves the task to the end status of the matching action. For each task it maintains a documentation file at `/data/tasks/[id]-Agent.md` that keeps the context of the task across runs. Task attachments are downloaded to `/data/tasks/[id]/attachments/` and listed in the documentation file so the LLM can use them. When a task reaches the cleanup status (default `Done`) the agent deletes its local task folder, and periodically removes folders for tasks that are no longer assigned or have reached the cleanup status.
+The agent polls the Planner API for tasks assigned to its user and executes the tasks selected by its _actions_ configuration (a YAML file, see [Agent actions](#agent-actions)). It runs the tasks with a coding-agent CLI (Qoder by default; Claude Code, Copilot CLI, Codex and Gemini CLI are also supported, see [CLI agent](#cli-agent)), posts the result as a task comment and moves the task to the end status of the matching action. For each task it maintains a documentation file at `/data/tasks/[id]-Agent.md` that keeps the context of the task across runs. Task attachments are downloaded to `/data/tasks/[id]/attachments/` and listed in the documentation file so the LLM can use them. When a task reaches the cleanup status (default `Done`) the agent deletes its local task folder, and periodically removes folders for tasks that are no longer assigned or have reached the cleanup status.
 
 Polling stays quiet: log entries are only emitted when a task is ready to be processed and during its processing (plus errors), not on every poll cycle.
 
 Tasks are processed with a bounded parallelism: at most `TASK_MAX_PARALLEL` tasks (default `1`) run at the same time, and a task already being processed is never picked again by a subsequent poll. A task that fails to process is not retried forever: it is moved to the end status with a comment explaining the error (kept concise in the comment; see the agent logs for full details), so it does not block the queue.
 
-The container ships all the toolchains needed to perform the tasks (Node.js, Python, Go, Rust, Java, shellcheck, jq, yq, kubectl, helm) as well as a complete Git and GitHub tooling set (`git`, `gh`, `gnupg`, `openssh-client`).
+The container ships all the toolchains needed to perform the tasks (Node.js, Python, Go, Rust, Java, shellcheck, jq, yq, kubectl, helm), every supported coding-agent CLI (see [CLI agent](#cli-agent)) as well as a complete Git and GitHub tooling set (`git`, `gh`, `gnupg`, `openssh-client`).
 
 ## Configuration
 
@@ -34,43 +34,55 @@ Configuration values are resolved with the following priority:
 | `TMP_DIR`               | `/tmp`                        | Temporary directory                                                       |
 | `DEV_MODE`              | `false`                       | Development mode flag                                                     |
 
-### Qoder CLI
+### CLI agent
 
-| Variable           | Default | Description                                        |
-| ------------------ | ------- | -------------------------------------------------- |
-| `QODER_CLI`        | `qoder` | Qoder CLI command                                  |
-| `QODER_AUTH_CHECK` | `true`  | Verify Qoder authentication at startup (fail fast) |
+| Variable           | Default  | Description                                                             |
+| ------------------ | -------- | ----------------------------------------------------------------------- |
+| `AGENT_CLI`        | `qoder`  | Coding-agent CLI running the tasks: `qoder`, `claude-code`, `copilot-cli`, `codex` or `gemini-cli` |
+| `AGENT_AUTH_CHECK` | `true`   | Verify the CLI authentication at startup with a headless probe (fail fast) |
+
+The command of each CLI is configurable, and the container ships every supported CLI:
+
+| Variable      | Default   | CLI                                      | Authentication (read by the CLI itself)                          |
+| ------------- | --------- | ---------------------------------------- | ---------------------------------------------------------------- |
+| `QODER_CLI`   | `qoder`   | [Qoder](https://qoder.com)               | `QODER_PERSONAL_ACCESS_TOKEN`                                    |
+| `CLAUDE_CLI`  | `claude`  | [Claude Code](https://code.claude.com)   | `ANTHROPIC_API_KEY` or `CLAUDE_CODE_OAUTH_TOKEN`                 |
+| `COPILOT_CLI` | `copilot` | [Copilot CLI](https://docs.github.com/copilot/concepts/agents/about-copilot-cli) | `GH_TOKEN` (GitHub token with a Copilot subscription) |
+| `CODEX_CLI`   | `codex`   | [Codex](https://developers.openai.com/codex) | `OPENAI_API_KEY` or the ChatGPT login (`codex login`)         |
+| `GEMINI_CLI`  | `gemini`  | [Gemini CLI](https://google-gemini.github.io/gemini-cli/) | `GEMINI_API_KEY` or the OAuth login (`gemini`)  |
+
+Only Qoder supports a model listing; for the other CLIs the model validation is skipped. Some CLIs do not report a usage metric (credits or cost): the task report footer then only displays the model, without warning.
 
 ### Model selection
 
 The model used for a task is resolved with the following priority:
 
-1. A `qoder-model: <model>` line in the task description (per-task override)
+1. An `agent-model: <model>` line in the task description (per-task override; the legacy `qoder-model:` line is still accepted)
 2. The `model` of the matching action (see [Agent actions](#agent-actions))
 3. The `default.model` of the actions configuration
-4. The Qoder CLI default model (when none of the above is set)
+4. The CLI default model (when none of the above is set)
 
-When a task starts, the resolved model is checked against the models available to the Qoder account (`qoder --list-models`, fetched once and cached). A model outside of that list is logged as a warning (with the available models) but the task still runs — the CLI remains the authority on what it can execute.
+When a task starts and the selected CLI supports a model listing (Qoder), the resolved model is checked against the models available to the account (`qoder --list-models`, fetched once and cached). A model outside of that list is logged as a warning (with the available models) but the task still runs — the CLI remains the authority on what it can execute. For the other CLIs the validation is skipped.
 
 Example task description requesting a specific model:
 
 ```
 Fix the failing unit tests in the payment module and update the documentation.
-qoder-model: claude-sonnet-4-5
+agent-model: claude-sonnet-4-5
 ```
 
 When the actions configuration sets a `default.model`, the startup authentication probe also runs with that model, so a misconfigured model fails fast at startup instead of on the first task.
 
 ### Task execution report
 
-Every task comment posted to Planner ends with a footer that displays the model used and the qoder account credits before and after the task execution:
+Every task comment posted to Planner ends with a footer that displays the model used and the usage metric reported by the CLI before and after the task execution:
 
 ```
 ---
 Model: claude-sonnet-4-5 · Qoder credits: 16.41 -> 16.35
 ```
 
-The credit balance comes from the qoder CLI JSON output (`total_credits`) and is persisted in `<DATA_DIR>/qoder-credits.json` — captured at startup by the authentication probe and after each task — so the next task can display the "before" value. The model is displayed as `auto` when no model is configured for the task, and values not reported by the CLI are shown as `unknown`.
+The usage metric depends on the selected CLI: the remaining Qoder credits (`total_credits`, persisted in `<DATA_DIR>/qoder-credits.json`) or the cost of the Claude Code run (`total_cost_usd`, displayed once since it is not a balance). CLIs that report no metric (Copilot CLI, Codex, Gemini CLI) only display the model in the footer. The model is displayed as `auto` when no model is configured for the task, and values not reported by the CLI are shown as `unknown`.
 
 ### Git and GitHub
 
@@ -235,7 +247,7 @@ The note content is generated by the LLM from facts collected by the agent:
 - Capabilities: the skills available from the agent config repository
 - Git and GitHub integration: authentication and commit signing setup, including the organizations with dedicated tokens
 - Activity: the number of tasks executed and the titles of the most recent ones
-- Account status: the remaining qoder credits
+- Account status: the usage metric reported by the CLI (Qoder credits remaining, cost of the last Claude Code run, ...)
 
 The note is updated when the agent starts (so a configuration change is picked up on every restart) and then every `AGENT_NOTE_INTERVAL` seconds (86400 = daily by default, set `3600` for hourly updates). A failed update is logged and retried on the next interval; it never stops the agent.
 

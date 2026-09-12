@@ -2,14 +2,15 @@ import * as fse from "fs-extra";
 import * as path from "path";
 import { AgentAction, AgentActionsConfig } from "./AgentActions";
 import { Config } from "./Config";
+import { createCliAgent } from "./clients/CliAgentRegistry";
+import type { CliAgentClient } from "./clients/CliAgent";
 import { OTelLogger } from "./OTelContext";
 import { PlannerClient, PlannerTask } from "./PlannerClient";
-import { QoderClient } from "./QoderClient";
 
 const logger = OTelLogger().createModuleLogger("agent");
 
 const AGENT_NOTES_MARKER =
-  "<!-- AGENT-NOTES: the content below is maintained by the Qoder agent. Do not remove this marker. -->";
+  "<!-- AGENT-NOTES: the content below is maintained by the planner agent. Do not remove this marker. -->";
 
 // Maximum length of the failure explanation posted on a task.
 const MAX_FAILURE_EXPLANATION_LENGTH = 1000;
@@ -18,7 +19,7 @@ export class Agent {
   private config: Config;
   private agentActions: AgentActionsConfig | null;
   private planner: PlannerClient;
-  private qoder: QoderClient;
+  private cliAgent: CliAgentClient;
   private pollingTimer?: NodeJS.Timeout;
   // Tasks currently being processed: they are never picked again by a
   // subsequent poll while their processing is still running.
@@ -28,7 +29,7 @@ export class Agent {
     this.config = config;
     this.agentActions = agentActions ?? null;
     this.planner = new PlannerClient(config);
-    this.qoder = new QoderClient(config, this.agentActions);
+    this.cliAgent = createCliAgent(config, this.agentActions);
   }
 
   public start(): void {
@@ -147,10 +148,10 @@ export class Agent {
       await this.writeTaskNotes(task, notesFile);
       // The model resolves to the action model, then the actions default
       // model; the task description still overrides both (see
-      // QoderClient.resolveModel).
+      // BaseCliAgent.resolveModel).
       const defaultModel =
         action.model || this.agentActions?.defaultModel || "";
-      const summary = await this.qoder.performTask(task, notesFile, {
+      const summary = await this.cliAgent.performTask(task, notesFile, {
         model: defaultModel,
         instruction: action.instruction,
       });
