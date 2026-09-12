@@ -34,7 +34,6 @@ export class Config {
   // Qoder CLI
   public QODER_CLI: string;
   public QODER_AUTH_CHECK: string;
-  public QODER_MODEL: string;
 
   // Git and GitHub integration
   public GIT_USER_NAME: string;
@@ -91,7 +90,6 @@ export class Config {
 
     this.QODER_CLI = "qoder";
     this.QODER_AUTH_CHECK = "true";
-    this.QODER_MODEL = "";
 
     this.GIT_USER_NAME = "planner-llm-agent";
     this.GIT_USER_EMAIL = "planner-llm-agent@users.noreply.github.com";
@@ -161,9 +159,6 @@ export class Config {
     }
     if (config.QODER_AUTH_CHECK) {
       this.QODER_AUTH_CHECK = config.QODER_AUTH_CHECK as string;
-    }
-    if (config.QODER_MODEL) {
-      this.QODER_MODEL = config.QODER_MODEL as string;
     }
     if (config.GIT_USER_NAME) {
       this.GIT_USER_NAME = config.GIT_USER_NAME as string;
@@ -268,9 +263,6 @@ export class Config {
     }
     if (process.env.QODER_AUTH_CHECK) {
       this.QODER_AUTH_CHECK = process.env.QODER_AUTH_CHECK;
-    }
-    if (process.env.QODER_MODEL) {
-      this.QODER_MODEL = process.env.QODER_MODEL;
     }
     if (process.env.GIT_USER_NAME) {
       this.GIT_USER_NAME = process.env.GIT_USER_NAME;

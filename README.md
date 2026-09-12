@@ -36,11 +36,10 @@ Configuration values are resolved with the following priority:
 
 ### Qoder CLI
 
-| Variable           | Default | Description                                                                   |
-| ------------------ | ------- | ----------------------------------------------------------------------------- |
-| `QODER_CLI`        | `qoder` | Qoder CLI command                                                             |
-| `QODER_AUTH_CHECK` | `true`  | Verify Qoder authentication at startup (fail fast)                            |
-| `QODER_MODEL`      | (empty) | Default model passed to the Qoder CLI (`--model`); empty uses the CLI default |
+| Variable           | Default | Description                                        |
+| ------------------ | ------- | -------------------------------------------------- |
+| `QODER_CLI`        | `qoder` | Qoder CLI command                                  |
+| `QODER_AUTH_CHECK` | `true`  | Verify Qoder authentication at startup (fail fast) |
 
 ### Model selection
 
@@ -49,8 +48,7 @@ The model used for a task is resolved with the following priority:
 1. A `qoder-model: <model>` line in the task description (per-task override)
 2. The `model` of the matching action (see [Agent actions](#agent-actions))
 3. The `default.model` of the actions configuration
-4. The `QODER_MODEL` configuration value (default model)
-5. The Qoder CLI default model (when none of the above is set)
+4. The Qoder CLI default model (when none of the above is set)
 
 When a task starts, the resolved model is checked against the models available to the Qoder account (`qoder --list-models`, fetched once and cached). A model outside of that list is logged as a warning (with the available models) but the task still runs — the CLI remains the authority on what it can execute.
 
@@ -61,7 +59,7 @@ Fix the failing unit tests in the payment module and update the documentation.
 qoder-model: claude-sonnet-4-5
 ```
 
-When `QODER_MODEL` is set, the startup authentication probe also runs with that model, so a misconfigured model fails fast at startup instead of on the first task.
+When the actions configuration sets a `default.model`, the startup authentication probe also runs with that model, so a misconfigured model fails fast at startup instead of on the first task.
 
 ### Task execution report
 

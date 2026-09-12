@@ -117,7 +117,6 @@ describe("QoderClient", () => {
   });
 
   it("should use the default model for the authentication probe", async () => {
-    config.QODER_MODEL = "claude-sonnet-4-5";
     mockExecFile.mockImplementation(
       (
         _command: string,
@@ -127,7 +126,10 @@ describe("QoderClient", () => {
       ) => callback(null, JSON.stringify({ response: "OK" }), ""),
     );
 
-    const client = new QoderClient(config);
+    const client = new QoderClient(config, {
+      defaultModel: "claude-sonnet-4-5",
+      actions: [],
+    });
     await expect(client.checkAuthentication()).resolves.toBeUndefined();
 
     const [, args] = mockExecFile.mock.calls[0];
@@ -444,7 +446,6 @@ describe("QoderClient", () => {
   });
 
   it("should run the task with the default model when the description has no request", async () => {
-    config.QODER_MODEL = "claude-sonnet-4-5";
     respondToCli(
       JSON.stringify({ result: "Done" }),
       "MODEL\nAuto\nclaude-sonnet-4-5\n",
@@ -462,6 +463,8 @@ describe("QoderClient", () => {
         attachments: [],
       },
       path.join(os.tmpdir(), "qoder-spec", "task-1-Agent.md"),
+      // The agent passes the actions default model in the task options.
+      { model: "claude-sonnet-4-5" },
     );
 
     const args = promptArgs();
@@ -476,7 +479,6 @@ describe("QoderClient", () => {
   });
 
   it("should prioritize the task description model over the default model", async () => {
-    config.QODER_MODEL = "claude-sonnet-4-5";
     respondToCli(
       JSON.stringify({ result: "Done" }),
       "MODEL\nAuto\nclaude-sonnet-4-5\nclaude-opus-4-1\n",
@@ -494,6 +496,8 @@ describe("QoderClient", () => {
         attachments: [],
       },
       path.join(os.tmpdir(), "qoder-spec", "task-1-Agent.md"),
+      // The agent passes the actions default model in the task options.
+      { model: "claude-sonnet-4-5" },
     );
 
     const args = promptArgs();
@@ -596,33 +600,6 @@ describe("QoderClient", () => {
       "--permission-mode",
       "bypass_permissions",
     ]);
-  });
-
-  it("should prioritize the action model over QODER_MODEL", async () => {
-    config.QODER_MODEL = "claude-sonnet-4-5";
-    respondToCli(
-      JSON.stringify({ result: "Done" }),
-      "MODEL\nAuto\nclaude-sonnet-4-5\naction-model\n",
-    );
-
-    const client = new QoderClient(config);
-    await client.performTask(
-      {
-        id: "task-1",
-        projectId: "project-1",
-        title: "Implement feature",
-        status: "To Do",
-        description: "Add a feature",
-        comments: [],
-        attachments: [],
-      },
-      path.join(os.tmpdir(), "qoder-spec", "task-1-Agent.md"),
-      { model: "action-model" },
-    );
-
-    const args = promptArgs();
-    expect(args).toContain("action-model");
-    expect(args).not.toContain("claude-sonnet-4-5");
   });
 
   it("should warn when the task model is not available to the account", async () => {
@@ -846,6 +823,12 @@ describe("QoderClient", () => {
     expect(summary).toBe(
       "Done\n\n---\nModel: auto · Qoder credits: unknown -> 16.35",
     );
+    // Without any configured model the CLI runs with its own default,
+    // so no --model argument is passed at all.
+    const [, args] = mockExecFile.mock.calls.find((call) =>
+      (call[1] as string[]).includes("-p"),
+    );
+    expect(args).not.toContain("--model");
   });
 
   it("should accept the probe reply from the json result field", async () => {
@@ -1073,7 +1056,6 @@ describe("QoderClient", () => {
   });
 
   it("should apply the default model to standalone prompts", async () => {
-    config.QODER_MODEL = "claude-sonnet-4-5";
     mockExecFile.mockImplementation(
       (
         _command: string,
@@ -1083,7 +1065,10 @@ describe("QoderClient", () => {
       ) => callback(null, JSON.stringify({ result: "reply" }), ""),
     );
 
-    const client = new QoderClient(config);
+    const client = new QoderClient(config, {
+      defaultModel: "claude-sonnet-4-5",
+      actions: [],
+    });
     await expect(client.runPrompt("hello")).resolves.toBe("reply");
 
     const [, args] = mockExecFile.mock.calls[0];

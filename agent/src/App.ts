@@ -117,7 +117,7 @@ Promise.resolve().then(async () => {
   }
 
   // Qoder client shared by the authentication check and the agent note
-  const qoderClient = new QoderClient(config);
+  const qoderClient = new QoderClient(config, agentActions);
 
   // Check Qoder authentication
   if (config.QODER_AUTH_CHECK === "true" || config.QODER_AUTH_CHECK === "1") {

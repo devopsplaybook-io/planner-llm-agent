@@ -28,7 +28,7 @@ export class Agent {
     this.config = config;
     this.agentActions = agentActions ?? null;
     this.planner = new PlannerClient(config);
-    this.qoder = new QoderClient(config);
+    this.qoder = new QoderClient(config, this.agentActions);
   }
 
   public start(): void {
@@ -145,13 +145,11 @@ export class Agent {
     try {
       const notesFile = this.getTaskNotesFile(task.id);
       await this.writeTaskNotes(task, notesFile);
-      // The model resolves to the action model, then the configured default
-      // model, then QODER_MODEL; the task description still overrides all of
-      // them (see QoderClient.resolveModel).
+      // The model resolves to the action model, then the actions default
+      // model; the task description still overrides both (see
+      // QoderClient.resolveModel).
       const defaultModel =
-        action.model ||
-        this.agentActions?.defaultModel ||
-        this.config.QODER_MODEL;
+        action.model || this.agentActions?.defaultModel || "";
       const summary = await this.qoder.performTask(task, notesFile, {
         model: defaultModel,
         instruction: action.instruction,
