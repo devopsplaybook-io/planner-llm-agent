@@ -156,7 +156,7 @@ Set `GIT_SSH_SIGNING=true` together with `GIT_SSH_PRIVATE_KEY` to sign commits w
 
 ### Kubernetes deployment
 
-When deployed with Flux (see `didier-home`), these values are provided as environment variables by the `didiercloud-planner-agent` secret, synced from AWS Secrets Manager. Example secret content:
+When deployed on Kubernetes, these values are provided as environment variables from a Kubernetes secret. Example secret content:
 
 ```json
 {
@@ -175,12 +175,12 @@ The actions of the agent are defined in a YAML file (path `AGENT_ACTIONS_FILE`, 
 
 ```yaml
 default:
-  model: claude-sonnet-4-5
+  model: DeepSeek-Flash
 actions:
   - project: Web
     status_start: To Do
     status_end: In Review
-    model: claude-opus-4-1
+    model: DeepSeek-Flash
     instruction: Follow the repository coding guidelines and open a PR when the task is done.
   - project: Backend
     status_start: To Do
