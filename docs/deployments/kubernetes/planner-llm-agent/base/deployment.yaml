@@ -1,0 +1,64 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: planner-llm-agent
+  labels:
+    app: planner-llm-agent
+spec:
+  replicas: 1
+  revisionHistoryLimit: 1
+  selector:
+    matchLabels:
+      app: planner-llm-agent
+  template:
+    metadata:
+      labels:
+        app: planner-llm-agent
+    spec:
+      containers:
+        - image: planner-llm-agent
+          name: planner-llm-agent
+          imagePullPolicy: Always
+          env:
+            - name: AGENT_NAME
+              value: "planner-llm-agent"
+            - name: PLANNER_URL
+              value: "http://planner:8080"
+            - name: PLANNER_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: planner-llm-agent
+                  key: PLANNER_API_KEY
+            - name: QODER_PERSONAL_ACCESS_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: planner-llm-agent
+                  key: QODER_PERSONAL_ACCESS_TOKEN
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: planner-llm-agent
+                  key: GITHUB_TOKEN
+          # The Qoder CLI runs as a child process of the agent and needs a
+          # large Node.js heap (it OOMs with the default heap sized from a
+          # 500Mi cgroup limit).
+          resources:
+            limits:
+              memory: 2Gi
+              cpu: "1"
+            requests:
+              memory: 100Mi
+              cpu: 100m
+          volumeMounts:
+            - mountPath: /data
+              name: pod-volume
+            - name: config-volume
+              mountPath: /etc/planner/llm-agent.yaml
+              subPath: llm-agent.yaml
+      volumes:
+        - name: pod-volume
+          persistentVolumeClaim:
+            claimName: planner-llm-agent
+        - name: config-volume
+          configMap:
+            name: planner-llm-agent-config

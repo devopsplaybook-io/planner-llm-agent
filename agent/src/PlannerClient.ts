@@ -28,6 +28,7 @@ export interface PlannerTaskAttachment {
 
 export interface PlannerTask {
   id: string;
+  projectId: string;
   title: string;
   status: string;
   description: string;
@@ -94,6 +95,7 @@ export class PlannerClient {
         )
         .map((task) => ({
           id: String(task.id),
+          projectId: String(task.projectId ?? ""),
           title: String(task.title),
           status: String(task.status),
           description:

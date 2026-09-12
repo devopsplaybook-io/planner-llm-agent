@@ -36,6 +36,7 @@ describe("Config", () => {
       expect(config.DEV_MODE).toBe(false);
       expect(config.SERVICE_ID).toBe("planner-llm-agent");
       expect(config.AGENT_NAME).toBe("planner-llm-agent");
+      expect(config.AGENT_ACTIONS_FILE).toBe("/etc/planner/llm-agent.yaml");
       expect(config.PLANNER_URL).toBe("http://localhost:8080");
       expect(config.PLANNER_API_KEY).toBe("");
       expect(config.TASK_POLLING_INTERVAL).toBe(60);
@@ -101,6 +102,22 @@ describe("Config", () => {
       await config.reload();
       expect(config.AGENT_NAME).toBe("env-agent");
       expect(config.TASK_POLLING_INTERVAL).toBe(120);
+
+      await fs.remove(tmpDir);
+    });
+
+    it("should load the agent actions file path from the config file and environment", async () => {
+      const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-config-"));
+      const configFile = path.join(tmpDir, "config.json");
+      await fs.writeJson(configFile, {
+        AGENT_ACTIONS_FILE: "/opt/planner/llm-agent.yaml",
+      });
+      process.env.CONFIG_FILE = configFile;
+      process.env.AGENT_ACTIONS_FILE = "/tmp/llm-agent.yaml";
+
+      const config = new Config();
+      await config.reload();
+      expect(config.AGENT_ACTIONS_FILE).toBe("/tmp/llm-agent.yaml");
 
       await fs.remove(tmpDir);
     });

@@ -1,5 +1,6 @@
 import { watchFile } from "fs-extra";
 import { Agent } from "./Agent";
+import { AgentActionsConfig, loadAgentActions } from "./AgentActions";
 import { AgentConfigRepository } from "./AgentConfigRepository";
 import { AgentNote } from "./AgentNote";
 import { Config } from "./Config";
@@ -44,6 +45,31 @@ Promise.resolve().then(async () => {
       );
     });
   });
+
+  // Agent actions: the YAML file binding projects and start statuses to a
+  // model, an instruction and an end status. The format is checked strictly
+  // at startup so a misconfiguration fails fast; when the file is missing
+  // the agent falls back to the legacy TASK_STATUS_START/TASK_STATUS_END
+  // behavior for every assigned task.
+  let agentActions: AgentActionsConfig | null = null;
+  try {
+    agentActions = await loadAgentActions(config.AGENT_ACTIONS_FILE);
+  } catch (error) {
+    logger.error(
+      `Invalid agent actions configuration file '${config.AGENT_ACTIONS_FILE}': ${(error as Error).message}`,
+      error as Error,
+    );
+    process.exit(1);
+  }
+  if (agentActions === null) {
+    logger.info(
+      `Agent actions file not found at '${config.AGENT_ACTIONS_FILE}' (using TASK_STATUS_START and TASK_STATUS_END for every task)`,
+    );
+  } else {
+    logger.info(
+      `Agent actions loaded from '${config.AGENT_ACTIONS_FILE}' (${agentActions.actions.length} action(s))`,
+    );
+  }
 
   // OpenTelemetry
   try {
@@ -111,7 +137,7 @@ Promise.resolve().then(async () => {
   }
 
   // Agent
-  const agent = new Agent(config);
+  const agent = new Agent(config, agentActions);
   agent.start();
 
   // Agent note: a single Planner note named after the agent, regularly

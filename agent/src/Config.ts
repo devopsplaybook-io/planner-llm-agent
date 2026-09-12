@@ -21,6 +21,7 @@ export class Config {
 
   // Agent
   public AGENT_NAME: string;
+  public AGENT_ACTIONS_FILE: string;
   public PLANNER_URL: string;
   public PLANNER_API_KEY: string;
   public TASK_POLLING_INTERVAL: number;
@@ -81,6 +82,7 @@ export class Config {
     }
 
     this.AGENT_NAME = "planner-llm-agent";
+    this.AGENT_ACTIONS_FILE = "/etc/planner/llm-agent.yaml";
     this.PLANNER_URL = "http://localhost:8080";
     this.PLANNER_API_KEY = "";
     this.TASK_POLLING_INTERVAL = 60;
@@ -130,6 +132,9 @@ export class Config {
 
     if (config.AGENT_NAME) {
       this.AGENT_NAME = config.AGENT_NAME as string;
+    }
+    if (config.AGENT_ACTIONS_FILE) {
+      this.AGENT_ACTIONS_FILE = config.AGENT_ACTIONS_FILE as string;
     }
     if (config.PLANNER_URL) {
       this.PLANNER_URL = config.PLANNER_URL as string;
@@ -237,6 +242,9 @@ export class Config {
     }
     if (process.env.AGENT_NAME) {
       this.AGENT_NAME = process.env.AGENT_NAME;
+    }
+    if (process.env.AGENT_ACTIONS_FILE) {
+      this.AGENT_ACTIONS_FILE = process.env.AGENT_ACTIONS_FILE;
     }
     if (process.env.PLANNER_URL) {
       this.PLANNER_URL = process.env.PLANNER_URL;

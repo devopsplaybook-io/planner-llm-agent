@@ -2,6 +2,7 @@ import * as os from "os";
 import * as path from "path";
 import * as fse from "fs-extra";
 import { Agent } from "./Agent";
+import { AgentActionsConfig } from "./AgentActions";
 import { Config } from "./Config";
 import { PlannerClient } from "./PlannerClient";
 import { QoderClient } from "./QoderClient";
@@ -19,6 +20,7 @@ const MockedQoderClient = QoderClient as unknown as jest.Mock;
 const mockPlanner = {
   getCurrentUser: jest.fn(),
   listAssignedTasks: jest.fn(),
+  listProjects: jest.fn(),
   addTaskComment: jest.fn(),
   updateTaskStatus: jest.fn(),
   downloadTaskAttachment: jest.fn(),
@@ -55,8 +57,8 @@ describe("Agent", () => {
   // assertion never leaks a polling interval into the next test.
   let agents: Agent[] = [];
 
-  const createAgent = (): Agent => {
-    const agent = new Agent(config);
+  const createAgent = (agentActions?: AgentActionsConfig): Agent => {
+    const agent = new Agent(config, agentActions);
     agents.push(agent);
     return agent;
   };
@@ -100,6 +102,7 @@ describe("Agent", () => {
     for (const mock of [
       mockPlanner.getCurrentUser,
       mockPlanner.listAssignedTasks,
+      mockPlanner.listProjects,
       mockPlanner.addTaskComment,
       mockPlanner.updateTaskStatus,
       mockPlanner.downloadTaskAttachment,
@@ -228,6 +231,7 @@ describe("Agent", () => {
     expect(mockQoder.performTask).toHaveBeenCalledWith(
       expect.objectContaining({ id: "task-1" }),
       path.join(dataDir, "tasks", "task-1-Agent.md"),
+      expect.objectContaining({ model: "", instruction: "" }),
     );
     expect(mockPlanner.addTaskComment).toHaveBeenCalledWith(
       "task-1",
@@ -482,6 +486,7 @@ describe("Agent", () => {
     expect(mockQoder.performTask).toHaveBeenCalledWith(
       expect.objectContaining({ id: "task-1" }),
       expect.any(String),
+      expect.anything(),
     );
 
     // Once it completes, the second task is picked on the next poll.
@@ -538,10 +543,12 @@ describe("Agent", () => {
     expect(mockQoder.performTask).toHaveBeenCalledWith(
       expect.objectContaining({ id: "task-1" }),
       expect.any(String),
+      expect.anything(),
     );
     expect(mockQoder.performTask).toHaveBeenCalledWith(
       expect.objectContaining({ id: "task-2" }),
       expect.any(String),
+      expect.anything(),
     );
 
     // Once a slot frees up, the third task is picked on the next poll.
@@ -551,6 +558,7 @@ describe("Agent", () => {
     expect(mockQoder.performTask).toHaveBeenCalledWith(
       expect.objectContaining({ id: "task-3" }),
       expect.any(String),
+      expect.anything(),
     );
     resolvers[2]("Third done");
     await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length === 3);
@@ -680,6 +688,255 @@ describe("Agent", () => {
       await fse.pathExists(path.join(tasksDir, `${taskId}-Agent.md`)),
     ).toBe(false);
     expect(await fse.pathExists(path.join(tasksDir, taskId))).toBe(false);
+    agent.stop();
+  });
+
+  it("should process only the tasks matching the action project and start status", async () => {
+    mockPlanner.listProjects.mockResolvedValue([
+      { id: "p1", name: "Web" },
+      { id: "p2", name: "Backend" },
+    ]);
+    mockPlanner.listAssignedTasks.mockResolvedValue([
+      {
+        id: "task-1",
+        projectId: "p1",
+        title: "Fix the build",
+        status: "To Do",
+        description: "The build is broken",
+        comments: [],
+        attachments: [],
+      },
+      {
+        id: "task-2",
+        projectId: "p2",
+        title: "Other project task",
+        status: "To Do",
+        description: "Not for this action",
+        comments: [],
+        attachments: [],
+      },
+      {
+        id: "task-3",
+        projectId: "p1",
+        title: "Wrong status",
+        status: "In Progress",
+        description: "Not in the start status",
+        comments: [],
+        attachments: [],
+      },
+    ]);
+    mockQoder.performTask.mockResolvedValue("Done");
+
+    const agent = createAgent({
+      defaultModel: "",
+      actions: [
+        {
+          project: "Web",
+          statusStart: "To Do",
+          statusEnd: "In Review",
+          model: "",
+          instruction: "",
+        },
+      ],
+    });
+    agent.start();
+    await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
+
+    expect(mockQoder.performTask).toHaveBeenCalledTimes(1);
+    expect(mockQoder.performTask).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "task-1" }),
+      expect.any(String),
+      expect.anything(),
+    );
+    expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith(
+      "task-1",
+      "In Review",
+    );
+    expect(mockPlanner.updateTaskStatus).not.toHaveBeenCalledWith(
+      "task-2",
+      expect.anything(),
+    );
+    expect(mockPlanner.updateTaskStatus).not.toHaveBeenCalledWith(
+      "task-3",
+      expect.anything(),
+    );
+    agent.stop();
+  });
+
+  it("should not process a task whose project cannot be resolved", async () => {
+    mockPlanner.listProjects.mockResolvedValue([{ id: "p1", name: "Web" }]);
+    mockPlanner.listAssignedTasks.mockResolvedValue([
+      {
+        id: "task-1",
+        projectId: "p-deleted",
+        title: "Fix the build",
+        status: "To Do",
+        description: "",
+        comments: [],
+        attachments: [],
+      },
+    ]);
+
+    const agent = createAgent({
+      defaultModel: "",
+      actions: [
+        {
+          project: "Web",
+          statusStart: "To Do",
+          statusEnd: "Done",
+          model: "",
+          instruction: "",
+        },
+      ],
+    });
+    agent.start();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    expect(mockQoder.performTask).not.toHaveBeenCalled();
+    expect(mockPlanner.updateTaskStatus).not.toHaveBeenCalled();
+    agent.stop();
+  });
+
+  it("should apply the action model and instruction to the task", async () => {
+    mockPlanner.listProjects.mockResolvedValue([{ id: "p1", name: "Web" }]);
+    mockPlanner.listAssignedTasks.mockResolvedValue([
+      {
+        id: "task-1",
+        projectId: "p1",
+        title: "Fix the build",
+        status: "To Do",
+        description: "",
+        comments: [],
+        attachments: [],
+      },
+    ]);
+    mockQoder.performTask.mockResolvedValue("Done");
+
+    const agent = createAgent({
+      defaultModel: "default-model",
+      actions: [
+        {
+          project: "Web",
+          statusStart: "To Do",
+          statusEnd: "Done",
+          model: "action-model",
+          instruction: "Follow the coding guidelines",
+        },
+      ],
+    });
+    agent.start();
+    await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
+
+    expect(mockQoder.performTask).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.any(String),
+      expect.objectContaining({
+        model: "action-model",
+        instruction: "Follow the coding guidelines",
+      }),
+    );
+    agent.stop();
+  });
+
+  it("should use the default model when the action has no model", async () => {
+    mockPlanner.listProjects.mockResolvedValue([{ id: "p1", name: "Web" }]);
+    mockPlanner.listAssignedTasks.mockResolvedValue([
+      {
+        id: "task-1",
+        projectId: "p1",
+        title: "Fix the build",
+        status: "To Do",
+        description: "",
+        comments: [],
+        attachments: [],
+      },
+    ]);
+    mockQoder.performTask.mockResolvedValue("Done");
+
+    const agent = createAgent({
+      defaultModel: "default-model",
+      actions: [
+        {
+          project: "Web",
+          statusStart: "To Do",
+          statusEnd: "Done",
+          model: "",
+          instruction: "",
+        },
+      ],
+    });
+    agent.start();
+    await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
+
+    expect(mockQoder.performTask).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.any(String),
+      expect.objectContaining({ model: "default-model" }),
+    );
+    agent.stop();
+  });
+
+  it("should fall back to QODER_MODEL when no action or default model is set", async () => {
+    config.QODER_MODEL = "env-model";
+    mockPlanner.listProjects.mockResolvedValue([{ id: "p1", name: "Web" }]);
+    mockPlanner.listAssignedTasks.mockResolvedValue([
+      {
+        id: "task-1",
+        projectId: "p1",
+        title: "Fix the build",
+        status: "To Do",
+        description: "",
+        comments: [],
+        attachments: [],
+      },
+    ]);
+    mockQoder.performTask.mockResolvedValue("Done");
+
+    const agent = createAgent({
+      defaultModel: "",
+      actions: [
+        {
+          project: "Web",
+          statusStart: "To Do",
+          statusEnd: "Done",
+          model: "",
+          instruction: "",
+        },
+      ],
+    });
+    agent.start();
+    await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
+
+    expect(mockQoder.performTask).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.any(String),
+      expect.objectContaining({ model: "env-model" }),
+    );
+    agent.stop();
+  });
+
+  it("should not fetch the projects when no action is project-bound", async () => {
+    mockPlanner.listAssignedTasks.mockResolvedValue([
+      {
+        id: "task-1",
+        projectId: "p1",
+        title: "Fix the build",
+        status: "To Do",
+        description: "",
+        comments: [],
+        attachments: [],
+      },
+    ]);
+    mockQoder.performTask.mockResolvedValue("Done");
+
+    // Without an actions configuration the legacy status-based behavior
+    // applies to every task, whatever its project.
+    const agent = createAgent();
+    agent.start();
+    await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
+
+    expect(mockPlanner.listProjects).not.toHaveBeenCalled();
+    expect(mockQoder.performTask).toHaveBeenCalledTimes(1);
     agent.stop();
   });
 });

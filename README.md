@@ -2,7 +2,7 @@
 
 LLM agent that connects to a [Planner](https://github.com/devopsplaybook-io/planner) instance and can be assigned tasks to execute.
 
-The agent polls the Planner API for tasks assigned to its user, executes the tasks in the start status (default `To Do`) with the [Qoder CLI](https://qoder.com), posts the result as a task comment and moves the task to the end status (default `Done`). For each task it maintains a documentation file at `/data/tasks/[id]-Agent.md` that keeps the context of the task across runs. Task attachments are downloaded to `/data/tasks/[id]/attachments/` and listed in the documentation file so the LLM can use them. When a task reaches the cleanup status (default `Done`) the agent deletes its local task folder, and periodically removes folders for tasks that are no longer assigned or have reached the cleanup status.
+The agent polls the Planner API for tasks assigned to its user and executes the tasks selected by its *actions* configuration (a YAML file, see [Agent actions](#agent-actions)); without an actions file it executes the tasks in the start status (default `To Do`). It runs the tasks with the [Qoder CLI](https://qoder.com), posts the result as a task comment and moves the task to the end status (default `Done`). For each task it maintains a documentation file at `/data/tasks/[id]-Agent.md` that keeps the context of the task across runs. Task attachments are downloaded to `/data/tasks/[id]/attachments/` and listed in the documentation file so the LLM can use them. When a task reaches the cleanup status (default `Done`) the agent deletes its local task folder, and periodically removes folders for tasks that are no longer assigned or have reached the cleanup status.
 
 Polling stays quiet: log entries are only emitted when a task is ready to be processed and during its processing (plus errors), not on every poll cycle.
 
@@ -23,6 +23,7 @@ Configuration values are resolved with the following priority:
 | Variable | Default | Description |
 | --- | --- | --- |
 | `AGENT_NAME` | `planner-llm-agent` | Planner user name the agent acts as (also used in the agent note title) |
+| `AGENT_ACTIONS_FILE` | `/etc/planner/llm-agent.yaml` | Path of the agent actions YAML file (see [Agent actions](#agent-actions)) |
 | `PLANNER_URL` | `http://localhost:8080` | Planner instance base URL |
 | `PLANNER_API_KEY` | (empty) | Planner API key (required) |
 | `TASK_POLLING_INTERVAL` | `60` | Seconds between polls of assigned tasks |
@@ -47,8 +48,10 @@ Configuration values are resolved with the following priority:
 The model used for a task is resolved with the following priority:
 
 1. A `qoder-model: <model>` line in the task description (per-task override)
-2. The `QODER_MODEL` configuration value (default model)
-3. The Qoder CLI default model (when neither is set)
+2. The `model` of the matching action (see [Agent actions](#agent-actions))
+3. The `default.model` of the actions configuration
+4. The `QODER_MODEL` configuration value (default model)
+5. The Qoder CLI default model (when none of the above is set)
 
 Example task description requesting a specific model:
 
@@ -163,6 +166,42 @@ When deployed with Flux (see `didier-home`), these values are provided as enviro
   "GIT_USER_EMAIL": "agent@users.noreply.github.com",
   "GIT_SSH_PRIVATE_KEY": "-----BEGIN OPENSSH PRIVATE KEY-----\n...\n-----END OPENSSH PRIVATE KEY-----\n"
 }
+```
+
+The agent actions file is provided by a ConfigMap mounted at `/etc/planner/llm-agent.yaml`. An example Kubernetes deployment (namespace, PVC, ConfigMap with the actions file, Deployment, Kustomize) is available in [`docs/deployments/kubernetes`](docs/deployments/kubernetes).
+
+## Agent actions
+
+The actions of the agent are defined in a YAML file (path `AGENT_ACTIONS_FILE`, default `/etc/planner/llm-agent.yaml`). Each action binds a Planner project and a start status to an optional model, an optional instruction and an end status:
+
+```yaml
+default:
+  model: claude-sonnet-4-5
+actions:
+  - project: Web
+    status_start: To Do
+    status_end: In Review
+    model: claude-opus-4-1
+    instruction: Follow the repository coding guidelines and open a PR when the task is done.
+  - project: Backend
+    status_start: To Do
+    status_end: Done
+```
+
+For every poll, the agent checks if an assigned task matches the project and the start status of an action. Matching tasks are processed with the action model and instruction (on top of the task information) and moved to the action end status once processed (including after a processing failure, same as the default behavior).
+
+- `project`, `status_start` and `status_end` are required; `model` and `instruction` are optional. `default.model` is the fallback model for actions without their own model.
+- The format is checked at startup: when the file exists but is invalid (bad YAML, missing or empty fields, unknown fields, duplicate project and start status), the agent exits immediately with the list of problems.
+- When the file does not exist, the agent falls back to the legacy behavior: every assigned task in `TASK_STATUS_START` is processed and moved to `TASK_STATUS_END`, regardless of its project.
+- `TASK_STATUS_CLEANUP` still governs the deletion of the local task folder, whatever end status the task reached.
+- Changes to the file require a restart; the file is not watched.
+
+The model resolution order combining the actions with the environment configuration is described in [Model selection](#model-selection).
+
+Example for a local test with a temporary actions file:
+
+```sh
+AGENT_ACTIONS_FILE=/tmp/llm-agent.yaml npm run dev
 ```
 
 ## Agent config repository

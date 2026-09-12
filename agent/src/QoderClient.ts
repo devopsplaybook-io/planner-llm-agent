@@ -13,6 +13,14 @@ const TASK_TIMEOUT_MS = 1800000;
 const PROMPT_TIMEOUT_MS = 600000;
 const PROBE_PROMPT = "Reply with exactly: OK";
 
+// Task execution options coming from the matching action of the agent
+// actions configuration: the model is the action model or the configured
+// default model, and the instruction is prepended to the task information.
+export interface TaskOptions {
+  model?: string;
+  instruction?: string;
+}
+
 export class QoderClient {
   private config: Config;
 
@@ -77,6 +85,7 @@ export class QoderClient {
   public async performTask(
     task: PlannerTask,
     notesFile: string,
+    options?: TaskOptions,
   ): Promise<string> {
     const span = OTelTracer().startSpan("qoder-client.perform-task");
     const summaryFile = getSummaryFile(notesFile);
@@ -90,10 +99,21 @@ export class QoderClient {
       }
       const promptLines = [
         "You are an autonomous agent working on an assigned task.",
+      ];
+      const instruction = options?.instruction?.trim();
+      if (instruction) {
+        // The instruction comes on top of the task information: it refines
+        // how the task documented in the notes file must be executed.
+        promptLines.push(
+          "Instructions for this task (apply them on top of the task information):",
+          instruction,
+        );
+      }
+      promptLines.push(
         `Task documentation file: ${notesFile}`,
         "Read the documentation file first: it contains the task description and all comments.",
         "Git and the GitHub CLI (gh) are already configured with authentication for Git and GitHub operations.",
-      ];
+      );
       const githubTokenEntries = this.config.githubTokenEntries();
       if (githubTokenEntries.length > 0) {
         promptLines.push(
@@ -119,7 +139,14 @@ export class QoderClient {
       );
       const prompt = promptLines.join("\n");
       const args = ["-p", prompt];
-      const model = resolveModel(task, this.config.QODER_MODEL);
+      // The model of the matching action (or the configured default model)
+      // replaces the QODER_MODEL fallback; the task description still takes
+      // priority over both.
+      const actionModel = options?.model?.trim() ?? "";
+      const model = resolveModel(
+        task,
+        actionModel.length > 0 ? actionModel : this.config.QODER_MODEL,
+      );
       if (model !== null) {
         logger.info(`Qoder model: ${model.model} (from ${model.source})`);
         args.push("--model", model.model);
