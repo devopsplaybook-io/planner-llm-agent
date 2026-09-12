@@ -227,9 +227,7 @@ describe("QoderClient", () => {
     const [command, args, options] = mockExecFile.mock.calls[0];
     expect(command).toBe("qoder");
     expect(args[0]).toBe("-p");
-    expect(String(args[1])).toContain(
-      `Task documentation file: ${notesFile}`,
-    );
+    expect(String(args[1])).toContain(`Task documentation file: ${notesFile}`);
     expect(String(args[1])).toContain(`to the file: ${summaryFile}`);
     expect(args.slice(2)).toEqual([
       "--output-format",
@@ -238,10 +236,42 @@ describe("QoderClient", () => {
       "bypass_permissions",
     ]);
     expect(options).toMatchObject({
-      timeout: 1800000,
+      timeout: 3600000,
       cwd: taskDir,
     });
     expect(await fse.pathExists(summaryFile)).toBe(false);
+  });
+
+  it("should run the task with the configured timeout", async () => {
+    config.TASK_TIMEOUT = 7200;
+    const taskDir = path.join(os.tmpdir(), "qoder-spec");
+    const notesFile = path.join(taskDir, "task-1-Agent.md");
+    await fse.ensureDir(taskDir);
+    mockExecFile.mockImplementation(
+      (
+        _command: string,
+        _args: string[],
+        _options: unknown,
+        callback: (error: Error | null, stdout: string, stderr: string) => void,
+      ) => callback(null, JSON.stringify({ result: "Done" }), ""),
+    );
+
+    const client = new QoderClient(config);
+    await client.performTask(
+      {
+        id: "task-1",
+        projectId: "project-1",
+        title: "Implement feature",
+        status: "To Do",
+        description: "Add a feature",
+        comments: [],
+        attachments: [],
+      },
+      notesFile,
+    );
+
+    const [, , options] = mockExecFile.mock.calls[0];
+    expect(options).toMatchObject({ timeout: 7200000 });
   });
 
   it("should document the organization token variables in the task prompt", async () => {
@@ -615,9 +645,9 @@ describe("QoderClient", () => {
     expect(summary).toBe(
       "Done\n\n---\nModel: claude-opus-4-1 · Qoder credits: 16.41 -> 16.35",
     );
-    expect(await fse.readJson(path.join(dataDir, "qoder-credits.json"))).toEqual(
-      { credits: 16.35 },
-    );
+    expect(
+      await fse.readJson(path.join(dataDir, "qoder-credits.json")),
+    ).toEqual({ credits: 16.35 });
   });
 
   it("should display the auto model and unknown previous credits on the first task", async () => {
@@ -943,9 +973,7 @@ describe("QoderClient", () => {
     );
 
     const client = new QoderClient(config);
-    await expect(client.runPrompt("hello")).resolves.toBe(
-      "plain text reply",
-    );
+    await expect(client.runPrompt("hello")).resolves.toBe("plain text reply");
   });
 
   it("should report a missing CLI for standalone prompts", async () => {

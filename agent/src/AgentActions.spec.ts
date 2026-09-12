@@ -1,7 +1,11 @@
 import * as fse from "fs-extra";
 import * as os from "os";
 import * as path from "path";
-import { AgentActionsConfig, loadAgentActions, parseAgentActions } from "./AgentActions";
+import {
+  AgentActionsConfig,
+  loadAgentActions,
+  parseAgentActions,
+} from "./AgentActions";
 
 describe("AgentActions", () => {
   describe("parseAgentActions", () => {
@@ -176,8 +180,12 @@ describe("AgentActions", () => {
           ].join("\n"),
         );
       expect(failure).toThrow(/'default\.model' must be a non-empty string/);
-      expect(failure).toThrow(/actions\[0\]\.project' must be a non-empty string/);
-      expect(failure).toThrow(/actions\[0\]\.status_end' must be a non-empty string/);
+      expect(failure).toThrow(
+        /actions\[0\]\.project' must be a non-empty string/,
+      );
+      expect(failure).toThrow(
+        /actions\[0\]\.status_end' must be a non-empty string/,
+      );
     });
 
     it("should throw on duplicate project and start status", () => {
@@ -245,7 +253,8 @@ describe("AgentActions", () => {
         ].join("\n"),
       );
 
-      const config: AgentActionsConfig | null = await loadAgentActions(filePath);
+      const config: AgentActionsConfig | null =
+        await loadAgentActions(filePath);
       expect(config).toEqual({
         defaultModel: "default-model",
         actions: [

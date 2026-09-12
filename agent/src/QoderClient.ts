@@ -9,7 +9,6 @@ import { PlannerTask } from "./PlannerClient";
 const logger = OTelLogger().createModuleLogger("qoder-client");
 
 const AUTH_CHECK_TIMEOUT_MS = 120000;
-const TASK_TIMEOUT_MS = 1800000;
 const PROMPT_TIMEOUT_MS = 600000;
 const PROBE_PROMPT = "Reply with exactly: OK";
 
@@ -117,7 +116,7 @@ export class QoderClient {
       const githubTokenEntries = this.config.githubTokenEntries();
       if (githubTokenEntries.length > 0) {
         promptLines.push(
-          'The default GH_TOKEN does not necessarily have the rights for every GitHub organization.',
+          "The default GH_TOKEN does not necessarily have the rights for every GitHub organization.",
           'Dedicated tokens are available per organization: for gh operations on repositories of an organization listed below, prefix the command with its token variable, e.g. GH_TOKEN="$GH_TOKEN_MY_ORG" gh pr create.',
           `Organizations and token variables: ${githubTokenEntries
             .map(
@@ -159,8 +158,10 @@ export class QoderClient {
       );
       const creditsBefore = await readCredits(this.config);
       logger.info(`Qoder credits before task: ${formatCredits(creditsBefore)}`);
+      // The task timeout is configurable (TASK_TIMEOUT, in seconds) so
+      // long-running tasks are not cut off by a hardcoded limit.
       const result = await runCli(this.config.QODER_CLI, args, {
-        timeout: TASK_TIMEOUT_MS,
+        timeout: this.config.TASK_TIMEOUT * 1000,
         windowsHide: true,
         cwd: path.dirname(notesFile),
         maxBuffer: 10 * 1024 * 1024,
@@ -224,7 +225,7 @@ export class QoderClient {
       }
       if (execError.killed) {
         throw new Error(
-          `Qoder task execution timed out after ${TASK_TIMEOUT_MS / 1000} seconds`,
+          `Qoder task execution timed out after ${this.config.TASK_TIMEOUT} seconds`,
           { cause: error },
         );
       }
@@ -286,9 +287,12 @@ export class QoderClient {
           { cause: error },
         );
       }
-      throw new Error(`Qoder prompt failed:\n${extractErrorDetail(execError)}`, {
-        cause: error,
-      });
+      throw new Error(
+        `Qoder prompt failed:\n${extractErrorDetail(execError)}`,
+        {
+          cause: error,
+        },
+      );
     } finally {
       span.end();
     }

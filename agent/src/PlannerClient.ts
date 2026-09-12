@@ -64,9 +64,7 @@ export class PlannerClient {
       const body = await this.request("/api/users/session", "POST", span);
       const user = body?.user;
       if (!user?.id || !user?.name) {
-        throw new Error(
-          "Planner session response is missing user information",
-        );
+        throw new Error("Planner session response is missing user information");
       }
       return { id: user.id as string, name: user.name as string };
     } catch (error) {
@@ -134,10 +132,7 @@ export class PlannerClient {
     }
   }
 
-  public async addTaskComment(
-    taskId: string,
-    text: string,
-  ): Promise<void> {
+  public async addTaskComment(taskId: string, text: string): Promise<void> {
     const span = OTelTracer().startSpan("planner-client.add-task-comment");
     try {
       await this.request(`/api/tasks/${taskId}/comments`, "POST", span, {
@@ -151,10 +146,7 @@ export class PlannerClient {
     }
   }
 
-  public async updateTaskStatus(
-    taskId: string,
-    status: string,
-  ): Promise<void> {
+  public async updateTaskStatus(taskId: string, status: string): Promise<void> {
     const span = OTelTracer().startSpan("planner-client.update-task-status");
     try {
       await this.request(`/api/tasks/${taskId}`, "PUT", span, {
@@ -270,7 +262,9 @@ export class PlannerClient {
         description: description,
       });
       if (!body?.id) {
-        throw new Error("Planner note creation response is missing the note id");
+        throw new Error(
+          "Planner note creation response is missing the note id",
+        );
       }
       return {
         id: String(body.id),

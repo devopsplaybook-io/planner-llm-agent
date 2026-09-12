@@ -5,12 +5,12 @@ metadata:
 data:
   llm-agent.yaml: |
     default:
-      model: claude-sonnet-4-5
+      model: auto
     actions:
       - project: Web
         status_start: To Do
         status_end: In Review
-        model: claude-opus-4-1
+        model: DeepSeek-Flash
         instruction: Follow the repository coding guidelines and open a PR when the task is done.
       - project: Backend
         status_start: To Do

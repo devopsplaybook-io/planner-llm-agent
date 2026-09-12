@@ -41,6 +41,7 @@ describe("Config", () => {
       expect(config.PLANNER_API_KEY).toBe("");
       expect(config.TASK_POLLING_INTERVAL).toBe(60);
       expect(config.TASK_STATUS_CLEANUP).toBe("Done");
+      expect(config.TASK_TIMEOUT).toBe(3600);
       expect(config.GITHUB_TOKENS).toBe("");
       expect(config.OPENTELEMETRY_COLLECTOR_HTTP_TRACES).toBe("");
       expect(config.OPENTELEMETRY_COLLECTOR_HTTP_METRICS).toBe("");
@@ -122,6 +123,22 @@ describe("Config", () => {
       await fs.remove(tmpDir);
     });
 
+    it("should load the task timeout from the config file and environment", async () => {
+      const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-config-"));
+      const configFile = path.join(tmpDir, "config.json");
+      await fs.writeJson(configFile, {
+        TASK_TIMEOUT: 1800,
+      });
+      process.env.CONFIG_FILE = configFile;
+      process.env.TASK_TIMEOUT = "7200";
+
+      const config = new Config();
+      await config.reload();
+      expect(config.TASK_TIMEOUT).toBe(7200);
+
+      await fs.remove(tmpDir);
+    });
+
     it("should load the agent note settings from the config file", async () => {
       const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-config-"));
       const configFile = path.join(tmpDir, "config.json");
@@ -151,7 +168,9 @@ describe("Config", () => {
 
       const config = new Config();
       await config.reload();
-      expect(config.GITHUB_TOKENS).toBe("env-org=github_pat_bbbbbbbbbbbbbbbbbbbb");
+      expect(config.GITHUB_TOKENS).toBe(
+        "env-org=github_pat_bbbbbbbbbbbbbbbbbbbb",
+      );
 
       await fs.remove(tmpDir);
     });
@@ -226,6 +245,17 @@ describe("Config", () => {
       ]);
     });
 
+    it("should report an invalid TASK_TIMEOUT", () => {
+      const config = new Config();
+      config.PLANNER_API_KEY = "key";
+      config.TASK_TIMEOUT = 0;
+
+      const errors = config.validate();
+      expect(errors).toEqual([
+        "TASK_TIMEOUT must be a positive integer (current value: '0')",
+      ]);
+    });
+
     it("should accept well-formed GitHub organization tokens", () => {
       const config = new Config();
       config.PLANNER_API_KEY = "key";
@@ -242,7 +272,8 @@ describe("Config", () => {
     it("should skip malformed entries when parsing the GitHub organization tokens", () => {
       const config = new Config();
       config.PLANNER_API_KEY = "key";
-      config.GITHUB_TOKENS = "just-a-token,,org=github_pat_aaaaaaaaaaaaaaaaaaaa";
+      config.GITHUB_TOKENS =
+        "just-a-token,,org=github_pat_aaaaaaaaaaaaaaaaaaaa";
 
       expect(config.githubTokenEntries()).toEqual([
         { organization: "org", token: "github_pat_aaaaaaaaaaaaaaaaaaaa" },

@@ -33,6 +33,21 @@ const mockQoder = {
 const AGENT_NOTES_MARKER =
   "<!-- AGENT-NOTES: the content below is maintained by the Qoder agent. Do not remove this marker. -->";
 
+// Wildcard actions (empty project) matching every task in 'To Do' and
+// moving it to 'Done': the default used by the task processing tests.
+const WILDCARD_ACTIONS: AgentActionsConfig = {
+  defaultModel: "",
+  actions: [
+    {
+      project: "",
+      statusStart: "To Do",
+      statusEnd: "Done",
+      model: "",
+      instruction: "",
+    },
+  ],
+};
+
 // Wait for the asynchronous processing chain (which performs real file I/O)
 // to reach a visible milestone before asserting.
 async function waitFor(
@@ -57,7 +72,11 @@ describe("Agent", () => {
   // assertion never leaks a polling interval into the next test.
   let agents: Agent[] = [];
 
-  const createAgent = (agentActions?: AgentActionsConfig): Agent => {
+  // Agents default to the wildcard actions; pass null to create an agent
+  // without any action (it then processes no task).
+  const createAgent = (
+    agentActions: AgentActionsConfig | null = WILDCARD_ACTIONS,
+  ): Agent => {
     const agent = new Agent(config, agentActions);
     agents.push(agent);
     return agent;
@@ -237,10 +256,7 @@ describe("Agent", () => {
       "task-1",
       "Feature implemented",
     );
-    expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith(
-      "task-1",
-      "Done",
-    );
+    expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith("task-1", "Done");
     agent.stop();
   });
 
@@ -275,7 +291,9 @@ describe("Agent", () => {
     const content = await fse.readFile(notesFile, "utf8");
     expect(content).toContain("# Task: Implement feature");
     expect(content).toContain("Add a feature");
-    expect(content).toContain("**Alice** (2026-09-02T00:00:00.000Z): Please add tests");
+    expect(content).toContain(
+      "**Alice** (2026-09-02T00:00:00.000Z): Please add tests",
+    );
     expect(content).toContain(AGENT_NOTES_MARKER);
     expect(content).toContain("## Agent Notes");
     agent.stop();
@@ -396,9 +414,7 @@ describe("Agent", () => {
       },
     ]);
     mockQoder.performTask.mockRejectedValue(new Error("boom"));
-    mockPlanner.addTaskComment.mockRejectedValue(
-      new Error("Planner is down"),
-    );
+    mockPlanner.addTaskComment.mockRejectedValue(new Error("Planner is down"));
 
     const agent = createAgent();
     agent.start();
@@ -662,9 +678,9 @@ describe("Agent", () => {
     expect(
       await fse.pathExists(path.join(dataDir, "tasks", `${taskId}-Agent.md`)),
     ).toBe(false);
-    expect(
-      await fse.pathExists(path.join(dataDir, "tasks", taskId)),
-    ).toBe(false);
+    expect(await fse.pathExists(path.join(dataDir, "tasks", taskId))).toBe(
+      false,
+    );
     agent.stop();
   });
 
@@ -929,14 +945,35 @@ describe("Agent", () => {
     ]);
     mockQoder.performTask.mockResolvedValue("Done");
 
-    // Without an actions configuration the legacy status-based behavior
-    // applies to every task, whatever its project.
+    // A wildcard action (empty project) applies to every task, whatever
+    // its project: the project names are not needed.
     const agent = createAgent();
     agent.start();
     await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
 
     expect(mockPlanner.listProjects).not.toHaveBeenCalled();
     expect(mockQoder.performTask).toHaveBeenCalledTimes(1);
+    agent.stop();
+  });
+
+  it("should not process any task without an actions configuration", async () => {
+    mockPlanner.listAssignedTasks.mockResolvedValue([
+      {
+        id: "task-1",
+        title: "Fix the build",
+        status: "To Do",
+        description: "",
+        comments: [],
+        attachments: [],
+      },
+    ]);
+
+    const agent = createAgent(null);
+    agent.start();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    expect(mockQoder.performTask).not.toHaveBeenCalled();
+    expect(mockPlanner.updateTaskStatus).not.toHaveBeenCalled();
     agent.stop();
   });
 });

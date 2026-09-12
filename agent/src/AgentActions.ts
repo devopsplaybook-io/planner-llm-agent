@@ -47,13 +47,17 @@ export function parseAgentActions(content: string): AgentActionsConfig {
   try {
     parsed = parse(content);
   } catch (error) {
-    throw new Error(`Invalid YAML: ${(error as Error).message}`, { cause: error });
+    throw new Error(`Invalid YAML: ${(error as Error).message}`, {
+      cause: error,
+    });
   }
   if (parsed === null || parsed === undefined) {
     throw new Error("The configuration is empty");
   }
   if (typeof parsed !== "object" || Array.isArray(parsed)) {
-    throw new Error("The configuration must be a mapping with 'default' and 'actions'");
+    throw new Error(
+      "The configuration must be a mapping with 'default' and 'actions'",
+    );
   }
   const root = parsed as Record<string, unknown>;
 
@@ -61,7 +65,11 @@ export function parseAgentActions(content: string): AgentActionsConfig {
   const config: AgentActionsConfig = { defaultModel: "", actions: [] };
 
   if (root.default !== undefined) {
-    if (typeof root.default !== "object" || root.default === null || Array.isArray(root.default)) {
+    if (
+      typeof root.default !== "object" ||
+      root.default === null ||
+      Array.isArray(root.default)
+    ) {
       errors.push("'default' must be a mapping");
     } else {
       const defaults = root.default as Record<string, unknown>;
@@ -94,15 +102,50 @@ export function parseAgentActions(content: string): AgentActionsConfig {
       }
       const action = entry as Record<string, unknown>;
       for (const key of Object.keys(action)) {
-        if (!["project", "status_start", "status_end", "model", "instruction"].includes(key)) {
+        if (
+          ![
+            "project",
+            "status_start",
+            "status_end",
+            "model",
+            "instruction",
+          ].includes(key)
+        ) {
           errors.push(`actions[${index}] has unknown field '${key}'`);
         }
       }
-      const project = readString(action, "project", `actions[${index}].project`, errors);
-      const statusStart = readString(action, "status_start", `actions[${index}].status_start`, errors);
-      const statusEnd = readString(action, "status_end", `actions[${index}].status_end`, errors);
-      const model = readString(action, "model", `actions[${index}].model`, errors, true);
-      const instruction = readString(action, "instruction", `actions[${index}].instruction`, errors, true);
+      const project = readString(
+        action,
+        "project",
+        `actions[${index}].project`,
+        errors,
+      );
+      const statusStart = readString(
+        action,
+        "status_start",
+        `actions[${index}].status_start`,
+        errors,
+      );
+      const statusEnd = readString(
+        action,
+        "status_end",
+        `actions[${index}].status_end`,
+        errors,
+      );
+      const model = readString(
+        action,
+        "model",
+        `actions[${index}].model`,
+        errors,
+        true,
+      );
+      const instruction = readString(
+        action,
+        "instruction",
+        `actions[${index}].instruction`,
+        errors,
+        true,
+      );
       if (project !== null && statusStart !== null) {
         const key = `${project}\n${statusStart}`;
         if (seen.has(key)) {
@@ -127,7 +170,10 @@ export function parseAgentActions(content: string): AgentActionsConfig {
 
   if (errors.length > 0) {
     throw new Error(
-      ["Invalid agent actions configuration:", ...errors.map((error) => `  - ${error}`)].join("\n"),
+      [
+        "Invalid agent actions configuration:",
+        ...errors.map((error) => `  - ${error}`),
+      ].join("\n"),
     );
   }
   return config;
@@ -135,11 +181,13 @@ export function parseAgentActions(content: string): AgentActionsConfig {
 
 /**
  * Loads and parses the agent actions file. Returns null when the file does
- * not exist (the agent then falls back to the legacy TASK_STATUS_START and
- * TASK_STATUS_END behavior); throws an Error when the file exists but is
- * invalid, so the caller can fail fast at startup.
+ * not exist (the agent then runs without any action and processes no task);
+ * throws an Error when the file exists but is invalid, so the caller can
+ * fail fast at startup.
  */
-export async function loadAgentActions(filePath: string): Promise<AgentActionsConfig | null> {
+export async function loadAgentActions(
+  filePath: string,
+): Promise<AgentActionsConfig | null> {
   if (!(await fse.pathExists(filePath))) {
     return null;
   }

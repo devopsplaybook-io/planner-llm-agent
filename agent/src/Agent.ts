@@ -96,7 +96,9 @@ export class Agent {
       }
       // Each task manages its own error handling and in-flight cleanup.
       await Promise.all(
-        tasksToProcess.map(({ task, action }) => this.processTask(task, action)),
+        tasksToProcess.map(({ task, action }) =>
+          this.processTask(task, action),
+        ),
       );
     } catch (error) {
       logger.error(
@@ -106,21 +108,10 @@ export class Agent {
   }
 
   // The actions drive which tasks are picked and how they are processed.
-  // Without an actions configuration the legacy behavior is kept: every
-  // task in TASK_STATUS_START is processed and moved to TASK_STATUS_END.
+  // They come from the agent actions configuration; without it no task
+  // is processed.
   private getActions(): AgentAction[] {
-    if (this.agentActions === null) {
-      return [
-        {
-          project: "",
-          statusStart: this.config.TASK_STATUS_START,
-          statusEnd: this.config.TASK_STATUS_END,
-          model: "",
-          instruction: "",
-        },
-      ];
-    }
-    return this.agentActions.actions;
+    return this.agentActions?.actions ?? [];
   }
 
   // A task matches an action when its status is the action start status and
@@ -144,7 +135,10 @@ export class Agent {
     return projectNames.get(task.projectId) === action.project;
   }
 
-  private async processTask(task: PlannerTask, action: AgentAction): Promise<void> {
+  private async processTask(
+    task: PlannerTask,
+    action: AgentAction,
+  ): Promise<void> {
     logger.info(
       `Processing task '${task.title}' (${task.id}) in status '${task.status}'`,
     );
@@ -155,7 +149,9 @@ export class Agent {
       // model, then QODER_MODEL; the task description still overrides all of
       // them (see QoderClient.resolveModel).
       const defaultModel =
-        action.model || this.agentActions?.defaultModel || this.config.QODER_MODEL;
+        action.model ||
+        this.agentActions?.defaultModel ||
+        this.config.QODER_MODEL;
       const summary = await this.qoder.performTask(task, notesFile, {
         model: defaultModel,
         instruction: action.instruction,
@@ -198,7 +194,11 @@ export class Agent {
   }
 
   private getTaskSummaryFile(taskId: string): string {
-    return path.join(this.config.DATA_DIR, "tasks", `${taskId}-Agent-Summary.md`);
+    return path.join(
+      this.config.DATA_DIR,
+      "tasks",
+      `${taskId}-Agent-Summary.md`,
+    );
   }
 
   private getTaskDir(taskId: string): string {
@@ -234,8 +234,7 @@ export class Agent {
           )
         : task.attachments.length > 0
           ? task.attachments.map(
-              (attachment) =>
-                `- ${attachment.fileName} (download failed)`,
+              (attachment) => `- ${attachment.fileName} (download failed)`,
             )
           : ["*(none)*"];
     const brief = [

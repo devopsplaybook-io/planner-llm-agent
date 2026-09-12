@@ -49,8 +49,7 @@ Promise.resolve().then(async () => {
   // Agent actions: the YAML file binding projects and start statuses to a
   // model, an instruction and an end status. The format is checked strictly
   // at startup so a misconfiguration fails fast; when the file is missing
-  // the agent falls back to the legacy TASK_STATUS_START/TASK_STATUS_END
-  // behavior for every assigned task.
+  // the agent starts with no action and processes no task.
   let agentActions: AgentActionsConfig | null = null;
   try {
     agentActions = await loadAgentActions(config.AGENT_ACTIONS_FILE);
@@ -62,8 +61,8 @@ Promise.resolve().then(async () => {
     process.exit(1);
   }
   if (agentActions === null) {
-    logger.info(
-      `Agent actions file not found at '${config.AGENT_ACTIONS_FILE}' (using TASK_STATUS_START and TASK_STATUS_END for every task)`,
+    logger.warn(
+      `Agent actions file not found at '${config.AGENT_ACTIONS_FILE}': no task will be processed`,
     );
   } else {
     logger.info(
@@ -152,7 +151,10 @@ Promise.resolve().then(async () => {
   if (agentNote.isEnabled()) {
     const updateAgentNote = () => {
       void agentNote.update().catch((error: Error) => {
-        logger.error("Agent note update failed (will retry on schedule)", error);
+        logger.error(
+          "Agent note update failed (will retry on schedule)",
+          error,
+        );
       });
     };
     void agentNote.ensureNote().catch((error: Error) => {

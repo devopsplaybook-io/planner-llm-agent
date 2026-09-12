@@ -2,7 +2,7 @@
 
 LLM agent that connects to a [Planner](https://github.com/devopsplaybook-io/planner) instance and can be assigned tasks to execute.
 
-The agent polls the Planner API for tasks assigned to its user and executes the tasks selected by its *actions* configuration (a YAML file, see [Agent actions](#agent-actions)); without an actions file it executes the tasks in the start status (default `To Do`). It runs the tasks with the [Qoder CLI](https://qoder.com), posts the result as a task comment and moves the task to the end status (default `Done`). For each task it maintains a documentation file at `/data/tasks/[id]-Agent.md` that keeps the context of the task across runs. Task attachments are downloaded to `/data/tasks/[id]/attachments/` and listed in the documentation file so the LLM can use them. When a task reaches the cleanup status (default `Done`) the agent deletes its local task folder, and periodically removes folders for tasks that are no longer assigned or have reached the cleanup status.
+The agent polls the Planner API for tasks assigned to its user and executes the tasks selected by its _actions_ configuration (a YAML file, see [Agent actions](#agent-actions)). It runs the tasks with the [Qoder CLI](https://qoder.com), posts the result as a task comment and moves the task to the end status of the matching action. For each task it maintains a documentation file at `/data/tasks/[id]-Agent.md` that keeps the context of the task across runs. Task attachments are downloaded to `/data/tasks/[id]/attachments/` and listed in the documentation file so the LLM can use them. When a task reaches the cleanup status (default `Done`) the agent deletes its local task folder, and periodically removes folders for tasks that are no longer assigned or have reached the cleanup status.
 
 Polling stays quiet: log entries are only emitted when a task is ready to be processed and during its processing (plus errors), not on every poll cycle.
 
@@ -20,28 +20,27 @@ Configuration values are resolved with the following priority:
 
 ### Agent
 
-| Variable | Default | Description |
-| --- | --- | --- |
-| `AGENT_NAME` | `planner-llm-agent` | Planner user name the agent acts as (also used in the agent note title) |
-| `AGENT_ACTIONS_FILE` | `/etc/planner/llm-agent.yaml` | Path of the agent actions YAML file (see [Agent actions](#agent-actions)) |
-| `PLANNER_URL` | `http://localhost:8080` | Planner instance base URL |
-| `PLANNER_API_KEY` | (empty) | Planner API key (required) |
-| `TASK_POLLING_INTERVAL` | `60` | Seconds between polls of assigned tasks |
-| `TASK_STATUS_START` | `To Do` | Only tasks with this status are executed |
-| `TASK_STATUS_END` | `Done` | Status set after a task is executed |
-| `TASK_STATUS_CLEANUP` | `Done` | Local task folder is deleted when a task reaches this status |
-| `TASK_MAX_PARALLEL` | `1` | Maximum number of tasks processed in parallel |
-| `DATA_DIR` | `/data` | Persistent data directory (task documentation files) |
-| `TMP_DIR` | `/tmp` | Temporary directory |
-| `DEV_MODE` | `false` | Development mode flag |
+| Variable                | Default                       | Description                                                               |
+| ----------------------- | ----------------------------- | ------------------------------------------------------------------------- |
+| `AGENT_NAME`            | `planner-llm-agent`           | Planner user name the agent acts as (also used in the agent note title)   |
+| `AGENT_ACTIONS_FILE`    | `/etc/planner/llm-agent.yaml` | Path of the agent actions YAML file (see [Agent actions](#agent-actions)) |
+| `PLANNER_URL`           | `http://localhost:8080`       | Planner instance base URL                                                 |
+| `PLANNER_API_KEY`       | (empty)                       | Planner API key (required)                                                |
+| `TASK_POLLING_INTERVAL` | `60`                          | Seconds between polls of assigned tasks                                   |
+| `TASK_STATUS_CLEANUP`   | `Done`                        | Local task folder is deleted when a task reaches this status              |
+| `TASK_MAX_PARALLEL`     | `1`                           | Maximum number of tasks processed in parallel                             |
+| `TASK_TIMEOUT`          | `3600`                        | Maximum duration of a task execution in seconds                           |
+| `DATA_DIR`              | `/data`                       | Persistent data directory (task documentation files)                      |
+| `TMP_DIR`               | `/tmp`                        | Temporary directory                                                       |
+| `DEV_MODE`              | `false`                       | Development mode flag                                                     |
 
 ### Qoder CLI
 
-| Variable | Default | Description |
-| --- | --- | --- |
-| `QODER_CLI` | `qoder` | Qoder CLI command |
-| `QODER_AUTH_CHECK` | `true` | Verify Qoder authentication at startup (fail fast) |
-| `QODER_MODEL` | (empty) | Default model passed to the Qoder CLI (`--model`); empty uses the CLI default |
+| Variable           | Default | Description                                                                   |
+| ------------------ | ------- | ----------------------------------------------------------------------------- |
+| `QODER_CLI`        | `qoder` | Qoder CLI command                                                             |
+| `QODER_AUTH_CHECK` | `true`  | Verify Qoder authentication at startup (fail fast)                            |
+| `QODER_MODEL`      | (empty) | Default model passed to the Qoder CLI (`--model`); empty uses the CLI default |
 
 ### Model selection
 
@@ -77,17 +76,17 @@ The credit balance comes from the qoder CLI JSON output (`total_credits`) and is
 
 All Git and GitHub settings are optional: the agent automatically prepares the environment based on what is configured, and skips the setup entirely when none of `GITHUB_TOKEN`, `GIT_SSH_PRIVATE_KEY` or `GIT_GPG_PRIVATE_KEY` is provided. The environment is prepared at startup, before the first task runs, and any invalid value makes the agent fail fast with a clear message.
 
-| Variable | Default | Description |
-| --- | --- | --- |
-| `GIT_USER_NAME` | `planner-llm-agent` | Git committer name |
-| `GIT_USER_EMAIL` | `planner-llm-agent@users.noreply.github.com` | Git committer email |
-| `GITHUB_TOKEN` | (empty) | GitHub Personal Access Token used as the default token |
-| `GITHUB_TOKENS` | (empty) | Additional tokens scoped by organization, format `org1=token1,org2=token2` |
-| `GIT_SSH_PRIVATE_KEY` | (empty) | SSH private key for `git@github.com` (OpenSSH or PEM) |
-| `GIT_SSH_SIGNING` | `false` | Use the SSH key for commit signing instead of GPG |
-| `GIT_GPG_PRIVATE_KEY` | (empty) | Armored GPG private key for commit signing |
-| `GIT_GPG_KEY_ID` | (empty) | Signing key id (auto-detected from the imported key when empty) |
-| `GIT_GPG_PASSPHRASE` | (empty) | GPG key passphrase (cached in gpg-agent for headless signing) |
+| Variable              | Default                                      | Description                                                                |
+| --------------------- | -------------------------------------------- | -------------------------------------------------------------------------- |
+| `GIT_USER_NAME`       | `planner-llm-agent`                          | Git committer name                                                         |
+| `GIT_USER_EMAIL`      | `planner-llm-agent@users.noreply.github.com` | Git committer email                                                        |
+| `GITHUB_TOKEN`        | (empty)                                      | GitHub Personal Access Token used as the default token                     |
+| `GITHUB_TOKENS`       | (empty)                                      | Additional tokens scoped by organization, format `org1=token1,org2=token2` |
+| `GIT_SSH_PRIVATE_KEY` | (empty)                                      | SSH private key for `git@github.com` (OpenSSH or PEM)                      |
+| `GIT_SSH_SIGNING`     | `false`                                      | Use the SSH key for commit signing instead of GPG                          |
+| `GIT_GPG_PRIVATE_KEY` | (empty)                                      | Armored GPG private key for commit signing                                 |
+| `GIT_GPG_KEY_ID`      | (empty)                                      | Signing key id (auto-detected from the imported key when empty)            |
+| `GIT_GPG_PASSPHRASE`  | (empty)                                      | GPG key passphrase (cached in gpg-agent for headless signing)              |
 
 Multi-line values (SSH and GPG keys) can be provided either with real newlines or with literal `\n` escape sequences.
 
@@ -114,19 +113,19 @@ When no default token is configured and exactly one organization token exists, t
 
 ### Agent config repository
 
-| Variable | Default | Description |
-| --- | --- | --- |
-| `AGENT_CONFIG_REPOSITORY` | (empty) | Git URL of the agent config repository (empty disables the feature) |
-| `AGENT_CONFIG_BRANCH` | `main` | Branch to sync |
-| `AGENT_CONFIG_FOLDER` | (empty) | Only sync this folder of the repository (sparse checkout) |
-| `AGENT_CONFIG_SYNC_INTERVAL` | `300` | Seconds between refreshes of the local copy |
+| Variable                     | Default | Description                                                         |
+| ---------------------------- | ------- | ------------------------------------------------------------------- |
+| `AGENT_CONFIG_REPOSITORY`    | (empty) | Git URL of the agent config repository (empty disables the feature) |
+| `AGENT_CONFIG_BRANCH`        | `main`  | Branch to sync                                                      |
+| `AGENT_CONFIG_FOLDER`        | (empty) | Only sync this folder of the repository (sparse checkout)           |
+| `AGENT_CONFIG_SYNC_INTERVAL` | `300`   | Seconds between refreshes of the local copy                         |
 
 ### Agent note
 
-| Variable | Default | Description |
-| --- | --- | --- |
-| `AGENT_NOTE_PROJECT` | (empty) | Planner project where the agent note is published (id or name; empty disables the feature) |
-| `AGENT_NOTE_INTERVAL` | `86400` | Seconds between agent note updates (default: daily); `0` disables the updates |
+| Variable              | Default | Description                                                                                |
+| --------------------- | ------- | ------------------------------------------------------------------------------------------ |
+| `AGENT_NOTE_PROJECT`  | (empty) | Planner project where the agent note is published (id or name; empty disables the feature) |
+| `AGENT_NOTE_INTERVAL` | `86400` | Seconds between agent note updates (default: daily); `0` disables the updates              |
 
 ## Git and GitHub authentication
 
@@ -192,7 +191,7 @@ For every poll, the agent checks if an assigned task matches the project and the
 
 - `project`, `status_start` and `status_end` are required; `model` and `instruction` are optional. `default.model` is the fallback model for actions without their own model.
 - The format is checked at startup: when the file exists but is invalid (bad YAML, missing or empty fields, unknown fields, duplicate project and start status), the agent exits immediately with the list of problems.
-- When the file does not exist, the agent falls back to the legacy behavior: every assigned task in `TASK_STATUS_START` is processed and moved to `TASK_STATUS_END`, regardless of its project.
+- When the file does not exist, the agent starts with no action and processes no task (a warning is logged at startup).
 - `TASK_STATUS_CLEANUP` still governs the deletion of the local task folder, whatever end status the task reached.
 - Changes to the file require a restart; the file is not watched.
 
@@ -206,7 +205,7 @@ AGENT_ACTIONS_FILE=/tmp/llm-agent.yaml npm run dev
 
 ## Agent config repository
 
-Skills, configuration files and other resources the agent should use are defined in a dedicated Git repository (the *agent config repository*). The agent clones it at startup, keeps a local copy under `/data/agent-config` (`/data/agent-config/<folder>` when `AGENT_CONFIG_FOLDER` is set) and refreshes it every `AGENT_CONFIG_SYNC_INTERVAL` seconds.
+Skills, configuration files and other resources the agent should use are defined in a dedicated Git repository (the _agent config repository_). The agent clones it at startup, keeps a local copy under `/data/agent-config` (`/data/agent-config/<folder>` when `AGENT_CONFIG_FOLDER` is set) and refreshes it every `AGENT_CONFIG_SYNC_INTERVAL` seconds.
 
 - The startup clone fails fast: the agent does not start when the repository cannot be cloned.
 - A failed periodic refresh keeps the last synced copy and only logs an error.

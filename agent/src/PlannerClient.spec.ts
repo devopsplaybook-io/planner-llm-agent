@@ -175,7 +175,10 @@ describe("PlannerClient", () => {
     );
 
     const client = new PlannerClient(config);
-    const tasks = await client.listAssignedTasks({ id: "user-1", name: "Didier" });
+    const tasks = await client.listAssignedTasks({
+      id: "user-1",
+      name: "Didier",
+    });
 
     expect(tasks).toEqual([
       {
