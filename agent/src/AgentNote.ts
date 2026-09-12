@@ -131,15 +131,11 @@ export class AgentNote {
     const skills = await this.listSkills();
     const tasks = await this.listRecentTasks();
     const credits = await readCredits(config);
-    // The effective default model: the actions configuration fallback model
-    // takes priority over the QODER_MODEL environment fallback.
+    // The actions default.model is the only configurable default model; the
+    // CLI default applies when it is not set.
     const actionsModel = this.agentActions?.defaultModel.trim() ?? "";
     const defaultModel =
-      actionsModel.length > 0
-        ? actionsModel
-        : config.QODER_MODEL.trim().length > 0
-          ? config.QODER_MODEL.trim()
-          : "auto (CLI default)";
+      actionsModel.length > 0 ? actionsModel : "auto (CLI default)";
     const githubTokenEntries = config.githubTokenEntries();
     const gitEnabled =
       config.GITHUB_TOKEN.trim().length > 0 ||

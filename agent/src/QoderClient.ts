@@ -1,5 +1,6 @@
 import * as fse from "fs-extra";
 import * as path from "path";
+import { AgentActionsConfig } from "./AgentActions";
 import { Config, githubTokenEnvName } from "./Config";
 import { getAgentConfigContentPath } from "./AgentConfigRepository";
 import { ExecFileError, extractErrorDetail, runCli } from "./CliUtils";
@@ -13,7 +14,7 @@ const PROMPT_TIMEOUT_MS = 600000;
 const PROBE_PROMPT = "Reply with exactly: OK";
 
 // Task execution options coming from the matching action of the agent
-// actions configuration: the model is the action model or the configured
+// actions configuration: the model is the action model or the actions
 // default model, and the instruction is prepended to the task information.
 export interface TaskOptions {
   model?: string;
@@ -22,12 +23,20 @@ export interface TaskOptions {
 
 export class QoderClient {
   private config: Config;
+  private agentActions: AgentActionsConfig | null;
   // Models available to the Qoder account, fetched once from the CLI and
   // cached for the lifetime of the client (undefined until the first fetch).
   private availableModels: string[] | undefined;
 
-  constructor(config: Config) {
+  constructor(config: Config, agentActions?: AgentActionsConfig | null) {
     this.config = config;
+    this.agentActions = agentActions ?? null;
+  }
+
+  // The actions default.model is the only configurable default model; an
+  // empty string means the Qoder CLI default is used.
+  private defaultModel(): string {
+    return this.agentActions?.defaultModel ?? "";
   }
 
   public async checkAuthentication(): Promise<void> {
@@ -36,8 +45,9 @@ export class QoderClient {
     // Apply the default model to the probe too, so a misconfigured model
     // fails fast at startup instead of on the first task.
     const args = ["-p", PROBE_PROMPT];
-    if (this.config.QODER_MODEL.trim().length > 0) {
-      args.push("--model", this.config.QODER_MODEL.trim());
+    const defaultModel = this.defaultModel();
+    if (defaultModel.length > 0) {
+      args.push("--model", defaultModel);
     }
     args.push("--output-format", "json");
     try {
@@ -141,14 +151,9 @@ export class QoderClient {
       );
       const prompt = promptLines.join("\n");
       const args = ["-p", prompt];
-      // The model of the matching action (or the configured default model)
-      // replaces the QODER_MODEL fallback; the task description still takes
-      // priority over both.
-      const actionModel = options?.model?.trim() ?? "";
-      const model = resolveModel(
-        task,
-        actionModel.length > 0 ? actionModel : this.config.QODER_MODEL,
-      );
+      // The model of the matching action or the actions default model; the
+      // task description still takes priority over both.
+      const model = resolveModel(task, options?.model?.trim() ?? "");
       if (model !== null) {
         logger.info(`Qoder model: ${model.model} (from ${model.source})`);
         await this.warnIfModelInvalid(model.model);
@@ -291,8 +296,9 @@ export class QoderClient {
   public async runPrompt(prompt: string): Promise<string> {
     const span = OTelTracer().startSpan("qoder-client.run-prompt");
     const args = ["-p", prompt];
-    if (this.config.QODER_MODEL.trim().length > 0) {
-      args.push("--model", this.config.QODER_MODEL.trim());
+    const defaultModel = this.defaultModel();
+    if (defaultModel.length > 0) {
+      args.push("--model", defaultModel);
     }
     args.push(
       "--output-format",

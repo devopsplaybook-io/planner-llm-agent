@@ -892,8 +892,7 @@ describe("Agent", () => {
     agent.stop();
   });
 
-  it("should fall back to QODER_MODEL when no action or default model is set", async () => {
-    config.QODER_MODEL = "env-model";
+  it("should run with no model when no action or default model is set", async () => {
     mockPlanner.listProjects.mockResolvedValue([{ id: "p1", name: "Web" }]);
     mockPlanner.listAssignedTasks.mockResolvedValue([
       {
@@ -926,7 +925,7 @@ describe("Agent", () => {
     expect(mockQoder.performTask).toHaveBeenCalledWith(
       expect.anything(),
       expect.any(String),
-      expect.objectContaining({ model: "env-model" }),
+      expect.objectContaining({ model: "" }),
     );
     agent.stop();
   });
