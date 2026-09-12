@@ -26,6 +26,7 @@ export class Config {
   public TASK_POLLING_INTERVAL: number;
   public TASK_STATUS_START: string;
   public TASK_STATUS_END: string;
+  public TASK_STATUS_CLEANUP: string;
   public TASK_MAX_PARALLEL: number;
   public AGENT_NOTE_PROJECT: string;
   public AGENT_NOTE_INTERVAL: number;
@@ -85,6 +86,7 @@ export class Config {
     this.TASK_POLLING_INTERVAL = 60;
     this.TASK_STATUS_START = "To Do";
     this.TASK_STATUS_END = "Done";
+    this.TASK_STATUS_CLEANUP = "Done";
     this.TASK_MAX_PARALLEL = 1;
     this.AGENT_NOTE_PROJECT = "";
     this.AGENT_NOTE_INTERVAL = 86400;
@@ -143,6 +145,9 @@ export class Config {
     }
     if (config.TASK_STATUS_END) {
       this.TASK_STATUS_END = config.TASK_STATUS_END as string;
+    }
+    if (config.TASK_STATUS_CLEANUP) {
+      this.TASK_STATUS_CLEANUP = config.TASK_STATUS_CLEANUP as string;
     }
     if (config.TASK_MAX_PARALLEL) {
       this.TASK_MAX_PARALLEL = config.TASK_MAX_PARALLEL as number;
@@ -247,6 +252,9 @@ export class Config {
     }
     if (process.env.TASK_STATUS_END) {
       this.TASK_STATUS_END = process.env.TASK_STATUS_END;
+    }
+    if (process.env.TASK_STATUS_CLEANUP) {
+      this.TASK_STATUS_CLEANUP = process.env.TASK_STATUS_CLEANUP;
     }
     if (process.env.TASK_MAX_PARALLEL) {
       this.TASK_MAX_PARALLEL = parseInt(process.env.TASK_MAX_PARALLEL);

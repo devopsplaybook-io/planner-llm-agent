@@ -19,12 +19,20 @@ export interface PlannerTaskComment {
   dateCreated: string;
 }
 
+export interface PlannerTaskAttachment {
+  id: string;
+  fileName: string;
+  filePath: string;
+  dateCreated: string;
+}
+
 export interface PlannerTask {
   id: string;
   title: string;
   status: string;
   description: string;
   comments: PlannerTaskComment[];
+  attachments: PlannerTaskAttachment[];
 }
 
 export interface PlannerProject {
@@ -105,6 +113,16 @@ export class PlannerClient {
                 }),
               )
             : [],
+          attachments: Array.isArray(task.attachments)
+            ? task.attachments.map(
+                (attachment: PlannerTaskJson): PlannerTaskAttachment => ({
+                  id: String(attachment.id),
+                  fileName: String(attachment.fileName),
+                  filePath: String(attachment.filePath),
+                  dateCreated: String(attachment.dateCreated),
+                }),
+              )
+            : [],
         }));
     } catch (error) {
       span.recordException(error as Error);
@@ -140,6 +158,46 @@ export class PlannerClient {
       await this.request(`/api/tasks/${taskId}`, "PUT", span, {
         status: status,
       });
+    } catch (error) {
+      span.recordException(error as Error);
+      throw error;
+    } finally {
+      span.end();
+    }
+  }
+
+  public async downloadTaskAttachment(
+    taskId: string,
+    attachmentId: string,
+  ): Promise<Buffer> {
+    const span = OTelTracer().startSpan(
+      "planner-client.download-task-attachment",
+    );
+    try {
+      const url = `${this.config.PLANNER_URL}/api/tasks/${taskId}/attachments/${attachmentId}`;
+      const headers: Record<string, string> = {
+        "x-api-key": this.config.PLANNER_API_KEY,
+      };
+      StandardTracer.updateHttpHeader(span, headers);
+      let response: Response;
+      try {
+        response = await fetch(url, {
+          method: "GET",
+          headers: headers,
+          signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+        });
+      } catch (error) {
+        throw new Error(
+          `Failed to reach Planner at '${url}': ${(error as Error).message}`,
+          { cause: error },
+        );
+      }
+      if (!response.ok) {
+        throw new Error(
+          `Planner request to '/api/tasks/${taskId}/attachments/${attachmentId}' failed with status ${response.status}`,
+        );
+      }
+      return Buffer.from(await response.arrayBuffer());
     } catch (error) {
       span.recordException(error as Error);
       throw error;

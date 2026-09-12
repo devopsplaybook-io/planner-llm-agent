@@ -2,7 +2,7 @@
 
 LLM agent that connects to a [Planner](https://github.com/devopsplaybook-io/planner) instance and can be assigned tasks to execute.
 
-The agent polls the Planner API for tasks assigned to its user, executes the tasks in the start status (default `To Do`) with the [Qoder CLI](https://qoder.com), posts the result as a task comment and moves the task to the end status (default `Done`). For each task it maintains a documentation file at `/data/tasks/[id]-Agent.md` that keeps the context of the task across runs.
+The agent polls the Planner API for tasks assigned to its user, executes the tasks in the start status (default `To Do`) with the [Qoder CLI](https://qoder.com), posts the result as a task comment and moves the task to the end status (default `Done`). For each task it maintains a documentation file at `/data/tasks/[id]-Agent.md` that keeps the context of the task across runs. Task attachments are downloaded to `/data/tasks/[id]/attachments/` and listed in the documentation file so the LLM can use them. When a task reaches the cleanup status (default `Done`) the agent deletes its local task folder, and periodically removes folders for tasks that are no longer assigned or have reached the cleanup status.
 
 Polling stays quiet: log entries are only emitted when a task is ready to be processed and during its processing (plus errors), not on every poll cycle.
 
@@ -28,6 +28,7 @@ Configuration values are resolved with the following priority:
 | `TASK_POLLING_INTERVAL` | `60` | Seconds between polls of assigned tasks |
 | `TASK_STATUS_START` | `To Do` | Only tasks with this status are executed |
 | `TASK_STATUS_END` | `Done` | Status set after a task is executed |
+| `TASK_STATUS_CLEANUP` | `Done` | Local task folder is deleted when a task reaches this status |
 | `TASK_MAX_PARALLEL` | `1` | Maximum number of tasks processed in parallel |
 | `DATA_DIR` | `/data` | Persistent data directory (task documentation files) |
 | `TMP_DIR` | `/tmp` | Temporary directory |
