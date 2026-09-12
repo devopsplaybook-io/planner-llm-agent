@@ -1,5 +1,6 @@
 import * as fse from "fs-extra";
 import * as path from "path";
+import { AgentActionsConfig } from "./AgentActions";
 import { getAgentConfigContentPath } from "./AgentConfigRepository";
 import { Config, githubTokenEnvName } from "./Config";
 import { OTelLogger, OTelTracer } from "./OTelContext";
@@ -10,18 +11,26 @@ const logger = OTelLogger().createModuleLogger("agent-note");
 
 const MAX_SKILLS_LISTED = 20;
 const MAX_RECENT_TASKS = 10;
+const MAX_INSTRUCTION_SHOWN = 100;
 const NOTE_TITLE_PREFIX = "Planner LLM Agent: ";
 
 export class AgentNote {
   private config: Config;
   private planner: PlannerClient;
   private qoder: QoderClient;
+  private agentActions: AgentActionsConfig | null;
   private updating = false;
 
-  constructor(config: Config, planner: PlannerClient, qoder: QoderClient) {
+  constructor(
+    config: Config,
+    planner: PlannerClient,
+    qoder: QoderClient,
+    agentActions: AgentActionsConfig | null,
+  ) {
     this.config = config;
     this.planner = planner;
     this.qoder = qoder;
+    this.agentActions = agentActions;
   }
 
   // The note title is user-friendly and contains the agent name.
@@ -38,38 +47,9 @@ export class AgentNote {
     );
   }
 
-  // At the end of the startup, make sure the note exists: it is created
-  // when missing, while an existing note is left untouched until its next
-  // scheduled update.
-  public async ensureNote(): Promise<void> {
-    if (this.updating) {
-      return;
-    }
-    const span = OTelTracer().startSpan("agent-note.ensure");
-    this.updating = true;
-    try {
-      const project = await this.resolveProject();
-      const existing = await this.findAgentNote(project);
-      if (existing) {
-        logger.info(
-          `Agent note already exists in project '${project.name}' (next update on schedule)`,
-        );
-        return;
-      }
-      const content = await this.generateContent();
-      await this.planner.createNote(project.id, this.noteTitle, content);
-      logger.info(`Agent note created in project '${project.name}'`);
-    } catch (error) {
-      span.recordException(error as Error);
-      throw error;
-    } finally {
-      this.updating = false;
-      span.end();
-    }
-  }
-
   // Generate the note content with the LLM and create or update the single
-  // note named after the agent in the configured project.
+  // note named after the agent in the configured project. Called when the
+  // agent starts and then on the configured interval.
   public async update(): Promise<void> {
     if (this.updating) {
       return;
@@ -151,6 +131,15 @@ export class AgentNote {
     const skills = await this.listSkills();
     const tasks = await this.listRecentTasks();
     const credits = await readCredits(config);
+    // The effective default model: the actions configuration fallback model
+    // takes priority over the QODER_MODEL environment fallback.
+    const actionsModel = this.agentActions?.defaultModel.trim() ?? "";
+    const defaultModel =
+      actionsModel.length > 0
+        ? actionsModel
+        : config.QODER_MODEL.trim().length > 0
+          ? config.QODER_MODEL.trim()
+          : "auto (CLI default)";
     const githubTokenEntries = config.githubTokenEntries();
     const gitEnabled =
       config.GITHUB_TOKEN.trim().length > 0 ||
@@ -177,7 +166,8 @@ export class AgentNote {
       `- Version: ${config.VERSION}`,
       `- Current date: ${new Date().toISOString()}`,
       `- Current session uptime: ${uptime}`,
-      `- Default model: ${config.QODER_MODEL.trim().length > 0 ? config.QODER_MODEL.trim() : "auto (CLI default)"}`,
+      `- Default model: ${defaultModel}`,
+      ...this.agentActionsFacts(),
       `- Git and GitHub integration: ${gitEnabled ? "configured" : "not configured"}`,
       `- GitHub organizations with dedicated tokens: ${
         githubTokenEntries.length > 0
@@ -195,6 +185,37 @@ export class AgentNote {
       `- Tasks executed so far: ${tasks.count}`,
       `- Recent tasks: ${tasks.recent.length > 0 ? tasks.recent.join(" | ") : "none"}`,
       `- Qoder account credits remaining: ${credits !== null ? credits.toFixed(2) : "unknown"}`,
+    ];
+  }
+
+  // The agent actions configuration describes which tasks the agent
+  // processes and how: it is listed so the note can present the mission of
+  // the agent to the team.
+  private agentActionsFacts(): string[] {
+    if (this.agentActions === null) {
+      return ["- Agent actions: not configured (no task will be processed)"];
+    }
+    if (this.agentActions.actions.length === 0) {
+      return ["- Agent actions: none defined (no task will be processed)"];
+    }
+    return [
+      "- Agent actions:",
+      ...this.agentActions.actions.map((action) => {
+        const project =
+          action.project.trim().length > 0
+            ? `'${action.project.trim()}'`
+            : "any project";
+        const model =
+          action.model.trim().length > 0
+            ? `model ${action.model.trim()}`
+            : "default model";
+        const instruction = action.instruction.trim().replace(/\s+/g, " ");
+        const instructionPart =
+          instruction.length > 0
+            ? `, instruction: ${truncate(instruction)}`
+            : "";
+        return `  - Project ${project}, status '${action.statusStart}' -> '${action.statusEnd}', ${model}${instructionPart}`;
+      }),
     ];
   }
 
@@ -246,4 +267,11 @@ export class AgentNote {
     }
     return { count: files.length, recent };
   }
+}
+
+// Instructions are shown as a one-line excerpt in the note facts.
+function truncate(text: string): string {
+  return text.length > MAX_INSTRUCTION_SHOWN
+    ? `${text.slice(0, MAX_INSTRUCTION_SHOWN)}...`
+    : text;
 }

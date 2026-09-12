@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: planner-llm-agent-config
+data:
+  llm-agent.yaml: |
+    default:
+      model: auto
+    actions:
+      - project: Web
+        status_start: To Do
+        status_end: In Review
+        model: DeepSeek-Flash
+        instruction: Follow the repository coding guidelines and open a PR when the task is done.
+      - project: Backend
+        status_start: To Do
+        status_end: Done

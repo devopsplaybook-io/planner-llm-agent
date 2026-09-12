@@ -83,6 +83,7 @@ describe("PlannerClient", () => {
         JSON.stringify([
           {
             id: "task-1",
+            projectId: "p1",
             title: "Fix the build",
             status: "In Progress",
             description: "The build is broken",
@@ -123,6 +124,7 @@ describe("PlannerClient", () => {
     expect(tasks).toEqual([
       {
         id: "task-1",
+        projectId: "p1",
         title: "Fix the build",
         status: "In Progress",
         description: "The build is broken",
@@ -173,11 +175,15 @@ describe("PlannerClient", () => {
     );
 
     const client = new PlannerClient(config);
-    const tasks = await client.listAssignedTasks({ id: "user-1", name: "Didier" });
+    const tasks = await client.listAssignedTasks({
+      id: "user-1",
+      name: "Didier",
+    });
 
     expect(tasks).toEqual([
       {
         id: "task-1",
+        projectId: "",
         title: "Fix the build",
         status: "In Progress",
         description: "The build is broken",

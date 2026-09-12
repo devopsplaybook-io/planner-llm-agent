@@ -5,28 +5,66 @@ import * as path from "path";
 import { QoderClient } from "./QoderClient";
 import { Config } from "./Config";
 
-jest.mock("./OTelContext", () => ({
-  OTelTracer: jest.fn(() => ({
-    startSpan: jest.fn(() => ({
-      end: jest.fn(),
-      setAttribute: jest.fn(),
-      recordException: jest.fn(),
+// The shared logger is created inside the factory because the mocked
+// module is first required during the import evaluation, before any
+// declaration of this file has run; it is retrieved with requireMock below.
+jest.mock("./OTelContext", () => {
+  const logger = { info: jest.fn(), warn: jest.fn(), error: jest.fn() };
+  return {
+    __logger: logger,
+    OTelTracer: jest.fn(() => ({
+      startSpan: jest.fn(() => ({
+        end: jest.fn(),
+        setAttribute: jest.fn(),
+        recordException: jest.fn(),
+      })),
     })),
-  })),
-  OTelLogger: jest.fn(() => ({
-    createModuleLogger: jest.fn(() => ({
-      info: jest.fn(),
-      warn: jest.fn(),
-      error: jest.fn(),
+    OTelLogger: jest.fn(() => ({
+      createModuleLogger: jest.fn(() => logger),
     })),
-  })),
-}));
+  };
+});
+
+const mockLogger = (
+  jest.requireMock("./OTelContext") as {
+    __logger: { info: jest.Mock; warn: jest.Mock; error: jest.Mock };
+  }
+).__logger;
 
 jest.mock("child_process", () => ({
   execFile: jest.fn(),
 }));
 
 const mockExecFile = execFile as unknown as jest.Mock;
+
+// CLI stub answering the model listing separately from the other calls.
+const respondToCli = (taskStdout: string, modelList: string) => {
+  mockExecFile.mockImplementation(
+    (
+      _command: string,
+      args: string[],
+      _options: unknown,
+      callback: (error: Error | null, stdout: string, stderr: string) => void,
+    ) => {
+      if (args.includes("--list-models")) {
+        callback(null, modelList, "");
+        return;
+      }
+      callback(null, taskStdout, "");
+    },
+  );
+};
+
+// The CLI call carrying the task prompt (the model listing is a separate call).
+const promptArgs = (): string[] => {
+  const call = mockExecFile.mock.calls.find((call) =>
+    (call[1] as string[]).includes("-p"),
+  );
+  if (!call) {
+    throw new Error("No task prompt call recorded");
+  }
+  return call[1] as string[];
+};
 
 describe("QoderClient", () => {
   const originalEnv = process.env;
@@ -38,6 +76,9 @@ describe("QoderClient", () => {
     config.QODER_CLI = "qoder";
     config.DATA_DIR = path.join(os.tmpdir(), "qoder-spec", "data");
     mockExecFile.mockReset();
+    mockLogger.info.mockClear();
+    mockLogger.warn.mockClear();
+    mockLogger.error.mockClear();
   });
 
   afterEach(() => {
@@ -212,6 +253,7 @@ describe("QoderClient", () => {
     const summary = await client.performTask(
       {
         id: "task-1",
+        projectId: "project-1",
         title: "Implement feature",
         status: "To Do",
         description: "Add a feature",
@@ -226,9 +268,7 @@ describe("QoderClient", () => {
     const [command, args, options] = mockExecFile.mock.calls[0];
     expect(command).toBe("qoder");
     expect(args[0]).toBe("-p");
-    expect(String(args[1])).toContain(
-      `Task documentation file: ${notesFile}`,
-    );
+    expect(String(args[1])).toContain(`Task documentation file: ${notesFile}`);
     expect(String(args[1])).toContain(`to the file: ${summaryFile}`);
     expect(args.slice(2)).toEqual([
       "--output-format",
@@ -237,10 +277,42 @@ describe("QoderClient", () => {
       "bypass_permissions",
     ]);
     expect(options).toMatchObject({
-      timeout: 1800000,
+      timeout: 3600000,
       cwd: taskDir,
     });
     expect(await fse.pathExists(summaryFile)).toBe(false);
+  });
+
+  it("should run the task with the configured timeout", async () => {
+    config.TASK_TIMEOUT = 7200;
+    const taskDir = path.join(os.tmpdir(), "qoder-spec");
+    const notesFile = path.join(taskDir, "task-1-Agent.md");
+    await fse.ensureDir(taskDir);
+    mockExecFile.mockImplementation(
+      (
+        _command: string,
+        _args: string[],
+        _options: unknown,
+        callback: (error: Error | null, stdout: string, stderr: string) => void,
+      ) => callback(null, JSON.stringify({ result: "Done" }), ""),
+    );
+
+    const client = new QoderClient(config);
+    await client.performTask(
+      {
+        id: "task-1",
+        projectId: "project-1",
+        title: "Implement feature",
+        status: "To Do",
+        description: "Add a feature",
+        comments: [],
+        attachments: [],
+      },
+      notesFile,
+    );
+
+    const [, , options] = mockExecFile.mock.calls[0];
+    expect(options).toMatchObject({ timeout: 7200000 });
   });
 
   it("should document the organization token variables in the task prompt", async () => {
@@ -259,6 +331,7 @@ describe("QoderClient", () => {
     await client.performTask(
       {
         id: "task-1",
+        projectId: "project-1",
         title: "Implement feature",
         status: "To Do",
         description: "Add a feature",
@@ -290,6 +363,7 @@ describe("QoderClient", () => {
     await client.performTask(
       {
         id: "task-1",
+        projectId: "project-1",
         title: "Implement feature",
         status: "To Do",
         description: "Add a feature",
@@ -325,6 +399,7 @@ describe("QoderClient", () => {
     const summary = await client.performTask(
       {
         id: "task-1",
+        projectId: "project-1",
         title: "Implement feature",
         status: "To Do",
         description: "Add a feature",
@@ -338,19 +413,16 @@ describe("QoderClient", () => {
   });
 
   it("should run the task with the model requested in the task description", async () => {
-    mockExecFile.mockImplementation(
-      (
-        _command: string,
-        _args: string[],
-        _options: unknown,
-        callback: (error: Error | null, stdout: string, stderr: string) => void,
-      ) => callback(null, JSON.stringify({ result: "Done" }), ""),
+    respondToCli(
+      JSON.stringify({ result: "Done" }),
+      "MODEL\nAuto\nclaude-opus-4-1\n",
     );
 
     const client = new QoderClient(config);
     await client.performTask(
       {
         id: "task-1",
+        projectId: "project-1",
         title: "Implement feature",
         status: "To Do",
         description: "Add a feature\nqoder-model: claude-opus-4-1\n",
@@ -360,7 +432,7 @@ describe("QoderClient", () => {
       path.join(os.tmpdir(), "qoder-spec", "task-1-Agent.md"),
     );
 
-    const [, args] = mockExecFile.mock.calls[0];
+    const args = promptArgs();
     expect(args.slice(-6)).toEqual([
       "--model",
       "claude-opus-4-1",
@@ -373,19 +445,16 @@ describe("QoderClient", () => {
 
   it("should run the task with the default model when the description has no request", async () => {
     config.QODER_MODEL = "claude-sonnet-4-5";
-    mockExecFile.mockImplementation(
-      (
-        _command: string,
-        _args: string[],
-        _options: unknown,
-        callback: (error: Error | null, stdout: string, stderr: string) => void,
-      ) => callback(null, JSON.stringify({ result: "Done" }), ""),
+    respondToCli(
+      JSON.stringify({ result: "Done" }),
+      "MODEL\nAuto\nclaude-sonnet-4-5\n",
     );
 
     const client = new QoderClient(config);
     await client.performTask(
       {
         id: "task-1",
+        projectId: "project-1",
         title: "Implement feature",
         status: "To Do",
         description: "Add a feature",
@@ -395,7 +464,7 @@ describe("QoderClient", () => {
       path.join(os.tmpdir(), "qoder-spec", "task-1-Agent.md"),
     );
 
-    const [, args] = mockExecFile.mock.calls[0];
+    const args = promptArgs();
     expect(args.slice(-6)).toEqual([
       "--model",
       "claude-sonnet-4-5",
@@ -408,6 +477,37 @@ describe("QoderClient", () => {
 
   it("should prioritize the task description model over the default model", async () => {
     config.QODER_MODEL = "claude-sonnet-4-5";
+    respondToCli(
+      JSON.stringify({ result: "Done" }),
+      "MODEL\nAuto\nclaude-sonnet-4-5\nclaude-opus-4-1\n",
+    );
+
+    const client = new QoderClient(config);
+    await client.performTask(
+      {
+        id: "task-1",
+        projectId: "project-1",
+        title: "Implement feature",
+        status: "To Do",
+        description: "Add a feature\nQoder-Model: claude-opus-4-1",
+        comments: [],
+        attachments: [],
+      },
+      path.join(os.tmpdir(), "qoder-spec", "task-1-Agent.md"),
+    );
+
+    const args = promptArgs();
+    expect(args.slice(-6)).toEqual([
+      "--model",
+      "claude-opus-4-1",
+      "--output-format",
+      "json",
+      "--permission-mode",
+      "bypass_permissions",
+    ]);
+  });
+
+  it("should prepend the action instruction to the task prompt", async () => {
     mockExecFile.mockImplementation(
       (
         _command: string,
@@ -421,24 +521,256 @@ describe("QoderClient", () => {
     await client.performTask(
       {
         id: "task-1",
+        projectId: "project-1",
         title: "Implement feature",
         status: "To Do",
-        description: "Add a feature\nQoder-Model: claude-opus-4-1",
+        description: "Add a feature",
+        comments: [],
+        attachments: [],
+      },
+      path.join(os.tmpdir(), "qoder-spec", "task-1-Agent.md"),
+      { instruction: "Follow the coding guidelines" },
+    );
+
+    const [, args] = mockExecFile.mock.calls[0];
+    const prompt = String(args[1]);
+    expect(prompt.indexOf("Follow the coding guidelines")).toBeGreaterThan(
+      prompt.indexOf("You are an autonomous agent"),
+    );
+    expect(prompt.indexOf("Follow the coding guidelines")).toBeLessThan(
+      prompt.indexOf("Task documentation file:"),
+    );
+  });
+
+  it("should not mention an instruction when the action has none", async () => {
+    respondToCli(
+      JSON.stringify({ result: "Done" }),
+      "MODEL\nAuto\naction-model\n",
+    );
+
+    const client = new QoderClient(config);
+    await client.performTask(
+      {
+        id: "task-1",
+        projectId: "project-1",
+        title: "Implement feature",
+        status: "To Do",
+        description: "Add a feature",
+        comments: [],
+        attachments: [],
+      },
+      path.join(os.tmpdir(), "qoder-spec", "task-1-Agent.md"),
+      { model: "action-model" },
+    );
+
+    expect(String(promptArgs()[1])).not.toContain("Instructions for this task");
+  });
+
+  it("should run the task with the model of the action", async () => {
+    respondToCli(
+      JSON.stringify({ result: "Done" }),
+      "MODEL\nAuto\naction-model\n",
+    );
+
+    const client = new QoderClient(config);
+    await client.performTask(
+      {
+        id: "task-1",
+        projectId: "project-1",
+        title: "Implement feature",
+        status: "To Do",
+        description: "Add a feature",
+        comments: [],
+        attachments: [],
+      },
+      path.join(os.tmpdir(), "qoder-spec", "task-1-Agent.md"),
+      { model: "action-model" },
+    );
+
+    const args = promptArgs();
+    expect(args.slice(-6)).toEqual([
+      "--model",
+      "action-model",
+      "--output-format",
+      "json",
+      "--permission-mode",
+      "bypass_permissions",
+    ]);
+  });
+
+  it("should prioritize the action model over QODER_MODEL", async () => {
+    config.QODER_MODEL = "claude-sonnet-4-5";
+    respondToCli(
+      JSON.stringify({ result: "Done" }),
+      "MODEL\nAuto\nclaude-sonnet-4-5\naction-model\n",
+    );
+
+    const client = new QoderClient(config);
+    await client.performTask(
+      {
+        id: "task-1",
+        projectId: "project-1",
+        title: "Implement feature",
+        status: "To Do",
+        description: "Add a feature",
+        comments: [],
+        attachments: [],
+      },
+      path.join(os.tmpdir(), "qoder-spec", "task-1-Agent.md"),
+      { model: "action-model" },
+    );
+
+    const args = promptArgs();
+    expect(args).toContain("action-model");
+    expect(args).not.toContain("claude-sonnet-4-5");
+  });
+
+  it("should warn when the task model is not available to the account", async () => {
+    respondToCli(
+      JSON.stringify({ result: "Done" }),
+      "MODEL\nAuto\nDeepSeek-Flash\n",
+    );
+
+    const client = new QoderClient(config);
+    await client.performTask(
+      {
+        id: "task-1",
+        projectId: "project-1",
+        title: "Implement feature",
+        status: "To Do",
+        description: "Add a feature\nqoder-model: claude-opus-4-1\n",
         comments: [],
         attachments: [],
       },
       path.join(os.tmpdir(), "qoder-spec", "task-1-Agent.md"),
     );
 
-    const [, args] = mockExecFile.mock.calls[0];
-    expect(args.slice(-6)).toEqual([
-      "--model",
-      "claude-opus-4-1",
-      "--output-format",
-      "json",
-      "--permission-mode",
-      "bypass_permissions",
-    ]);
+    expect(mockLogger.warn).toHaveBeenCalledWith(
+      expect.stringContaining(
+        "Task model 'claude-opus-4-1' is not available to this Qoder account",
+      ),
+    );
+    expect(mockLogger.warn).toHaveBeenCalledWith(
+      expect.stringContaining("DeepSeek-Flash"),
+    );
+  });
+
+  it("should not warn when the task model is available to the account", async () => {
+    respondToCli(
+      JSON.stringify({ result: "Done" }),
+      "MODEL\nAuto\nclaude-opus-4-1\n",
+    );
+
+    const client = new QoderClient(config);
+    await client.performTask(
+      {
+        id: "task-1",
+        projectId: "project-1",
+        title: "Implement feature",
+        status: "To Do",
+        description: "Add a feature\nqoder-model: claude-opus-4-1\n",
+        comments: [],
+        attachments: [],
+      },
+      path.join(os.tmpdir(), "qoder-spec", "task-1-Agent.md"),
+    );
+
+    expect(mockLogger.warn).not.toHaveBeenCalled();
+  });
+
+  it("should still run the task when the model list cannot be fetched", async () => {
+    mockExecFile.mockImplementation(
+      (
+        _command: string,
+        args: string[],
+        _options: unknown,
+        callback: (error: Error | null, stdout: string, stderr: string) => void,
+      ) => {
+        if (args.includes("--list-models")) {
+          callback(
+            Object.assign(new Error("Command failed"), {
+              code: 1,
+              killed: false,
+              stderr: "boom",
+              stdout: "",
+            }),
+            "",
+            "",
+          );
+          return;
+        }
+        callback(null, JSON.stringify({ result: "Done" }), "");
+      },
+    );
+
+    const client = new QoderClient(config);
+    const summary = await client.performTask(
+      {
+        id: "task-1",
+        projectId: "project-1",
+        title: "Implement feature",
+        status: "To Do",
+        description: "Add a feature\nqoder-model: claude-opus-4-1\n",
+        comments: [],
+        attachments: [],
+      },
+      path.join(os.tmpdir(), "qoder-spec", "task-1-Agent.md"),
+    );
+
+    expect(summary).toBe("Done\n\n---\nModel: claude-opus-4-1");
+    expect(mockLogger.warn).not.toHaveBeenCalled();
+  });
+
+  it("should list the models only once across tasks", async () => {
+    respondToCli(JSON.stringify({ result: "Done" }), "MODEL\nAuto\n");
+
+    const client = new QoderClient(config);
+    const notesFile = path.join(os.tmpdir(), "qoder-spec", "task-1-Agent.md");
+    const task = {
+      id: "task-1",
+      projectId: "project-1",
+      title: "Implement feature",
+      status: "To Do",
+      description: "Add a feature\nqoder-model: claude-opus-4-1\n",
+      comments: [],
+      attachments: [],
+    };
+    await client.performTask(task, notesFile);
+    await client.performTask(task, notesFile);
+
+    expect(
+      mockExecFile.mock.calls.filter((call) =>
+        (call[1] as string[]).includes("--list-models"),
+      ),
+    ).toHaveLength(1);
+  });
+
+  it("should not check the models when the task runs with the CLI default", async () => {
+    mockExecFile.mockImplementation(
+      (
+        _command: string,
+        _args: string[],
+        _options: unknown,
+        callback: (error: Error | null, stdout: string, stderr: string) => void,
+      ) => callback(null, JSON.stringify({ result: "Done" }), ""),
+    );
+
+    const client = new QoderClient(config);
+    await client.performTask(
+      {
+        id: "task-1",
+        projectId: "project-1",
+        title: "Implement feature",
+        status: "To Do",
+        description: "Add a feature",
+        comments: [],
+        attachments: [],
+      },
+      path.join(os.tmpdir(), "qoder-spec", "task-1-Agent.md"),
+    );
+
+    expect(mockExecFile).toHaveBeenCalledTimes(1);
+    expect(mockExecFile.mock.calls[0][1]).not.toContain("--list-models");
   });
 
   it("should append the model and credits footer to the task summary", async () => {
@@ -464,6 +796,7 @@ describe("QoderClient", () => {
     const summary = await client.performTask(
       {
         id: "task-1",
+        projectId: "project-1",
         title: "Implement feature",
         status: "To Do",
         description: "Add a feature\nqoder-model: claude-opus-4-1",
@@ -476,9 +809,9 @@ describe("QoderClient", () => {
     expect(summary).toBe(
       "Done\n\n---\nModel: claude-opus-4-1 · Qoder credits: 16.41 -> 16.35",
     );
-    expect(await fse.readJson(path.join(dataDir, "qoder-credits.json"))).toEqual(
-      { credits: 16.35 },
-    );
+    expect(
+      await fse.readJson(path.join(dataDir, "qoder-credits.json")),
+    ).toEqual({ credits: 16.35 });
   });
 
   it("should display the auto model and unknown previous credits on the first task", async () => {
@@ -500,6 +833,7 @@ describe("QoderClient", () => {
     const summary = await client.performTask(
       {
         id: "task-1",
+        projectId: "project-1",
         title: "Implement feature",
         status: "To Do",
         description: "Add a feature",
@@ -567,6 +901,7 @@ describe("QoderClient", () => {
     const summary = await client.performTask(
       {
         id: "task-1",
+        projectId: "project-1",
         title: "Suggest skills",
         status: "To Do",
         description: "",
@@ -600,6 +935,7 @@ describe("QoderClient", () => {
     const summary = await client.performTask(
       {
         id: "task-1",
+        projectId: "project-1",
         title: "Implement feature",
         status: "To Do",
         description: "",
@@ -626,6 +962,7 @@ describe("QoderClient", () => {
     const summary = await client.performTask(
       {
         id: "task-1",
+        projectId: "project-1",
         title: "Implement feature",
         status: "To Do",
         description: "Add a feature",
@@ -652,6 +989,7 @@ describe("QoderClient", () => {
     const summary = await client.performTask(
       {
         id: "task-1",
+        projectId: "project-1",
         title: "Implement feature",
         status: "To Do",
         description: "",
@@ -689,6 +1027,7 @@ describe("QoderClient", () => {
       client.performTask(
         {
           id: "task-1",
+          projectId: "project-1",
           title: "Implement feature",
           status: "To Do",
           description: "",
@@ -798,9 +1137,7 @@ describe("QoderClient", () => {
     );
 
     const client = new QoderClient(config);
-    await expect(client.runPrompt("hello")).resolves.toBe(
-      "plain text reply",
-    );
+    await expect(client.runPrompt("hello")).resolves.toBe("plain text reply");
   });
 
   it("should report a missing CLI for standalone prompts", async () => {

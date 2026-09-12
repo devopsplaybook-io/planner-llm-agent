@@ -1,0 +1,6 @@
+kind: Namespace
+apiVersion: v1
+metadata:
+  name: planner-llm-agent
+  labels:
+    name: planner-llm-agent

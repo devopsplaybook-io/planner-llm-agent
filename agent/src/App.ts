@@ -1,5 +1,6 @@
 import { watchFile } from "fs-extra";
 import { Agent } from "./Agent";
+import { AgentActionsConfig, loadAgentActions } from "./AgentActions";
 import { AgentConfigRepository } from "./AgentConfigRepository";
 import { AgentNote } from "./AgentNote";
 import { Config } from "./Config";
@@ -44,6 +45,30 @@ Promise.resolve().then(async () => {
       );
     });
   });
+
+  // Agent actions: the YAML file binding projects and start statuses to a
+  // model, an instruction and an end status. The format is checked strictly
+  // at startup so a misconfiguration fails fast; when the file is missing
+  // the agent starts with no action and processes no task.
+  let agentActions: AgentActionsConfig | null = null;
+  try {
+    agentActions = await loadAgentActions(config.AGENT_ACTIONS_FILE);
+  } catch (error) {
+    logger.error(
+      `Invalid agent actions configuration file '${config.AGENT_ACTIONS_FILE}': ${(error as Error).message}`,
+      error as Error,
+    );
+    process.exit(1);
+  }
+  if (agentActions === null) {
+    logger.warn(
+      `Agent actions file not found at '${config.AGENT_ACTIONS_FILE}': no task will be processed`,
+    );
+  } else {
+    logger.info(
+      `Agent actions loaded from '${config.AGENT_ACTIONS_FILE}' (${agentActions.actions.length} action(s))`,
+    );
+  }
 
   // OpenTelemetry
   try {
@@ -111,30 +136,31 @@ Promise.resolve().then(async () => {
   }
 
   // Agent
-  const agent = new Agent(config);
+  const agent = new Agent(config, agentActions);
   agent.start();
 
   // Agent note: a single Planner note named after the agent, regularly
-  // refreshed with LLM-generated content. At the end of the startup the
-  // note is checked and created when missing; the content is then refreshed
-  // on the configured interval.
+  // refreshed with LLM-generated content. The note is updated when the
+  // agent starts so its content reflects the current agent configuration,
+  // then on the configured interval.
   const agentNote = new AgentNote(
     config,
     new PlannerClient(config),
     qoderClient,
+    agentActions,
   );
   if (agentNote.isEnabled()) {
     const updateAgentNote = () => {
       void agentNote.update().catch((error: Error) => {
-        logger.error("Agent note update failed (will retry on schedule)", error);
+        logger.error(
+          "Agent note update failed (will retry on schedule)",
+          error,
+        );
       });
     };
-    void agentNote.ensureNote().catch((error: Error) => {
-      logger.error(
-        "Agent note startup check failed (will retry on schedule)",
-        error,
-      );
-    });
+    // The note is refreshed once at startup, before the first scheduled
+    // interval, so a configuration change is picked up on every restart.
+    updateAgentNote();
     const agentNoteTimer = setInterval(
       updateAgentNote,
       config.AGENT_NOTE_INTERVAL * 1000,

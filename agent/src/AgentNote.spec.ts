@@ -1,6 +1,7 @@
 import * as fse from "fs-extra";
 import * as os from "os";
 import * as path from "path";
+import { AgentActionsConfig } from "./AgentActions";
 import { AgentNote } from "./AgentNote";
 import { Config } from "./Config";
 import { PlannerClient, PlannerProject } from "./PlannerClient";
@@ -53,6 +54,7 @@ describe("AgentNote", () => {
       config,
       planner as unknown as PlannerClient,
       qoder as unknown as QoderClient,
+      null,
     );
   });
 
@@ -185,8 +187,7 @@ describe("AgentNote", () => {
       planner.listNotes.mockResolvedValue([]);
       planner.createNote.mockResolvedValue({ id: "n1" });
       qoder.runPrompt.mockResolvedValue("content");
-      let resolveProjects: (value: PlannerProject[]) => void = () =>
-        undefined;
+      let resolveProjects: (value: PlannerProject[]) => void = () => undefined;
       planner.listProjects.mockImplementation(
         () =>
           new Promise<PlannerProject[]>((resolve) => {
@@ -262,42 +263,124 @@ describe("AgentNote", () => {
       expect(prompt).toContain(
         "GitHub organizations with dedicated tokens: org-one (GH_TOKEN_ORG_ONE), org-two (GH_TOKEN_ORG_TWO)",
       );
+      expect(prompt).toContain(
+        "Agent actions: not configured (no task will be processed)",
+      );
+      expect(prompt).toContain("Default model: auto (CLI default)");
     });
   });
 
-  describe("ensureNote", () => {
-    it("should create the note at startup when it does not exist", async () => {
+  describe("agent actions facts", () => {
+    it("should include the agent actions configuration in the generation prompt", async () => {
+      const actions: AgentActionsConfig = {
+        defaultModel: "GLM-5.3-Flash",
+        actions: [
+          {
+            project: "Projects",
+            statusStart: "Plan",
+            statusEnd: "Review",
+            model: "DeepSeek-Flash",
+            instruction: "Do not modify any code. Post an implementation plan.",
+          },
+          {
+            project: "Projects",
+            statusStart: "Merge",
+            statusEnd: "Review",
+            model: "",
+            instruction: "",
+          },
+        ],
+      };
       planner.listProjects.mockResolvedValue([project]);
       planner.listNotes.mockResolvedValue([]);
-      qoder.runPrompt.mockResolvedValue("initial content");
+      qoder.runPrompt.mockResolvedValue("content");
       planner.createNote.mockResolvedValue({ id: "n1" });
-
-      await agentNote.ensureNote();
-
-      expect(planner.createNote).toHaveBeenCalledWith(
-        "p1",
-        "Planner LLM Agent: test-agent",
-        "initial content",
+      const note = new AgentNote(
+        config,
+        planner as unknown as PlannerClient,
+        qoder as unknown as QoderClient,
+        actions,
       );
-      expect(planner.updateNote).not.toHaveBeenCalled();
+
+      await note.update();
+
+      const prompt = qoder.runPrompt.mock.calls[0][0] as string;
+      expect(prompt).toContain("Default model: GLM-5.3-Flash");
+      expect(prompt).toContain("- Agent actions:");
+      expect(prompt).toContain(
+        "Project 'Projects', status 'Plan' -> 'Review', model DeepSeek-Flash, instruction: Do not modify any code. Post an implementation plan.",
+      );
+      expect(prompt).toContain(
+        "Project 'Projects', status 'Merge' -> 'Review', default model",
+      );
     });
 
-    it("should leave an existing note untouched at startup", async () => {
+    it("should truncate long instructions in the actions facts", async () => {
+      const longInstruction =
+        "Do not modify any code. Analyze the task description, the comments and the target repository, then produce a concise implementation plan for the team.";
+      const actions: AgentActionsConfig = {
+        defaultModel: "",
+        actions: [
+          {
+            project: "Projects",
+            statusStart: "Plan",
+            statusEnd: "Review",
+            model: "",
+            instruction: longInstruction,
+          },
+        ],
+      };
       planner.listProjects.mockResolvedValue([project]);
-      planner.listNotes.mockResolvedValue([
-        {
-          id: "n1",
-          projectId: "p1",
-          title: "Planner LLM Agent: test-agent",
-          description: "existing content",
-        },
-      ]);
+      planner.listNotes.mockResolvedValue([]);
+      qoder.runPrompt.mockResolvedValue("content");
+      planner.createNote.mockResolvedValue({ id: "n1" });
+      const note = new AgentNote(
+        config,
+        planner as unknown as PlannerClient,
+        qoder as unknown as QoderClient,
+        actions,
+      );
 
-      await agentNote.ensureNote();
+      await note.update();
 
-      expect(qoder.runPrompt).not.toHaveBeenCalled();
-      expect(planner.createNote).not.toHaveBeenCalled();
-      expect(planner.updateNote).not.toHaveBeenCalled();
+      const prompt = qoder.runPrompt.mock.calls[0][0] as string;
+      expect(prompt).toContain(
+        `instruction: ${longInstruction.slice(0, 100)}...`,
+      );
+      expect(prompt).not.toContain(longInstruction);
+    });
+
+    it("should list a wildcard project as any project", async () => {
+      const actions: AgentActionsConfig = {
+        defaultModel: "",
+        actions: [
+          {
+            project: "",
+            statusStart: "To Do",
+            statusEnd: "Done",
+            model: "",
+            instruction: "",
+          },
+        ],
+      };
+      planner.listProjects.mockResolvedValue([project]);
+      planner.listNotes.mockResolvedValue([]);
+      qoder.runPrompt.mockResolvedValue("content");
+      planner.createNote.mockResolvedValue({ id: "n1" });
+      const note = new AgentNote(
+        config,
+        planner as unknown as PlannerClient,
+        qoder as unknown as QoderClient,
+        actions,
+      );
+
+      await note.update();
+
+      const prompt = qoder.runPrompt.mock.calls[0][0] as string;
+      expect(prompt).toContain(
+        "Project any project, status 'To Do' -> 'Done', default model",
+      );
+      expect(prompt).toContain("Default model: auto (CLI default)");
     });
   });
 });

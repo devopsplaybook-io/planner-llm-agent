@@ -9,12 +9,22 @@ import { PlannerTask } from "./PlannerClient";
 const logger = OTelLogger().createModuleLogger("qoder-client");
 
 const AUTH_CHECK_TIMEOUT_MS = 120000;
-const TASK_TIMEOUT_MS = 1800000;
 const PROMPT_TIMEOUT_MS = 600000;
 const PROBE_PROMPT = "Reply with exactly: OK";
 
+// Task execution options coming from the matching action of the agent
+// actions configuration: the model is the action model or the configured
+// default model, and the instruction is prepended to the task information.
+export interface TaskOptions {
+  model?: string;
+  instruction?: string;
+}
+
 export class QoderClient {
   private config: Config;
+  // Models available to the Qoder account, fetched once from the CLI and
+  // cached for the lifetime of the client (undefined until the first fetch).
+  private availableModels: string[] | undefined;
 
   constructor(config: Config) {
     this.config = config;
@@ -77,6 +87,7 @@ export class QoderClient {
   public async performTask(
     task: PlannerTask,
     notesFile: string,
+    options?: TaskOptions,
   ): Promise<string> {
     const span = OTelTracer().startSpan("qoder-client.perform-task");
     const summaryFile = getSummaryFile(notesFile);
@@ -90,14 +101,25 @@ export class QoderClient {
       }
       const promptLines = [
         "You are an autonomous agent working on an assigned task.",
+      ];
+      const instruction = options?.instruction?.trim();
+      if (instruction) {
+        // The instruction comes on top of the task information: it refines
+        // how the task documented in the notes file must be executed.
+        promptLines.push(
+          "Instructions for this task (apply them on top of the task information):",
+          instruction,
+        );
+      }
+      promptLines.push(
         `Task documentation file: ${notesFile}`,
         "Read the documentation file first: it contains the task description and all comments.",
         "Git and the GitHub CLI (gh) are already configured with authentication for Git and GitHub operations.",
-      ];
+      );
       const githubTokenEntries = this.config.githubTokenEntries();
       if (githubTokenEntries.length > 0) {
         promptLines.push(
-          'The default GH_TOKEN does not necessarily have the rights for every GitHub organization.',
+          "The default GH_TOKEN does not necessarily have the rights for every GitHub organization.",
           'Dedicated tokens are available per organization: for gh operations on repositories of an organization listed below, prefix the command with its token variable, e.g. GH_TOKEN="$GH_TOKEN_MY_ORG" gh pr create.',
           `Organizations and token variables: ${githubTokenEntries
             .map(
@@ -119,9 +141,17 @@ export class QoderClient {
       );
       const prompt = promptLines.join("\n");
       const args = ["-p", prompt];
-      const model = resolveModel(task, this.config.QODER_MODEL);
+      // The model of the matching action (or the configured default model)
+      // replaces the QODER_MODEL fallback; the task description still takes
+      // priority over both.
+      const actionModel = options?.model?.trim() ?? "";
+      const model = resolveModel(
+        task,
+        actionModel.length > 0 ? actionModel : this.config.QODER_MODEL,
+      );
       if (model !== null) {
         logger.info(`Qoder model: ${model.model} (from ${model.source})`);
+        await this.warnIfModelInvalid(model.model);
         args.push("--model", model.model);
       }
       args.push(
@@ -132,8 +162,10 @@ export class QoderClient {
       );
       const creditsBefore = await readCredits(this.config);
       logger.info(`Qoder credits before task: ${formatCredits(creditsBefore)}`);
+      // The task timeout is configurable (TASK_TIMEOUT, in seconds) so
+      // long-running tasks are not cut off by a hardcoded limit.
       const result = await runCli(this.config.QODER_CLI, args, {
-        timeout: TASK_TIMEOUT_MS,
+        timeout: this.config.TASK_TIMEOUT * 1000,
         windowsHide: true,
         cwd: path.dirname(notesFile),
         maxBuffer: 10 * 1024 * 1024,
@@ -197,7 +229,7 @@ export class QoderClient {
       }
       if (execError.killed) {
         throw new Error(
-          `Qoder task execution timed out after ${TASK_TIMEOUT_MS / 1000} seconds`,
+          `Qoder task execution timed out after ${this.config.TASK_TIMEOUT} seconds`,
           { cause: error },
         );
       }
@@ -207,6 +239,50 @@ export class QoderClient {
       );
     } finally {
       span.end();
+    }
+  }
+
+  // The models available to the Qoder account, listed once by the CLI and
+  // cached for the lifetime of the client. Returns null when the list
+  // cannot be obtained: the model validation is best-effort and is then
+  // skipped.
+  public async listModels(): Promise<string[] | null> {
+    if (this.availableModels !== undefined) {
+      return this.availableModels;
+    }
+    try {
+      const result = await runCli(this.config.QODER_CLI, ["--list-models"], {
+        timeout: AUTH_CHECK_TIMEOUT_MS,
+        windowsHide: true,
+      });
+      const models = parseModelList(result.stdout);
+      if (models.length === 0) {
+        return null;
+      }
+      this.availableModels = models;
+      return models;
+    } catch {
+      // A failed listing only disables the validation for this call.
+      return null;
+    }
+  }
+
+  // When a task starts, the resolved model is checked against the models
+  // available to the account: a typo in the configuration would otherwise
+  // only surface as an obscure CLI failure during the task. The task still
+  // runs: the CLI remains the authority on what it can execute.
+  private async warnIfModelInvalid(model: string): Promise<void> {
+    const models = await this.listModels();
+    if (models === null) {
+      return;
+    }
+    const known = models.some(
+      (entry) => entry.toLowerCase() === model.toLowerCase(),
+    );
+    if (!known) {
+      logger.warn(
+        `Task model '${model}' is not available to this Qoder account (available models: ${models.join(", ")})`,
+      );
     }
   }
 
@@ -259,9 +335,12 @@ export class QoderClient {
           { cause: error },
         );
       }
-      throw new Error(`Qoder prompt failed:\n${extractErrorDetail(execError)}`, {
-        cause: error,
-      });
+      throw new Error(
+        `Qoder prompt failed:\n${extractErrorDetail(execError)}`,
+        {
+          cause: error,
+        },
+      );
     } finally {
       span.end();
     }
@@ -296,6 +375,14 @@ function resolveModel(
 function extractTaskModel(description: string): string | null {
   const match = description.match(/^\s*qoder-model:\s*(\S+)/im);
   return match ? match[1] : null;
+}
+
+// The CLI lists the available models as plain lines after a 'MODEL' header.
+function parseModelList(stdout: string): string[] {
+  return stdout
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0 && line.toLowerCase() !== "model");
 }
 
 // The qoder account credit balance is persisted so each task can display

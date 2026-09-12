@@ -1,5 +1,6 @@
 import * as fse from "fs-extra";
 import * as path from "path";
+import { AgentAction, AgentActionsConfig } from "./AgentActions";
 import { Config } from "./Config";
 import { OTelLogger } from "./OTelContext";
 import { PlannerClient, PlannerTask } from "./PlannerClient";
@@ -15,6 +16,7 @@ const MAX_FAILURE_EXPLANATION_LENGTH = 1000;
 
 export class Agent {
   private config: Config;
+  private agentActions: AgentActionsConfig | null;
   private planner: PlannerClient;
   private qoder: QoderClient;
   private pollingTimer?: NodeJS.Timeout;
@@ -22,8 +24,9 @@ export class Agent {
   // subsequent poll while their processing is still running.
   private processingTasks = new Set<string>();
 
-  constructor(config: Config) {
+  constructor(config: Config, agentActions?: AgentActionsConfig | null) {
     this.config = config;
+    this.agentActions = agentActions ?? null;
     this.planner = new PlannerClient(config);
     this.qoder = new QoderClient(config);
   }
@@ -51,25 +54,51 @@ export class Agent {
       const user = await this.planner.getCurrentUser();
       const tasks = await this.planner.listAssignedTasks(user);
       await this.cleanupCompletedTasks(tasks);
-      // Only tasks in the start status are ready, and a task already being
-      // processed is never picked again by a subsequent poll.
-      const actionableTasks = tasks.filter(
-        (task) =>
-          task.status === this.config.TASK_STATUS_START &&
-          !this.processingTasks.has(task.id),
-      );
+      const actions = this.getActions();
+      // Actions are bound to a project name: the project ids of the tasks
+      // are resolved to names once per poll.
+      let projectNames: Map<string, string> | null = null;
+      if (actions.some((action) => action.project.length > 0)) {
+        const projects = await this.planner.listProjects();
+        projectNames = new Map(
+          projects.map((project) => [project.id, project.name]),
+        );
+      }
+      // Only tasks matching an action are ready, and a task already being
+      // processed is never picked again by a subsequent poll. The parallel
+      // limit is shared by every action.
       const freeSlots =
         this.config.TASK_MAX_PARALLEL - this.processingTasks.size;
-      if (freeSlots <= 0 || actionableTasks.length === 0) {
+      const tasksToProcess: { task: PlannerTask; action: AgentAction }[] = [];
+      for (const action of actions) {
+        if (tasksToProcess.length >= freeSlots) {
+          break;
+        }
+        for (const task of tasks) {
+          if (tasksToProcess.length >= freeSlots) {
+            break;
+          }
+          if (
+            !this.matchesAction(task, action, projectNames) ||
+            this.processingTasks.has(task.id) ||
+            tasksToProcess.some((selected) => selected.task.id === task.id)
+          ) {
+            continue;
+          }
+          tasksToProcess.push({ task, action });
+        }
+      }
+      if (tasksToProcess.length === 0) {
         return;
       }
-      const tasksToProcess = actionableTasks.slice(0, freeSlots);
-      for (const task of tasksToProcess) {
+      for (const { task } of tasksToProcess) {
         this.processingTasks.add(task.id);
       }
       // Each task manages its own error handling and in-flight cleanup.
       await Promise.all(
-        tasksToProcess.map((task) => this.processTask(task)),
+        tasksToProcess.map(({ task, action }) =>
+          this.processTask(task, action),
+        ),
       );
     } catch (error) {
       logger.error(
@@ -78,20 +107,61 @@ export class Agent {
     }
   }
 
-  private async processTask(task: PlannerTask): Promise<void> {
+  // The actions drive which tasks are picked and how they are processed.
+  // They come from the agent actions configuration; without it no task
+  // is processed.
+  private getActions(): AgentAction[] {
+    return this.agentActions?.actions ?? [];
+  }
+
+  // A task matches an action when its status is the action start status and
+  // its project is the action project (an empty project matches any
+  // project). A task whose project cannot be resolved never matches a
+  // project-bound action.
+  private matchesAction(
+    task: PlannerTask,
+    action: AgentAction,
+    projectNames: Map<string, string> | null,
+  ): boolean {
+    if (task.status !== action.statusStart) {
+      return false;
+    }
+    if (action.project.length === 0) {
+      return true;
+    }
+    if (projectNames === null || task.projectId.length === 0) {
+      return false;
+    }
+    return projectNames.get(task.projectId) === action.project;
+  }
+
+  private async processTask(
+    task: PlannerTask,
+    action: AgentAction,
+  ): Promise<void> {
     logger.info(
       `Processing task '${task.title}' (${task.id}) in status '${task.status}'`,
     );
     try {
       const notesFile = this.getTaskNotesFile(task.id);
       await this.writeTaskNotes(task, notesFile);
-      const summary = await this.qoder.performTask(task, notesFile);
+      // The model resolves to the action model, then the configured default
+      // model, then QODER_MODEL; the task description still overrides all of
+      // them (see QoderClient.resolveModel).
+      const defaultModel =
+        action.model ||
+        this.agentActions?.defaultModel ||
+        this.config.QODER_MODEL;
+      const summary = await this.qoder.performTask(task, notesFile, {
+        model: defaultModel,
+        instruction: action.instruction,
+      });
       await this.planner.addTaskComment(task.id, summary);
-      await this.planner.updateTaskStatus(task.id, this.config.TASK_STATUS_END);
+      await this.planner.updateTaskStatus(task.id, action.statusEnd);
       logger.info(
-        `Task '${task.title}' (${task.id}) completed and moved to status '${this.config.TASK_STATUS_END}'`,
+        `Task '${task.title}' (${task.id}) completed and moved to status '${action.statusEnd}'`,
       );
-      await this.cleanupTaskFolderIfNeeded(task.id);
+      await this.cleanupTaskFolderIfNeeded(task.id, action.statusEnd);
     } catch (error) {
       const message = (error as Error).message;
       logger.error(
@@ -102,16 +172,16 @@ export class Agent {
       try {
         await this.planner.addTaskComment(
           task.id,
-          buildFailureComment(message, this.config.TASK_STATUS_END),
+          buildFailureComment(message, action.statusEnd),
         );
-        await this.planner.updateTaskStatus(task.id, this.config.TASK_STATUS_END);
+        await this.planner.updateTaskStatus(task.id, action.statusEnd);
         logger.info(
-          `Task '${task.title}' (${task.id}) moved to status '${this.config.TASK_STATUS_END}' after a processing failure`,
+          `Task '${task.title}' (${task.id}) moved to status '${action.statusEnd}' after a processing failure`,
         );
-        await this.cleanupTaskFolderIfNeeded(task.id);
+        await this.cleanupTaskFolderIfNeeded(task.id, action.statusEnd);
       } catch (cleanupError) {
         logger.error(
-          `Failed to move task '${task.title}' (${task.id}) to status '${this.config.TASK_STATUS_END}' after the processing failure: ${(cleanupError as Error).message}`,
+          `Failed to move task '${task.title}' (${task.id}) to status '${action.statusEnd}' after the processing failure: ${(cleanupError as Error).message}`,
         );
       }
     } finally {
@@ -124,7 +194,11 @@ export class Agent {
   }
 
   private getTaskSummaryFile(taskId: string): string {
-    return path.join(this.config.DATA_DIR, "tasks", `${taskId}-Agent-Summary.md`);
+    return path.join(
+      this.config.DATA_DIR,
+      "tasks",
+      `${taskId}-Agent-Summary.md`,
+    );
   }
 
   private getTaskDir(taskId: string): string {
@@ -160,8 +234,7 @@ export class Agent {
           )
         : task.attachments.length > 0
           ? task.attachments.map(
-              (attachment) =>
-                `- ${attachment.fileName} (download failed)`,
+              (attachment) => `- ${attachment.fileName} (download failed)`,
             )
           : ["*(none)*"];
     const brief = [
@@ -240,8 +313,11 @@ export class Agent {
     }
   }
 
-  private async cleanupTaskFolderIfNeeded(taskId: string): Promise<void> {
-    if (this.config.TASK_STATUS_END === this.config.TASK_STATUS_CLEANUP) {
+  private async cleanupTaskFolderIfNeeded(
+    taskId: string,
+    endStatus: string,
+  ): Promise<void> {
+    if (endStatus === this.config.TASK_STATUS_CLEANUP) {
       await this.cleanupTaskFolder(taskId, false);
     }
   }
