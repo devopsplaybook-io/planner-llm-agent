@@ -22,6 +22,9 @@ export interface TaskOptions {
 
 export class QoderClient {
   private config: Config;
+  // Models available to the Qoder account, fetched once from the CLI and
+  // cached for the lifetime of the client (undefined until the first fetch).
+  private availableModels: string[] | undefined;
 
   constructor(config: Config) {
     this.config = config;
@@ -148,6 +151,7 @@ export class QoderClient {
       );
       if (model !== null) {
         logger.info(`Qoder model: ${model.model} (from ${model.source})`);
+        await this.warnIfModelInvalid(model.model);
         args.push("--model", model.model);
       }
       args.push(
@@ -235,6 +239,50 @@ export class QoderClient {
       );
     } finally {
       span.end();
+    }
+  }
+
+  // The models available to the Qoder account, listed once by the CLI and
+  // cached for the lifetime of the client. Returns null when the list
+  // cannot be obtained: the model validation is best-effort and is then
+  // skipped.
+  public async listModels(): Promise<string[] | null> {
+    if (this.availableModels !== undefined) {
+      return this.availableModels;
+    }
+    try {
+      const result = await runCli(this.config.QODER_CLI, ["--list-models"], {
+        timeout: AUTH_CHECK_TIMEOUT_MS,
+        windowsHide: true,
+      });
+      const models = parseModelList(result.stdout);
+      if (models.length === 0) {
+        return null;
+      }
+      this.availableModels = models;
+      return models;
+    } catch {
+      // A failed listing only disables the validation for this call.
+      return null;
+    }
+  }
+
+  // When a task starts, the resolved model is checked against the models
+  // available to the account: a typo in the configuration would otherwise
+  // only surface as an obscure CLI failure during the task. The task still
+  // runs: the CLI remains the authority on what it can execute.
+  private async warnIfModelInvalid(model: string): Promise<void> {
+    const models = await this.listModels();
+    if (models === null) {
+      return;
+    }
+    const known = models.some(
+      (entry) => entry.toLowerCase() === model.toLowerCase(),
+    );
+    if (!known) {
+      logger.warn(
+        `Task model '${model}' is not available to this Qoder account (available models: ${models.join(", ")})`,
+      );
     }
   }
 
@@ -327,6 +375,14 @@ function resolveModel(
 function extractTaskModel(description: string): string | null {
   const match = description.match(/^\s*qoder-model:\s*(\S+)/im);
   return match ? match[1] : null;
+}
+
+// The CLI lists the available models as plain lines after a 'MODEL' header.
+function parseModelList(stdout: string): string[] {
+  return stdout
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0 && line.toLowerCase() !== "model");
 }
 
 // The qoder account credit balance is persisted so each task can display
