@@ -50,9 +50,7 @@ describe("AgentNote", () => {
       updateNote: jest.fn(),
     };
     qoder = { runPrompt: jest.fn(), usageSummary: jest.fn() };
-    qoder.usageSummary.mockResolvedValue(
-      "Qoder account credits remaining: unknown",
-    );
+    qoder.usageSummary.mockResolvedValue("Qoder credits not reported by the CLI");
     agentNote = new AgentNote(
       config,
       planner as unknown as PlannerClient,
@@ -241,7 +239,7 @@ describe("AgentNote", () => {
       await fse.writeFile(path.join(tasksDir, "README.md"), "not a task");
 
       qoder.usageSummary.mockResolvedValue(
-        "Qoder account credits remaining: 12.50",
+        "Qoder credits used by the last run: 12.50",
       );
       config.GITHUB_TOKEN = "github-token";
       config.GITHUB_TOKENS =

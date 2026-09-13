@@ -7,8 +7,8 @@ import {
 } from "./CliOutput";
 import { BaseCliAgent } from "./BaseCliAgent";
 
-// The qoder account credit balance is persisted so each task can display
-// the balance before and after its execution.
+// The credits consumed by the last run are persisted so each task can
+// report the spend of the previous execution.
 function getCreditsFile(config: Config): string {
   return path.join(config.DATA_DIR, "qoder-credits.json");
 }
@@ -85,8 +85,8 @@ export class QoderClient extends BaseCliAgent {
     return parseQoderModelList(stdout);
   }
 
-  // The credits balance keeps its legacy file name and format so balances
-  // persisted by previous agent versions stay readable.
+  // The file keeps its legacy name and format so values persisted by
+  // previous agent versions (last-run spends) stay readable.
   public async readUsage(): Promise<number | null> {
     try {
       const content = await fse.readJson(getCreditsFile(this.config));
@@ -107,10 +107,21 @@ export class QoderClient extends BaseCliAgent {
     }
   }
 
+  // The CLI reports the credits consumed by the run itself, not a remaining
+  // balance: the footer only displays the value of the current run.
+  protected usageFooter(
+    _usageBefore: number | null,
+    usageAfter: number | null,
+  ): string | null {
+    return usageAfter !== null
+      ? `Qoder credits used: ${this.formatUsage(usageAfter)}`
+      : null;
+  }
+
   public async usageSummary(): Promise<string> {
     const credits = await this.readUsage();
-    return `Qoder account credits remaining: ${
-      credits !== null ? credits.toFixed(2) : "unknown"
-    }`;
+    return credits !== null
+      ? `Qoder credits used by the last run: ${this.formatUsage(credits)}`
+      : "Qoder credits not reported by the CLI";
   }
 }
