@@ -5,7 +5,7 @@ import { AgentActionsConfig } from "./AgentActions";
 import { AgentNote } from "./AgentNote";
 import { Config } from "./Config";
 import { PlannerClient, PlannerProject } from "./PlannerClient";
-import { QoderClient } from "./QoderClient";
+import type { CliAgentClient } from "./clients/CliAgent";
 
 jest.mock("./OTelContext", () => ({
   OTelTracer: jest.fn(() => ({
@@ -33,7 +33,7 @@ describe("AgentNote", () => {
     createNote: jest.Mock;
     updateNote: jest.Mock;
   };
-  let qoder: { runPrompt: jest.Mock };
+  let qoder: { runPrompt: jest.Mock; usageSummary: jest.Mock };
   let agentNote: AgentNote;
 
   beforeEach(() => {
@@ -49,11 +49,14 @@ describe("AgentNote", () => {
       createNote: jest.fn(),
       updateNote: jest.fn(),
     };
-    qoder = { runPrompt: jest.fn() };
+    qoder = { runPrompt: jest.fn(), usageSummary: jest.fn() };
+    qoder.usageSummary.mockResolvedValue(
+      "Qoder account credits remaining: unknown",
+    );
     agentNote = new AgentNote(
       config,
       planner as unknown as PlannerClient,
-      qoder as unknown as QoderClient,
+      qoder as unknown as CliAgentClient,
       null,
     );
   });
@@ -237,9 +240,9 @@ describe("AgentNote", () => {
       );
       await fse.writeFile(path.join(tasksDir, "README.md"), "not a task");
 
-      await fse.outputJson(path.join(config.DATA_DIR, "qoder-credits.json"), {
-        credits: 12.5,
-      });
+      qoder.usageSummary.mockResolvedValue(
+        "Qoder account credits remaining: 12.50",
+      );
       config.GITHUB_TOKEN = "github-token";
       config.GITHUB_TOKENS =
         "org-one=github_pat_aaaaaaaaaaaaaaaaaaaa,org-two=github_pat_bbbbbbbbbbbbbbbbbbbb";
@@ -298,7 +301,7 @@ describe("AgentNote", () => {
       const note = new AgentNote(
         config,
         planner as unknown as PlannerClient,
-        qoder as unknown as QoderClient,
+        qoder as unknown as CliAgentClient,
         actions,
       );
 
@@ -337,7 +340,7 @@ describe("AgentNote", () => {
       const note = new AgentNote(
         config,
         planner as unknown as PlannerClient,
-        qoder as unknown as QoderClient,
+        qoder as unknown as CliAgentClient,
         actions,
       );
 
@@ -370,7 +373,7 @@ describe("AgentNote", () => {
       const note = new AgentNote(
         config,
         planner as unknown as PlannerClient,
-        qoder as unknown as QoderClient,
+        qoder as unknown as CliAgentClient,
         actions,
       );
 

@@ -43,6 +43,13 @@ describe("Config", () => {
       expect(config.TASK_STATUS_CLEANUP).toBe("Done");
       expect(config.TASK_TIMEOUT).toBe(3600);
       expect(config.GITHUB_TOKENS).toBe("");
+      expect(config.AGENT_CLI).toBe("qoder");
+      expect(config.AGENT_AUTH_CHECK).toBe("true");
+      expect(config.QODER_CLI).toBe("qoder");
+      expect(config.CLAUDE_CLI).toBe("claude");
+      expect(config.COPILOT_CLI).toBe("copilot");
+      expect(config.CODEX_CLI).toBe("codex");
+      expect(config.GEMINI_CLI).toBe("gemini");
       expect(config.OPENTELEMETRY_COLLECTOR_HTTP_TRACES).toBe("");
       expect(config.OPENTELEMETRY_COLLECTOR_HTTP_METRICS).toBe("");
       expect(config.OPENTELEMETRY_COLLECTOR_HTTP_LOGS).toBe("");
@@ -171,6 +178,27 @@ describe("Config", () => {
       expect(config.GITHUB_TOKENS).toBe(
         "env-org=github_pat_bbbbbbbbbbbbbbbbbbbb",
       );
+
+      await fs.remove(tmpDir);
+    });
+
+    it("should load the CLI agent settings from the config file and environment", async () => {
+      const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-config-"));
+      const configFile = path.join(tmpDir, "config.json");
+      await fs.writeJson(configFile, {
+        AGENT_CLI: "claude-code",
+        CLAUDE_CLI: "claude-code-bin",
+      });
+      process.env.CONFIG_FILE = configFile;
+      process.env.AGENT_CLI = "codex";
+      process.env.CODEX_CLI = "codex-bin";
+
+      const config = new Config();
+      await config.reload();
+      // The environment wins over the config file.
+      expect(config.AGENT_CLI).toBe("codex");
+      expect(config.CODEX_CLI).toBe("codex-bin");
+      expect(config.CLAUDE_CLI).toBe("claude-code-bin");
 
       await fs.remove(tmpDir);
     });
@@ -363,6 +391,31 @@ describe("Config", () => {
       const errors = config.validate();
       expect(errors).toEqual([
         "AGENT_NOTE_INTERVAL must be a positive integer or 0 to disable (current value: 'NaN')",
+      ]);
+    });
+
+    it("should accept every supported CLI agent", () => {
+      for (const cli of [
+        "qoder",
+        "claude-code",
+        "copilot-cli",
+        "codex",
+        "gemini-cli",
+      ]) {
+        const config = new Config();
+        config.PLANNER_API_KEY = "key";
+        config.AGENT_CLI = cli;
+        expect(config.validate()).toEqual([]);
+      }
+    });
+
+    it("should report an unsupported CLI agent", () => {
+      const config = new Config();
+      config.PLANNER_API_KEY = "key";
+      config.AGENT_CLI = "unknown-cli";
+
+      expect(config.validate()).toEqual([
+        "AGENT_CLI 'unknown-cli' is not supported (supported CLIs: qoder, claude-code, copilot-cli, codex, gemini-cli)",
       ]);
     });
   });

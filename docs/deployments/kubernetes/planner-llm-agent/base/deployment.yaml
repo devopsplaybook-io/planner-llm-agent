@@ -34,6 +34,34 @@ spec:
                 secretKeyRef:
                   name: planner-llm-agent
                   key: QODER_PERSONAL_ACCESS_TOKEN
+                  optional: true
+            # Credentials of the other supported coding-agent CLIs
+            # (AGENT_CLI: claude-code, copilot-cli, codex, gemini-cli).
+            # Copilot CLI reuses the GitHub token below.
+            - name: ANTHROPIC_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: planner-llm-agent
+                  key: ANTHROPIC_API_KEY
+                  optional: true
+            - name: CLAUDE_CODE_OAUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: planner-llm-agent
+                  key: CLAUDE_CODE_OAUTH_TOKEN
+                  optional: true
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: planner-llm-agent
+                  key: OPENAI_API_KEY
+                  optional: true
+            - name: GEMINI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: planner-llm-agent
+                  key: GEMINI_API_KEY
+                  optional: true
             - name: GITHUB_TOKEN
               valueFrom:
                 secretKeyRef:

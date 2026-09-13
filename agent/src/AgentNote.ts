@@ -5,7 +5,7 @@ import { getAgentConfigContentPath } from "./AgentConfigRepository";
 import { Config, githubTokenEnvName } from "./Config";
 import { OTelLogger, OTelTracer } from "./OTelContext";
 import { PlannerClient, PlannerNote, PlannerProject } from "./PlannerClient";
-import { QoderClient, readCredits } from "./QoderClient";
+import type { CliAgentClient } from "./clients/CliAgent";
 
 const logger = OTelLogger().createModuleLogger("agent-note");
 
@@ -17,19 +17,19 @@ const NOTE_TITLE_PREFIX = "Planner LLM Agent: ";
 export class AgentNote {
   private config: Config;
   private planner: PlannerClient;
-  private qoder: QoderClient;
+  private cliAgent: CliAgentClient;
   private agentActions: AgentActionsConfig | null;
   private updating = false;
 
   constructor(
     config: Config,
     planner: PlannerClient,
-    qoder: QoderClient,
+    cliAgent: CliAgentClient,
     agentActions: AgentActionsConfig | null,
   ) {
     this.config = config;
     this.planner = planner;
-    this.qoder = qoder;
+    this.cliAgent = cliAgent;
     this.agentActions = agentActions;
   }
 
@@ -119,7 +119,7 @@ export class AgentNote {
       "",
       "Write the updated content of the agent note. Structure it with short markdown sections (About, Skills, Recent activity, Status). Only use the facts above; do not invent information. Keep it concise (maximum 40 lines). Reply with the note content only.",
     ].join("\n");
-    const content = (await this.qoder.runPrompt(prompt)).trim();
+    const content = (await this.cliAgent.runPrompt(prompt)).trim();
     if (content.length === 0) {
       throw new Error("Agent note content generation returned an empty reply");
     }
@@ -130,7 +130,7 @@ export class AgentNote {
     const config = this.config;
     const skills = await this.listSkills();
     const tasks = await this.listRecentTasks();
-    const credits = await readCredits(config);
+    const usageSummary = await this.cliAgent.usageSummary();
     // The actions default.model is the only configurable default model; the
     // CLI default applies when it is not set.
     const actionsModel = this.agentActions?.defaultModel.trim() ?? "";
@@ -180,7 +180,7 @@ export class AgentNote {
       `- Skills available: ${skills.length > 0 ? skills.join(", ") : "none"}`,
       `- Tasks executed so far: ${tasks.count}`,
       `- Recent tasks: ${tasks.recent.length > 0 ? tasks.recent.join(" | ") : "none"}`,
-      `- Qoder account credits remaining: ${credits !== null ? credits.toFixed(2) : "unknown"}`,
+      `- ${usageSummary}`,
     ];
   }
 

@@ -7,7 +7,8 @@ import { Config } from "./Config";
 import { GitEnvironment } from "./GitEnvironment";
 import { OTelInit, OTelLogger, OTelTracer } from "./OTelContext";
 import { PlannerClient } from "./PlannerClient";
-import { QoderClient } from "./QoderClient";
+import { createCliAgent } from "./clients/CliAgentRegistry";
+import type { CliAgentClient } from "./clients/CliAgent";
 
 const logger = OTelLogger().createModuleLogger("app");
 
@@ -116,23 +117,32 @@ Promise.resolve().then(async () => {
     logger.info("Agent config repository not configured");
   }
 
-  // Qoder client shared by the authentication check and the agent note
-  const qoderClient = new QoderClient(config, agentActions);
+  // CLI agent client shared by the authentication check and the agent note
+  let cliAgent: CliAgentClient;
+  try {
+    cliAgent = createCliAgent(config, agentActions);
+  } catch (error) {
+    logger.error((error as Error).message, error as Error);
+    process.exit(1);
+  }
 
-  // Check Qoder authentication
-  if (config.QODER_AUTH_CHECK === "true" || config.QODER_AUTH_CHECK === "1") {
+  // Check the CLI agent authentication
+  if (config.AGENT_AUTH_CHECK === "true" || config.AGENT_AUTH_CHECK === "1") {
     try {
-      await qoderClient.checkAuthentication();
-      logger.info("Qoder authentication verified");
-    } catch (error) {
-      logger.error("Qoder authentication check failed", error as Error);
-      logger.error(
-        "Ensure QODER_PERSONAL_ACCESS_TOKEN is set to a valid Personal Access Token (https://qoder.com/account/integrations)",
+      await cliAgent.checkAuthentication();
+      logger.info(
+        `${cliAgent.displayName} authentication verified (CLI: ${cliAgent.name})`,
       );
+    } catch (error) {
+      logger.error(
+        `${cliAgent.displayName} authentication check failed`,
+        error as Error,
+      );
+      logger.error(cliAgent.authHint);
       process.exit(1);
     }
   } else {
-    logger.info("Qoder authentication check disabled");
+    logger.info(`${cliAgent.displayName} authentication check disabled`);
   }
 
   // Agent
@@ -146,7 +156,7 @@ Promise.resolve().then(async () => {
   const agentNote = new AgentNote(
     config,
     new PlannerClient(config),
-    qoderClient,
+    cliAgent,
     agentActions,
   );
   if (agentNote.isEnabled()) {
