@@ -815,14 +815,14 @@ describe("QoderClient", () => {
     );
 
     expect(summary).toBe(
-      "Done\n\n---\nModel: claude-opus-4-1 · Qoder credits: 16.41 -> 16.35",
+      "Done\n\n---\nModel: claude-opus-4-1 · Qoder credits used: 16.35",
     );
     expect(
       await fse.readJson(path.join(dataDir, "qoder-credits.json")),
     ).toEqual({ credits: 16.35 });
   });
 
-  it("should display the auto model and unknown previous credits on the first task", async () => {
+  it("should display the auto model and a single credits value on the first task", async () => {
     mockExecFile.mockImplementation(
       (
         _command: string,
@@ -852,7 +852,7 @@ describe("QoderClient", () => {
     );
 
     expect(summary).toBe(
-      "Done\n\n---\nModel: auto · Qoder credits: unknown -> 16.35",
+      "Done\n\n---\nModel: auto · Qoder credits used: 16.35",
     );
     // Without any configured model the CLI runs with its own default,
     // so no --model argument is passed at all.
@@ -1140,6 +1140,24 @@ describe("QoderClient", () => {
       "qoder-credits.json",
     );
     expect(await fse.readJson(creditsFile)).toEqual({ credits: 14.25 });
+  });
+
+  it("should report the credits used by the last run in the usage summary", async () => {
+    await fse.outputJson(path.join(os.tmpdir(), "qoder-spec", "data", "qoder-credits.json"), {
+      credits: 16.41,
+    });
+
+    const client = new QoderClient(config);
+    await expect(client.usageSummary()).resolves.toBe(
+      "Qoder credits used by the last run: 16.41",
+    );
+  });
+
+  it("should report unknown credits in the usage summary when nothing was persisted", async () => {
+    const client = new QoderClient(config);
+    await expect(client.usageSummary()).resolves.toBe(
+      "Qoder credits not reported by the CLI",
+    );
   });
 
   it("should fall back to the raw stdout for standalone prompts without a JSON envelope", async () => {
