@@ -6,12 +6,17 @@ data:
   llm-agent.yaml: |
     default:
       model: auto
+      # Global task timeout in seconds, applied to the actions without their
+      # own timeout (defaults to 3600 = 1 hour when unset).
+      # timeout: 3600
     actions:
       - project: Web
         status_start: To Do
         status_end: In Review
         model: DeepSeek-Flash
         instruction: Follow the repository coding guidelines and open a PR when the task is done.
+        # Per-action task timeout in seconds (optional).
+        # timeout: 1800
       - project: Backend
         status_start: To Do
         status_end: Done

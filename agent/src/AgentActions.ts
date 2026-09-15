@@ -7,6 +7,8 @@ import { parse } from "yaml";
  * to the end status. An empty project matches any project (used by the
  * legacy status-based fallback when no actions file is configured); an
  * empty model or instruction means the corresponding feature is not set.
+ * The timeout is the task timeout in seconds for the tasks of this action;
+ * null falls back to the actions default timeout.
  */
 export interface AgentAction {
   project: string;
@@ -14,14 +16,18 @@ export interface AgentAction {
   statusEnd: string;
   model: string;
   instruction: string;
+  timeout: number | null;
 }
 
 /**
  * The agent actions configuration: the default model applied to the
- * actions without their own model, and the actions themselves.
+ * actions without their own model, the default task timeout (seconds)
+ * applied to the actions without their own timeout, and the actions
+ * themselves.
  */
 export interface AgentActionsConfig {
   defaultModel: string;
+  defaultTimeout: number | null;
   actions: AgentAction[];
 }
 
@@ -31,16 +37,18 @@ export interface AgentActionsConfig {
  *
  * default:
  *   model: <model name>
+ *   timeout: <seconds>
  * actions:
  *   - project: <project name>
  *     status_start: <status name>
  *     status_end: <status name>
  *     model: <model name>
  *     instruction: <instruction>
+ *     timeout: <seconds>
  *
- * 'default' and per-action 'model'/'instruction' are optional; everything
- * else is required and unknown fields are rejected. Throws an Error
- * listing every problem found when the configuration is invalid.
+ * 'default' and per-action 'model'/'instruction'/'timeout' are optional;
+ * everything else is required and unknown fields are rejected. Throws an
+ * Error listing every problem found when the configuration is invalid.
  */
 export function parseAgentActions(content: string): AgentActionsConfig {
   let parsed: unknown;
@@ -62,7 +70,11 @@ export function parseAgentActions(content: string): AgentActionsConfig {
   const root = parsed as Record<string, unknown>;
 
   const errors: string[] = [];
-  const config: AgentActionsConfig = { defaultModel: "", actions: [] };
+  const config: AgentActionsConfig = {
+    defaultModel: "",
+    defaultTimeout: null,
+    actions: [],
+  };
 
   if (root.default !== undefined) {
     if (
@@ -74,7 +86,7 @@ export function parseAgentActions(content: string): AgentActionsConfig {
     } else {
       const defaults = root.default as Record<string, unknown>;
       for (const key of Object.keys(defaults)) {
-        if (key !== "model") {
+        if (key !== "model" && key !== "timeout") {
           errors.push(`Unknown 'default' field '${key}'`);
         }
       }
@@ -85,6 +97,15 @@ export function parseAgentActions(content: string): AgentActionsConfig {
         } else {
           config.defaultModel = model.trim();
         }
+      }
+      const timeout = readPositiveInteger(
+        defaults,
+        "timeout",
+        "default.timeout",
+        errors,
+      );
+      if (timeout !== null) {
+        config.defaultTimeout = timeout;
       }
     }
   }
@@ -109,6 +130,7 @@ export function parseAgentActions(content: string): AgentActionsConfig {
             "status_end",
             "model",
             "instruction",
+            "timeout",
           ].includes(key)
         ) {
           errors.push(`actions[${index}] has unknown field '${key}'`);
@@ -146,6 +168,12 @@ export function parseAgentActions(content: string): AgentActionsConfig {
         errors,
         true,
       );
+      const timeout = readPositiveInteger(
+        action,
+        "timeout",
+        `actions[${index}].timeout`,
+        errors,
+      );
       if (project !== null && statusStart !== null) {
         const key = `${project}\n${statusStart}`;
         if (seen.has(key)) {
@@ -163,6 +191,7 @@ export function parseAgentActions(content: string): AgentActionsConfig {
           statusEnd: statusEnd,
           model: model ?? "",
           instruction: instruction ?? "",
+          timeout: timeout,
         });
       }
     });
@@ -217,4 +246,24 @@ function readString(
     return null;
   }
   return value.trim();
+}
+
+// Reads an optional positive integer field (a timeout in seconds); missing
+// fields report 'not set' (null). Non-integer, zero, negative or float
+// values always produce a validation error so typos fail fast at startup.
+function readPositiveInteger(
+  source: Record<string, unknown>,
+  field: string,
+  label: string,
+  errors: string[],
+): number | null {
+  const value = source[field];
+  if (value === undefined) {
+    return null;
+  }
+  if (typeof value !== "number" || !Number.isInteger(value) || value <= 0) {
+    errors.push(`'${label}' must be a positive integer (seconds)`);
+    return null;
+  }
+  return value;
 }

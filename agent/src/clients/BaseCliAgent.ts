@@ -1,10 +1,9 @@
 import * as fse from "fs-extra";
 import * as path from "path";
-import type { ExecFileOptionsWithStringEncoding } from "child_process";
 import type { AgentActionsConfig } from "../AgentActions";
 import { getAgentConfigContentPath } from "../AgentConfigRepository";
 import { Config, githubTokenEnvName } from "../Config";
-import { ExecFileError, extractErrorDetail, runCli } from "../CliUtils";
+import { ExecFileError, extractErrorDetail, runCli, RunCliOptions } from "../CliUtils";
 import { OTelLogger, OTelTracer } from "../OTelContext";
 import type { PlannerTask } from "../PlannerClient";
 import { CliAgentClient, TaskOptions } from "./CliAgent";
@@ -127,6 +126,7 @@ export abstract class BaseCliAgent implements CliAgentClient {
       const result = await this.runAgentCli(args, {
         timeout: AUTH_CHECK_TIMEOUT_MS,
         windowsHide: true,
+        killProcessGroup: true,
       }, "authentication check");
       // A zero exit code is not enough: verify that the probe actually
       // produced a reply so an empty-output CLI fails visibly at startup.
@@ -180,15 +180,18 @@ export abstract class BaseCliAgent implements CliAgentClient {
       logger.info(
         `${this.usageLabel()} before task: ${formatUsageValue(usageBefore)}`,
       );
-      // The task timeout is configurable (TASK_TIMEOUT, in seconds) so
-      // long-running tasks are not cut off by a hardcoded limit.
+      // The task timeout is configurable (per-action timeout, then the
+      // actions default.timeout, then the global TASK_TIMEOUT, in seconds)
+      // so long-running tasks are not cut off by a hardcoded limit.
       const result = await this.runAgentCli(
         args,
         {
-          timeout: this.config.TASK_TIMEOUT * 1000,
+          timeout:
+            (options?.timeoutSeconds ?? this.config.TASK_TIMEOUT) * 1000,
           windowsHide: true,
           cwd: path.dirname(notesFile),
           maxBuffer: MAX_BUFFER_BYTES,
+          killProcessGroup: true,
         },
         "task execution",
       );
@@ -269,6 +272,7 @@ export abstract class BaseCliAgent implements CliAgentClient {
         timeout: PROMPT_TIMEOUT_MS,
         windowsHide: true,
         maxBuffer: MAX_BUFFER_BYTES,
+        killProcessGroup: true,
       }, "prompt");
       const usageAfter = this.extractUsage(result.stdout);
       if (usageAfter !== null) {
@@ -303,6 +307,7 @@ export abstract class BaseCliAgent implements CliAgentClient {
       const result = await runCli(this.cliCommand(), args, {
         timeout: AUTH_CHECK_TIMEOUT_MS,
         windowsHide: true,
+        killProcessGroup: true,
       });
       const models = this.parseModelList(result.stdout);
       if (models.length === 0) {
@@ -337,7 +342,7 @@ export abstract class BaseCliAgent implements CliAgentClient {
 
   private async runAgentCli(
     args: string[],
-    options: ExecFileOptionsWithStringEncoding,
+    options: RunCliOptions,
     action: string,
   ): Promise<{ stdout: string; stderr: string }> {
     try {

@@ -37,6 +37,7 @@ const AGENT_NOTES_MARKER =
 // moving it to 'Done': the default used by the task processing tests.
 const WILDCARD_ACTIONS: AgentActionsConfig = {
   defaultModel: "",
+  defaultTimeout: null,
   actions: [
     {
       project: "",
@@ -44,6 +45,7 @@ const WILDCARD_ACTIONS: AgentActionsConfig = {
       statusEnd: "Done",
       model: "",
       instruction: "",
+      timeout: null,
     },
   ],
 };
@@ -395,10 +397,12 @@ describe("Agent", () => {
     agent.start();
     await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
 
-    const comment = mockPlanner.addTaskComment.mock.calls[0][1] as string;
-    expect(comment).toContain("Task processing failed:");
-    expect(comment).toContain(`${"x".repeat(1000)}...`);
-    expect(comment).not.toContain("x".repeat(1001));
+    const failureComment = mockPlanner.addTaskComment.mock.calls
+      .map((call) => call[1] as string)
+      .find((text) => text.includes("Task processing failed:"));
+    expect(failureComment).toContain("Task processing failed:");
+    expect(failureComment).toContain(`${"x".repeat(1000)}...`);
+    expect(failureComment).not.toContain("x".repeat(1001));
     agent.stop();
   });
 
@@ -744,6 +748,7 @@ describe("Agent", () => {
     mockQoder.performTask.mockResolvedValue("Done");
 
     const agent = createAgent({
+      defaultTimeout: null,
       defaultModel: "",
       actions: [
         {
@@ -752,6 +757,7 @@ describe("Agent", () => {
           statusEnd: "In Review",
           model: "",
           instruction: "",
+          timeout: null,
         },
       ],
     });
@@ -794,6 +800,7 @@ describe("Agent", () => {
     ]);
 
     const agent = createAgent({
+      defaultTimeout: null,
       defaultModel: "",
       actions: [
         {
@@ -802,6 +809,7 @@ describe("Agent", () => {
           statusEnd: "Done",
           model: "",
           instruction: "",
+          timeout: null,
         },
       ],
     });
@@ -829,6 +837,7 @@ describe("Agent", () => {
     mockQoder.performTask.mockResolvedValue("Done");
 
     const agent = createAgent({
+      defaultTimeout: null,
       defaultModel: "default-model",
       actions: [
         {
@@ -837,6 +846,7 @@ describe("Agent", () => {
           statusEnd: "Done",
           model: "action-model",
           instruction: "Follow the coding guidelines",
+          timeout: null,
         },
       ],
     });
@@ -870,6 +880,7 @@ describe("Agent", () => {
     mockQoder.performTask.mockResolvedValue("Done");
 
     const agent = createAgent({
+      defaultTimeout: null,
       defaultModel: "default-model",
       actions: [
         {
@@ -878,6 +889,7 @@ describe("Agent", () => {
           statusEnd: "Done",
           model: "",
           instruction: "",
+          timeout: null,
         },
       ],
     });
@@ -908,6 +920,7 @@ describe("Agent", () => {
     mockQoder.performTask.mockResolvedValue("Done");
 
     const agent = createAgent({
+      defaultTimeout: null,
       defaultModel: "",
       actions: [
         {
@@ -916,6 +929,7 @@ describe("Agent", () => {
           statusEnd: "Done",
           model: "",
           instruction: "",
+          timeout: null,
         },
       ],
     });
@@ -926,6 +940,200 @@ describe("Agent", () => {
       expect.anything(),
       expect.any(String),
       expect.objectContaining({ model: "" }),
+    );
+    agent.stop();
+  });
+
+  it("should post a start notification comment before executing the task", async () => {
+    config.AGENT_NAME = "test-agent";
+    mockPlanner.listAssignedTasks.mockResolvedValue([
+      {
+        id: "task-1",
+        title: "Implement feature",
+        status: "To Do",
+        description: "Add a feature",
+        comments: [],
+        attachments: [],
+      },
+    ]);
+    let resolveTask: (value: string) => void = () => undefined;
+    mockQoder.performTask.mockImplementation(
+      () =>
+        new Promise<string>((resolve) => {
+          resolveTask = resolve;
+        }),
+    );
+
+    const agent = createAgent();
+    agent.start();
+    // The start comment is posted while the task is still executing.
+    await waitFor(() => mockQoder.performTask.mock.calls.length === 1);
+    expect(mockPlanner.addTaskComment).toHaveBeenCalledTimes(1);
+    expect(mockPlanner.addTaskComment).toHaveBeenCalledWith(
+      "task-1",
+      "Agent 'test-agent' started working on this task.",
+    );
+
+    resolveTask("Feature implemented");
+    await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
+    expect(mockPlanner.addTaskComment).toHaveBeenCalledWith(
+      "task-1",
+      "Feature implemented",
+    );
+    agent.stop();
+  });
+
+  it("should not fail the task when the start notification fails", async () => {
+    mockPlanner.listAssignedTasks.mockResolvedValue([
+      {
+        id: "task-1",
+        title: "Implement feature",
+        status: "To Do",
+        description: "Add a feature",
+        comments: [],
+        attachments: [],
+      },
+    ]);
+    mockPlanner.addTaskComment
+      .mockRejectedValueOnce(new Error("Planner is down"))
+      .mockResolvedValueOnce(undefined);
+    mockQoder.performTask.mockResolvedValue("Feature implemented");
+
+    const agent = createAgent();
+    agent.start();
+    await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
+
+    expect(mockQoder.performTask).toHaveBeenCalledTimes(1);
+    expect(mockPlanner.addTaskComment).toHaveBeenCalledWith(
+      "task-1",
+      "Feature implemented",
+    );
+    expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith("task-1", "Done");
+    expect(console.log).toHaveBeenCalledWith(
+      expect.stringContaining(
+        "Failed to post the start notification for task 'Implement feature' (task-1)",
+      ),
+    );
+    agent.stop();
+  });
+
+  it("should pass the action timeout to the task execution", async () => {
+    mockPlanner.listProjects.mockResolvedValue([{ id: "p1", name: "Web" }]);
+    mockPlanner.listAssignedTasks.mockResolvedValue([
+      {
+        id: "task-1",
+        projectId: "p1",
+        title: "Implement feature",
+        status: "To Do",
+        description: "",
+        comments: [],
+        attachments: [],
+      },
+    ]);
+    mockQoder.performTask.mockResolvedValue("Done");
+
+    const agent = createAgent({
+      defaultModel: "",
+      defaultTimeout: 7200,
+      actions: [
+        {
+          project: "Web",
+          statusStart: "To Do",
+          statusEnd: "Done",
+          model: "",
+          instruction: "",
+          timeout: 1800,
+        },
+      ],
+    });
+    agent.start();
+    await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
+
+    expect(mockQoder.performTask).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.any(String),
+      expect.objectContaining({ timeoutSeconds: 1800 }),
+    );
+    agent.stop();
+  });
+
+  it("should pass the actions default timeout when the action has none", async () => {
+    mockPlanner.listProjects.mockResolvedValue([{ id: "p1", name: "Web" }]);
+    mockPlanner.listAssignedTasks.mockResolvedValue([
+      {
+        id: "task-1",
+        projectId: "p1",
+        title: "Implement feature",
+        status: "To Do",
+        description: "",
+        comments: [],
+        attachments: [],
+      },
+    ]);
+    mockQoder.performTask.mockResolvedValue("Done");
+
+    const agent = createAgent({
+      defaultModel: "",
+      defaultTimeout: 7200,
+      actions: [
+        {
+          project: "Web",
+          statusStart: "To Do",
+          statusEnd: "Done",
+          model: "",
+          instruction: "",
+          timeout: null,
+        },
+      ],
+    });
+    agent.start();
+    await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
+
+    expect(mockQoder.performTask).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.any(String),
+      expect.objectContaining({ timeoutSeconds: 7200 }),
+    );
+    agent.stop();
+  });
+
+  it("should fall back to the global task timeout when the actions define none", async () => {
+    config.TASK_TIMEOUT = 5400;
+    mockPlanner.listProjects.mockResolvedValue([{ id: "p1", name: "Web" }]);
+    mockPlanner.listAssignedTasks.mockResolvedValue([
+      {
+        id: "task-1",
+        projectId: "p1",
+        title: "Implement feature",
+        status: "To Do",
+        description: "",
+        comments: [],
+        attachments: [],
+      },
+    ]);
+    mockQoder.performTask.mockResolvedValue("Done");
+
+    const agent = createAgent({
+      defaultModel: "",
+      defaultTimeout: null,
+      actions: [
+        {
+          project: "Web",
+          statusStart: "To Do",
+          statusEnd: "Done",
+          model: "",
+          instruction: "",
+          timeout: null,
+        },
+      ],
+    });
+    agent.start();
+    await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
+
+    expect(mockQoder.performTask).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.any(String),
+      expect.objectContaining({ timeoutSeconds: 5400 }),
     );
     agent.stop();
   });

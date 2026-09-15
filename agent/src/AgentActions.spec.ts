@@ -14,12 +14,14 @@ describe("AgentActions", () => {
         [
           "default:",
           "  model: default-model",
+          "  timeout: 3600",
           "actions:",
           "  - project: Web",
           "    status_start: To Do",
           "    status_end: In Review",
           "    model: action-model",
           "    instruction: Follow the guidelines",
+          "    timeout: 1800",
           "  - project: Backend",
           "    status_start: To Do",
           "    status_end: Done",
@@ -28,6 +30,7 @@ describe("AgentActions", () => {
 
       expect(config).toEqual({
         defaultModel: "default-model",
+        defaultTimeout: 3600,
         actions: [
           {
             project: "Web",
@@ -35,6 +38,7 @@ describe("AgentActions", () => {
             statusEnd: "In Review",
             model: "action-model",
             instruction: "Follow the guidelines",
+            timeout: 1800,
           },
           {
             project: "Backend",
@@ -42,6 +46,7 @@ describe("AgentActions", () => {
             statusEnd: "Done",
             model: "",
             instruction: "",
+            timeout: null,
           },
         ],
       });
@@ -59,6 +64,7 @@ describe("AgentActions", () => {
 
       expect(config).toEqual({
         defaultModel: "",
+        defaultTimeout: null,
         actions: [
           {
             project: "Web",
@@ -66,6 +72,7 @@ describe("AgentActions", () => {
             statusEnd: "Done",
             model: "",
             instruction: "",
+            timeout: null,
           },
         ],
       });
@@ -73,7 +80,11 @@ describe("AgentActions", () => {
 
     it("should accept an empty actions list", () => {
       const config = parseAgentActions("actions: []");
-      expect(config).toEqual({ defaultModel: "", actions: [] });
+      expect(config).toEqual({
+        defaultModel: "",
+        defaultTimeout: null,
+        actions: [],
+      });
     });
 
     it("should trim the configured values", () => {
@@ -167,6 +178,50 @@ describe("AgentActions", () => {
       ).toThrow(/Unknown 'default' field 'instruction'/);
     });
 
+    it("should throw on invalid default timeout values", () => {
+      const failure = (value: string): (() => unknown) => () =>
+        parseAgentActions(
+          ["default:", `  timeout: ${value}`, "actions: []"].join("\n"),
+        );
+      expect(failure('"3600"')).toThrow(
+        /'default\.timeout' must be a positive integer \(seconds\)/,
+      );
+      expect(failure("0")).toThrow(
+        /'default\.timeout' must be a positive integer \(seconds\)/,
+      );
+      expect(failure("-1")).toThrow(
+        /'default\.timeout' must be a positive integer \(seconds\)/,
+      );
+      expect(failure("1.5")).toThrow(
+        /'default\.timeout' must be a positive integer \(seconds\)/,
+      );
+    });
+
+    it("should throw on invalid action timeout values", () => {
+      const failure = (value: string): (() => unknown) => () =>
+        parseAgentActions(
+          [
+            "actions:",
+            "  - project: Web",
+            "    status_start: To Do",
+            "    status_end: Done",
+            `    timeout: ${value}`,
+          ].join("\n"),
+        );
+      expect(failure('"600"')).toThrow(
+        /'actions\[0\]\.timeout' must be a positive integer \(seconds\)/,
+      );
+      expect(failure("0")).toThrow(
+        /'actions\[0\]\.timeout' must be a positive integer \(seconds\)/,
+      );
+      expect(failure("-5")).toThrow(
+        /'actions\[0\]\.timeout' must be a positive integer \(seconds\)/,
+      );
+      expect(failure("0.5")).toThrow(
+        /'actions\[0\]\.timeout' must be a positive integer \(seconds\)/,
+      );
+    });
+
     it("should throw on empty or non-string values", () => {
       const failure = (): unknown =>
         parseAgentActions(
@@ -257,6 +312,7 @@ describe("AgentActions", () => {
         await loadAgentActions(filePath);
       expect(config).toEqual({
         defaultModel: "default-model",
+        defaultTimeout: null,
         actions: [
           {
             project: "Web",
@@ -264,6 +320,7 @@ describe("AgentActions", () => {
             statusEnd: "Done",
             model: "",
             instruction: "Do it well",
+            timeout: null,
           },
         ],
       });
