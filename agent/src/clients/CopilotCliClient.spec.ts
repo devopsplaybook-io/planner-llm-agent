@@ -71,7 +71,9 @@ describe("CopilotCliClient", () => {
     projectId: "project-1",
     title: "Implement feature",
     status: "To Do",
+    priority: "medium",
     description,
+    dateUpdated: "",
     comments: [],
     attachments: [],
   });

@@ -94,6 +94,8 @@ describe("Agent", () => {
       description: string;
       comments: unknown[];
       attachments: unknown[];
+      priority?: string;
+      dateUpdated?: string;
     }[],
   ) => {
     mockPlanner.listAssignedTasks.mockImplementation(async () =>
@@ -137,6 +139,7 @@ describe("Agent", () => {
       name: "Test User",
     });
     mockPlanner.listAssignedTasks.mockResolvedValue([]);
+    mockPlanner.listProjects.mockResolvedValue([]);
   });
 
   afterEach(() => {
@@ -205,6 +208,8 @@ describe("Agent", () => {
       expect.stringContaining("Tasks assigned"),
     );
     expect(mockQoder.performTask).not.toHaveBeenCalled();
+    // The projects are only loaded when a task is ready to be processed.
+    expect(mockPlanner.listProjects).not.toHaveBeenCalled();
     agent.stop();
   });
 
@@ -220,6 +225,7 @@ describe("Agent", () => {
     expect(console.log).not.toHaveBeenCalledWith(
       expect.stringContaining("Tasks assigned"),
     );
+    expect(mockPlanner.listProjects).not.toHaveBeenCalled();
     agent.stop();
   });
 
@@ -713,8 +719,8 @@ describe("Agent", () => {
 
   it("should process only the tasks matching the action project and start status", async () => {
     mockPlanner.listProjects.mockResolvedValue([
-      { id: "p1", name: "Web" },
-      { id: "p2", name: "Backend" },
+      { id: "p1", name: "Web", description: "" },
+      { id: "p2", name: "Backend", description: "" },
     ]);
     mockPlanner.listAssignedTasks.mockResolvedValue([
       {
@@ -786,7 +792,9 @@ describe("Agent", () => {
   });
 
   it("should not process a task whose project cannot be resolved", async () => {
-    mockPlanner.listProjects.mockResolvedValue([{ id: "p1", name: "Web" }]);
+    mockPlanner.listProjects.mockResolvedValue([
+      { id: "p1", name: "Web", description: "" },
+    ]);
     mockPlanner.listAssignedTasks.mockResolvedValue([
       {
         id: "task-1",
@@ -822,7 +830,9 @@ describe("Agent", () => {
   });
 
   it("should apply the action model and instruction to the task", async () => {
-    mockPlanner.listProjects.mockResolvedValue([{ id: "p1", name: "Web" }]);
+    mockPlanner.listProjects.mockResolvedValue([
+      { id: "p1", name: "Web", description: "" },
+    ]);
     mockPlanner.listAssignedTasks.mockResolvedValue([
       {
         id: "task-1",
@@ -865,7 +875,9 @@ describe("Agent", () => {
   });
 
   it("should use the default model when the action has no model", async () => {
-    mockPlanner.listProjects.mockResolvedValue([{ id: "p1", name: "Web" }]);
+    mockPlanner.listProjects.mockResolvedValue([
+      { id: "p1", name: "Web", description: "" },
+    ]);
     mockPlanner.listAssignedTasks.mockResolvedValue([
       {
         id: "task-1",
@@ -905,7 +917,9 @@ describe("Agent", () => {
   });
 
   it("should run with no model when no action or default model is set", async () => {
-    mockPlanner.listProjects.mockResolvedValue([{ id: "p1", name: "Web" }]);
+    mockPlanner.listProjects.mockResolvedValue([
+      { id: "p1", name: "Web", description: "" },
+    ]);
     mockPlanner.listAssignedTasks.mockResolvedValue([
       {
         id: "task-1",
@@ -1018,7 +1032,9 @@ describe("Agent", () => {
   });
 
   it("should pass the action timeout to the task execution", async () => {
-    mockPlanner.listProjects.mockResolvedValue([{ id: "p1", name: "Web" }]);
+    mockPlanner.listProjects.mockResolvedValue([
+      { id: "p1", name: "Web", description: "" },
+    ]);
     mockPlanner.listAssignedTasks.mockResolvedValue([
       {
         id: "task-1",
@@ -1058,7 +1074,9 @@ describe("Agent", () => {
   });
 
   it("should pass the actions default timeout when the action has none", async () => {
-    mockPlanner.listProjects.mockResolvedValue([{ id: "p1", name: "Web" }]);
+    mockPlanner.listProjects.mockResolvedValue([
+      { id: "p1", name: "Web", description: "" },
+    ]);
     mockPlanner.listAssignedTasks.mockResolvedValue([
       {
         id: "task-1",
@@ -1099,7 +1117,9 @@ describe("Agent", () => {
 
   it("should fall back to the global task timeout when the actions define none", async () => {
     config.TASK_TIMEOUT = 5400;
-    mockPlanner.listProjects.mockResolvedValue([{ id: "p1", name: "Web" }]);
+    mockPlanner.listProjects.mockResolvedValue([
+      { id: "p1", name: "Web", description: "" },
+    ]);
     mockPlanner.listAssignedTasks.mockResolvedValue([
       {
         id: "task-1",
@@ -1138,7 +1158,7 @@ describe("Agent", () => {
     agent.stop();
   });
 
-  it("should not fetch the projects when no action is project-bound", async () => {
+  it("should fetch the projects when a task is processed so the notes carry the project info", async () => {
     mockPlanner.listAssignedTasks.mockResolvedValue([
       {
         id: "task-1",
@@ -1152,14 +1172,271 @@ describe("Agent", () => {
     ]);
     mockQoder.performTask.mockResolvedValue("Done");
 
-    // A wildcard action (empty project) applies to every task, whatever
-    // its project: the project names are not needed.
+    // A wildcard action (empty project) applies to every task, whatever its
+    // project: the projects are still fetched to document the task notes.
     const agent = createAgent();
     agent.start();
     await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
 
-    expect(mockPlanner.listProjects).not.toHaveBeenCalled();
+    expect(mockPlanner.listProjects).toHaveBeenCalledTimes(1);
     expect(mockQoder.performTask).toHaveBeenCalledTimes(1);
+    agent.stop();
+  });
+
+  it("should process higher priority tasks first", async () => {
+    config.TASK_POLLING_INTERVAL = 1;
+    const resolvers: ((value: string) => void)[] = [];
+    mockPlannerTasks([
+      {
+        id: "task-low",
+        title: "Low priority task",
+        status: "To Do",
+        description: "",
+        comments: [],
+        attachments: [],
+        priority: "low",
+      },
+      {
+        id: "task-high",
+        title: "High priority task",
+        status: "To Do",
+        description: "",
+        comments: [],
+        attachments: [],
+        priority: "high",
+      },
+      {
+        id: "task-medium",
+        title: "Medium priority task",
+        status: "To Do",
+        description: "",
+        comments: [],
+        attachments: [],
+        priority: "medium",
+      },
+    ]);
+    mockQoder.performTask.mockImplementation(
+      () =>
+        new Promise<string>((resolve) => {
+          resolvers.push(resolve);
+        }),
+    );
+
+    const agent = createAgent();
+    agent.start();
+    await waitFor(() => mockQoder.performTask.mock.calls.length === 1);
+    expect(mockQoder.performTask).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "task-high" }),
+      expect.any(String),
+      expect.anything(),
+    );
+
+    resolvers[0]("High done");
+    await waitFor(() => mockQoder.performTask.mock.calls.length === 2);
+    expect(mockQoder.performTask).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "task-medium" }),
+      expect.any(String),
+      expect.anything(),
+    );
+
+    resolvers[1]("Medium done");
+    await waitFor(() => mockQoder.performTask.mock.calls.length === 3);
+    expect(mockQoder.performTask).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "task-low" }),
+      expect.any(String),
+      expect.anything(),
+    );
+    resolvers[2]("Low done");
+    await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length === 3);
+    agent.stop();
+  });
+
+  it("should process the task with the oldest update first within the same priority", async () => {
+    config.TASK_POLLING_INTERVAL = 1;
+    const resolvers: ((value: string) => void)[] = [];
+    mockPlannerTasks([
+      {
+        id: "task-newest",
+        title: "Newest task",
+        status: "To Do",
+        description: "",
+        comments: [],
+        attachments: [],
+        priority: "high",
+        dateUpdated: "2026-09-10T00:00:00.000Z",
+      },
+      {
+        id: "task-oldest",
+        title: "Oldest task",
+        status: "To Do",
+        description: "",
+        comments: [],
+        attachments: [],
+        priority: "high",
+        dateUpdated: "2026-09-01T00:00:00.000Z",
+      },
+      {
+        id: "task-middle",
+        title: "Middle task",
+        status: "To Do",
+        description: "",
+        comments: [],
+        attachments: [],
+        priority: "high",
+        dateUpdated: "2026-09-05T00:00:00.000Z",
+      },
+    ]);
+    mockQoder.performTask.mockImplementation(
+      () =>
+        new Promise<string>((resolve) => {
+          resolvers.push(resolve);
+        }),
+    );
+
+    const agent = createAgent();
+    agent.start();
+    await waitFor(() => mockQoder.performTask.mock.calls.length === 1);
+    expect(mockQoder.performTask).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "task-oldest" }),
+      expect.any(String),
+      expect.anything(),
+    );
+
+    resolvers[0]("Oldest done");
+    await waitFor(() => mockQoder.performTask.mock.calls.length === 2);
+    expect(mockQoder.performTask).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "task-middle" }),
+      expect.any(String),
+      expect.anything(),
+    );
+
+    resolvers[1]("Middle done");
+    await waitFor(() => mockQoder.performTask.mock.calls.length === 3);
+    expect(mockQoder.performTask).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "task-newest" }),
+      expect.any(String),
+      expect.anything(),
+    );
+    resolvers[2]("Newest done");
+    await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length === 3);
+    agent.stop();
+  });
+
+  it("should treat an unknown task priority as medium", async () => {
+    config.TASK_POLLING_INTERVAL = 1;
+    const resolvers: ((value: string) => void)[] = [];
+    mockPlannerTasks([
+      {
+        id: "task-low",
+        title: "Low priority task",
+        status: "To Do",
+        description: "",
+        comments: [],
+        attachments: [],
+        priority: "low",
+      },
+      {
+        id: "task-unknown",
+        title: "Unknown priority task",
+        status: "To Do",
+        description: "",
+        comments: [],
+        attachments: [],
+        priority: "urgent",
+      },
+    ]);
+    mockQoder.performTask.mockImplementation(
+      () =>
+        new Promise<string>((resolve) => {
+          resolvers.push(resolve);
+        }),
+    );
+
+    const agent = createAgent();
+    agent.start();
+    await waitFor(() => mockQoder.performTask.mock.calls.length === 1);
+    expect(mockQoder.performTask).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "task-unknown" }),
+      expect.any(String),
+      expect.anything(),
+    );
+
+    resolvers[0]("Unknown done");
+    await waitFor(() => mockQoder.performTask.mock.calls.length === 2);
+    expect(mockQoder.performTask).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "task-low" }),
+      expect.any(String),
+      expect.anything(),
+    );
+    resolvers[1]("Low done");
+    await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length === 2);
+    agent.stop();
+  });
+
+  it("should include the project name and description in the task notes", async () => {
+    config.TASK_STATUS_CLEANUP = "Archived";
+    mockPlanner.listProjects.mockResolvedValue([
+      {
+        id: "p1",
+        name: "Web",
+        description: "The web application of the suite",
+      },
+    ]);
+    mockPlanner.listAssignedTasks.mockResolvedValue([
+      {
+        id: "task-1",
+        projectId: "p1",
+        title: "Fix the build",
+        status: "To Do",
+        description: "The build is broken",
+        comments: [],
+        attachments: [],
+      },
+    ]);
+    mockQoder.performTask.mockResolvedValue("Done");
+
+    const agent = createAgent();
+    agent.start();
+    await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
+
+    const content = await fse.readFile(
+      path.join(dataDir, "tasks", "task-1-Agent.md"),
+      "utf8",
+    );
+    expect(content).toContain("- **Project**: Web");
+    expect(content).toContain("## Project");
+    expect(content).toContain("The web application of the suite");
+    agent.stop();
+  });
+
+  it("should omit the project section when the project has no description", async () => {
+    config.TASK_STATUS_CLEANUP = "Archived";
+    mockPlanner.listProjects.mockResolvedValue([
+      { id: "p1", name: "Web", description: "" },
+    ]);
+    mockPlanner.listAssignedTasks.mockResolvedValue([
+      {
+        id: "task-1",
+        projectId: "p1",
+        title: "Fix the build",
+        status: "To Do",
+        description: "",
+        comments: [],
+        attachments: [],
+      },
+    ]);
+    mockQoder.performTask.mockResolvedValue("Done");
+
+    const agent = createAgent();
+    agent.start();
+    await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
+
+    const content = await fse.readFile(
+      path.join(dataDir, "tasks", "task-1-Agent.md"),
+      "utf8",
+    );
+    expect(content).toContain("- **Project**: Web");
+    expect(content).not.toContain("## Project");
     agent.stop();
   });
 
