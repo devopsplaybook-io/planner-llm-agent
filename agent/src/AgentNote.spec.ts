@@ -63,7 +63,11 @@ describe("AgentNote", () => {
     fse.removeSync(tmpRoot);
   });
 
-  const project: PlannerProject = { id: "p1", name: "Agent Workspace" };
+  const project: PlannerProject = {
+    id: "p1",
+    name: "Agent Workspace",
+    description: "",
+  };
 
   describe("isEnabled", () => {
     it("should be enabled when a project and a positive interval are set", () => {

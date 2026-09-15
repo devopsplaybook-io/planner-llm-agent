@@ -31,7 +31,9 @@ export interface PlannerTask {
   projectId: string;
   title: string;
   status: string;
+  priority: string;
   description: string;
+  dateUpdated: string;
   comments: PlannerTaskComment[];
   attachments: PlannerTaskAttachment[];
 }
@@ -39,6 +41,7 @@ export interface PlannerTask {
 export interface PlannerProject {
   id: string;
   name: string;
+  description: string;
 }
 
 export interface PlannerNote {
@@ -96,10 +99,18 @@ export class PlannerClient {
           projectId: String(task.projectId ?? ""),
           title: String(task.title),
           status: String(task.status),
+          priority:
+            task.priority === undefined || task.priority === null
+              ? "medium"
+              : String(task.priority),
           description:
             task.description === undefined || task.description === null
               ? ""
               : String(task.description),
+          dateUpdated:
+            task.dateUpdated === undefined || task.dateUpdated === null
+              ? ""
+              : String(task.dateUpdated),
           comments: Array.isArray(task.comments)
             ? task.comments.map(
                 (comment: PlannerTaskJson): PlannerTaskComment => ({
@@ -212,6 +223,10 @@ export class PlannerClient {
         .map((project) => ({
           id: String(project.id),
           name: String(project.name),
+          description:
+            project.description === undefined || project.description === null
+              ? ""
+              : String(project.description),
         }));
     } catch (error) {
       span.recordException(error as Error);

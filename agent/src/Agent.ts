@@ -5,7 +5,7 @@ import { Config } from "./Config";
 import { createCliAgent } from "./clients/CliAgentRegistry";
 import type { CliAgentClient } from "./clients/CliAgent";
 import { OTelLogger } from "./OTelContext";
-import { PlannerClient, PlannerTask } from "./PlannerClient";
+import { PlannerClient, PlannerProject, PlannerTask } from "./PlannerClient";
 
 const logger = OTelLogger().createModuleLogger("agent");
 
@@ -56,49 +56,69 @@ export class Agent {
       const tasks = await this.planner.listAssignedTasks(user);
       await this.cleanupCompletedTasks(tasks);
       const actions = this.getActions();
-      // Actions are bound to a project name: the project ids of the tasks
-      // are resolved to names once per poll.
-      let projectNames: Map<string, string> | null = null;
+      if (actions.length === 0 || tasks.length === 0) {
+        return;
+      }
+      // The projects are loaded lazily, once per poll: the project-bound
+      // actions match on the project names, and the task brief includes the
+      // project name and description.
+      let projects: Map<string, PlannerProject> | null = null;
+      const loadProjects =
+        async (): Promise<Map<string, PlannerProject>> => {
+          if (projects === null) {
+            const list = await this.planner.listProjects();
+            projects = new Map(list.map((project) => [project.id, project]));
+          }
+          return projects;
+        };
       if (actions.some((action) => action.project.length > 0)) {
-        const projects = await this.planner.listProjects();
-        projectNames = new Map(
-          projects.map((project) => [project.id, project.name]),
-        );
+        await loadProjects();
       }
       // Only tasks matching an action are ready, and a task already being
-      // processed is never picked again by a subsequent poll. The parallel
-      // limit is shared by every action.
+      // processed is never picked again by a subsequent poll. Every matching
+      // (task, action) pair is a candidate; the free slots are then filled
+      // from the candidates sorted by queue priority. The parallel limit is
+      // shared by every action.
       const freeSlots =
         this.config.TASK_MAX_PARALLEL - this.processingTasks.size;
-      const tasksToProcess: { task: PlannerTask; action: AgentAction }[] = [];
+      const candidates: { task: PlannerTask; action: AgentAction }[] = [];
       for (const action of actions) {
-        if (tasksToProcess.length >= freeSlots) {
-          break;
-        }
         for (const task of tasks) {
-          if (tasksToProcess.length >= freeSlots) {
-            break;
-          }
           if (
-            !this.matchesAction(task, action, projectNames) ||
+            !this.matchesAction(task, action, projects) ||
             this.processingTasks.has(task.id) ||
-            tasksToProcess.some((selected) => selected.task.id === task.id)
+            candidates.some((selected) => selected.task.id === task.id)
           ) {
             continue;
           }
-          tasksToProcess.push({ task, action });
+          candidates.push({ task, action });
         }
       }
+      // Queue order: higher priorities first; within the same priority the
+      // task whose last update is the oldest is picked first. The sort is
+      // stable, so equal candidates keep the actions configuration order.
+      candidates.sort(
+        (a, b) =>
+          priorityRank(b.task.priority) - priorityRank(a.task.priority) ||
+          dateUpdatedValue(a.task.dateUpdated) -
+            dateUpdatedValue(b.task.dateUpdated),
+      );
+      const tasksToProcess = candidates.slice(0, Math.max(freeSlots, 0));
       if (tasksToProcess.length === 0) {
         return;
       }
+      const projectMap = await loadProjects();
       for (const { task } of tasksToProcess) {
         this.processingTasks.add(task.id);
       }
       // Each task manages its own error handling and in-flight cleanup.
       await Promise.all(
         tasksToProcess.map(({ task, action }) =>
-          this.processTask(task, action),
+          this.processTask(
+            task,
+            action,
+            projectMap.get(task.projectId) ?? null,
+          ),
         ),
       );
     } catch (error) {
@@ -122,7 +142,7 @@ export class Agent {
   private matchesAction(
     task: PlannerTask,
     action: AgentAction,
-    projectNames: Map<string, string> | null,
+    projects: Map<string, PlannerProject> | null,
   ): boolean {
     if (task.status !== action.statusStart) {
       return false;
@@ -130,15 +150,16 @@ export class Agent {
     if (action.project.length === 0) {
       return true;
     }
-    if (projectNames === null || task.projectId.length === 0) {
+    if (projects === null || task.projectId.length === 0) {
       return false;
     }
-    return projectNames.get(task.projectId) === action.project;
+    return projects.get(task.projectId)?.name === action.project;
   }
 
   private async processTask(
     task: PlannerTask,
     action: AgentAction,
+    project: PlannerProject | null,
   ): Promise<void> {
     logger.info(
       `Processing task '${task.title}' (${task.id}) in status '${task.status}'`,
@@ -146,7 +167,7 @@ export class Agent {
     await this.postStartComment(task);
     try {
       const notesFile = this.getTaskNotesFile(task.id);
-      await this.writeTaskNotes(task, notesFile);
+      await this.writeTaskNotes(task, notesFile, project);
       // The model resolves to the action model, then the actions default
       // model; the task description still overrides both (see
       // BaseCliAgent.resolveModel).
@@ -231,6 +252,7 @@ export class Agent {
   private async writeTaskNotes(
     task: PlannerTask,
     notesFile: string,
+    project: PlannerProject | null,
   ): Promise<void> {
     // Preserve the agent notes from previous runs; the task brief (description,
     // comments and attachments) is always refreshed with the latest Planner content.
@@ -265,11 +287,17 @@ export class Agent {
       "",
       `- **ID**: ${task.id}`,
       `- **Status**: ${task.status}`,
+      `- **Project**: ${project?.name ?? task.projectId}`,
       "",
       "## Description",
       "",
       task.description.trim().length > 0 ? task.description : "*(empty)*",
       "",
+      // The project section is only rendered when the project has a
+      // description.
+      ...(project !== null && project.description.trim().length > 0
+        ? ["## Project", "", project.description, ""]
+        : []),
       "## Comments",
       "",
       comments.length > 0 ? comments : "*(none)*",
@@ -374,6 +402,25 @@ function extractTaskId(entry: string): string | undefined {
     /^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i,
   );
   return match ? match[1].toLowerCase() : undefined;
+}
+
+// Queue order of the priorities: higher ranks are picked first. Unknown or
+// missing priorities rank as medium, the Planner default.
+const PRIORITY_RANKS: Record<string, number> = {
+  high: 3,
+  medium: 2,
+  low: 1,
+};
+
+function priorityRank(priority: string): number {
+  return PRIORITY_RANKS[priority] ?? PRIORITY_RANKS.medium;
+}
+
+// Sort key of the task last update, ascending: the oldest update comes
+// first. A missing or unparsable date sorts as the oldest task.
+function dateUpdatedValue(dateUpdated: string): number {
+  const time = Date.parse(dateUpdated);
+  return Number.isNaN(time) ? Number.NEGATIVE_INFINITY : time;
 }
 
 // The comment posted on a task that failed to process: the explanation of

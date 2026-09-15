@@ -127,7 +127,9 @@ describe("PlannerClient", () => {
         projectId: "p1",
         title: "Fix the build",
         status: "In Progress",
+        priority: "medium",
         description: "The build is broken",
+        dateUpdated: "",
         comments: [
           {
             id: "comment-1",
@@ -147,6 +149,46 @@ describe("PlannerClient", () => {
         headers: expect.objectContaining({ "x-api-key": "test-api-key" }),
       }),
     );
+  });
+
+  it("should map the task priority and last update date", async () => {
+    fetchMock.mockResolvedValue(
+      new Response(
+        JSON.stringify([
+          {
+            id: "task-1",
+            title: "Fix the build",
+            status: "To Do",
+            priority: "high",
+            description: "The build is broken",
+            dateUpdated: "2026-09-10T12:00:00.000Z",
+            comments: [],
+            assignees: [{ userId: "user-1" }],
+          },
+        ]),
+        { status: 200 },
+      ),
+    );
+
+    const client = new PlannerClient(config);
+    const tasks = await client.listAssignedTasks({
+      id: "user-1",
+      name: "Didier",
+    });
+
+    expect(tasks).toEqual([
+      {
+        id: "task-1",
+        projectId: "",
+        title: "Fix the build",
+        status: "To Do",
+        priority: "high",
+        description: "The build is broken",
+        dateUpdated: "2026-09-10T12:00:00.000Z",
+        comments: [],
+        attachments: [],
+      },
+    ]);
   });
 
   it("should map task attachments", async () => {
@@ -186,7 +228,9 @@ describe("PlannerClient", () => {
         projectId: "",
         title: "Fix the build",
         status: "In Progress",
+        priority: "medium",
         description: "The build is broken",
+        dateUpdated: "",
         comments: [],
         attachments: [
           {
@@ -286,7 +330,12 @@ describe("PlannerClient", () => {
     fetchMock.mockResolvedValue(
       new Response(
         JSON.stringify([
-          { id: "p1", name: "Agent Workspace", other: "ignored" },
+          {
+            id: "p1",
+            name: "Agent Workspace",
+            description: "Workspace description",
+            other: "ignored",
+          },
           { id: "p2", name: "Personal" },
         ]),
         { status: 200 },
@@ -297,8 +346,12 @@ describe("PlannerClient", () => {
     const projects = await client.listProjects();
 
     expect(projects).toEqual([
-      { id: "p1", name: "Agent Workspace" },
-      { id: "p2", name: "Personal" },
+      {
+        id: "p1",
+        name: "Agent Workspace",
+        description: "Workspace description",
+      },
+      { id: "p2", name: "Personal", description: "" },
     ]);
     expect(fetchMock).toHaveBeenCalledWith(
       "http://planner.test:8080/api/projects",
