@@ -106,7 +106,7 @@ describe("ClaudeCodeClient", () => {
       "--output-format",
       "json",
     ]);
-    expect(options).toMatchObject({ timeout: 120000 });
+    expect(options).toMatchObject({ detached: true });
   });
 
   it("should use the default model for the authentication probe", async () => {
@@ -121,6 +121,7 @@ describe("ClaudeCodeClient", () => {
 
     const clientWithModel = new ClaudeCodeClient(config, {
       defaultModel: "claude-sonnet-4-5",
+      defaultTimeout: null,
       actions: [],
     });
     await expect(clientWithModel.checkAuthentication()).resolves.toBeUndefined();
@@ -317,6 +318,6 @@ describe("ClaudeCodeClient", () => {
       "--permission-mode",
       "bypassPermissions",
     ]);
-    expect(options).toMatchObject({ timeout: 600000 });
+    expect(options).toMatchObject({ detached: true });
   });
 });

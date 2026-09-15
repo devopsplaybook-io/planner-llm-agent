@@ -275,6 +275,7 @@ describe("AgentNote", () => {
     it("should include the agent actions configuration in the generation prompt", async () => {
       const actions: AgentActionsConfig = {
         defaultModel: "GLM-5.3-Flash",
+        defaultTimeout: null,
         actions: [
           {
             project: "Projects",
@@ -282,6 +283,7 @@ describe("AgentNote", () => {
             statusEnd: "Review",
             model: "DeepSeek-Flash",
             instruction: "Do not modify any code. Post an implementation plan.",
+            timeout: null,
           },
           {
             project: "Projects",
@@ -289,6 +291,7 @@ describe("AgentNote", () => {
             statusEnd: "Review",
             model: "",
             instruction: "",
+            timeout: null,
           },
         ],
       };
@@ -321,6 +324,7 @@ describe("AgentNote", () => {
         "Do not modify any code. Analyze the task description, the comments and the target repository, then produce a concise implementation plan for the team.";
       const actions: AgentActionsConfig = {
         defaultModel: "",
+        defaultTimeout: null,
         actions: [
           {
             project: "Projects",
@@ -328,6 +332,7 @@ describe("AgentNote", () => {
             statusEnd: "Review",
             model: "",
             instruction: longInstruction,
+            timeout: null,
           },
         ],
       };
@@ -354,6 +359,7 @@ describe("AgentNote", () => {
     it("should list a wildcard project as any project", async () => {
       const actions: AgentActionsConfig = {
         defaultModel: "",
+        defaultTimeout: null,
         actions: [
           {
             project: "",
@@ -361,6 +367,7 @@ describe("AgentNote", () => {
             statusEnd: "Done",
             model: "",
             instruction: "",
+            timeout: null,
           },
         ],
       };

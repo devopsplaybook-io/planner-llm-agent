@@ -2,10 +2,14 @@ import type { PlannerTask } from "../PlannerClient";
 
 // Task execution options coming from the matching action of the agent
 // actions configuration: the model is the action model or the actions
-// default model, and the instruction is prepended to the task information.
+// default model, the instruction is prepended to the task information and
+// the timeout is the effective task timeout in seconds (action timeout,
+// then actions default.timeout; missing values fall back to the global
+// TASK_TIMEOUT configuration).
 export interface TaskOptions {
   model?: string;
   instruction?: string;
+  timeoutSeconds?: number;
 }
 
 /**

@@ -54,6 +54,7 @@ describe("CliAgentRegistry", () => {
     const config = new Config();
     const agentActions = {
       defaultModel: "claude-sonnet-4-5",
+      defaultTimeout: null,
       actions: [],
     };
     const client = createCliAgent(config, agentActions) as QoderClient;

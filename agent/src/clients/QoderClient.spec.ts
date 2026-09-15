@@ -86,6 +86,52 @@ describe("QoderClient", () => {
     fse.removeSync(path.join(os.tmpdir(), "qoder-spec"));
   });
 
+  // Drives a CLI run to its process-group timeout under the fake clock: the
+  // fake CLI spawns (pid 4242) once the run's preparatory awaits settle, the
+  // timeout signals the process group and the CLI exits afterwards. Asserts
+  // the group kill and the timeout error reported by the client.
+  const expectGroupKillAtTimeout = async (
+    run: () => Promise<unknown>,
+    timeoutMs: number,
+    expectedMessage: string,
+  ): Promise<void> => {
+    const killSpy = jest.spyOn(process, "kill").mockImplementation(() => true);
+    jest.useFakeTimers();
+    try {
+      let execCallback: (
+        error: Error | null,
+        stdout: string,
+        stderr: string,
+      ) => void = () => undefined;
+      mockExecFile.mockImplementation(
+        (
+          _command: string,
+          _args: string[],
+          _options: unknown,
+          callback: (error: Error | null, stdout: string, stderr: string) => void,
+        ) => {
+          execCallback = callback;
+          return { pid: 4242 };
+        },
+      );
+
+      const promise = run();
+      // Pump the event loop until the CLI spawns: the preparatory awaits of
+      // the run (file cleanup, usage read) precede the spawn.
+      for (let i = 0; i < 500 && mockExecFile.mock.calls.length === 0; i++) {
+        await jest.advanceTimersByTimeAsync(10);
+      }
+      expect(mockExecFile).toHaveBeenCalledTimes(1);
+      await jest.advanceTimersByTimeAsync(timeoutMs);
+      expect(killSpy).toHaveBeenCalledWith(-4242, "SIGTERM");
+      execCallback(null, "", "");
+      await expect(promise).rejects.toThrow(expectedMessage);
+    } finally {
+      jest.useRealTimers();
+      killSpy.mockRestore();
+    }
+  };
+
   it("should run a headless prompt to verify authentication", async () => {
     mockExecFile.mockImplementation(
       (
@@ -113,7 +159,43 @@ describe("QoderClient", () => {
       "--output-format",
       "json",
     ]);
-    expect(options).toMatchObject({ timeout: 120000 });
+    expect(options).toMatchObject({ detached: true });
+  });
+
+  it("should kill the authentication probe process group at the timeout", async () => {
+    const killSpy = jest.spyOn(process, "kill").mockImplementation(() => true);
+    jest.useFakeTimers();
+    try {
+      let execCallback: (
+        error: Error | null,
+        stdout: string,
+        stderr: string,
+      ) => void = () => undefined;
+      mockExecFile.mockImplementation(
+        (
+          _command: string,
+          _args: string[],
+          _options: unknown,
+          callback: (error: Error | null, stdout: string, stderr: string) => void,
+        ) => {
+          execCallback = callback;
+          return { pid: 4242 };
+        },
+      );
+
+      const client = new QoderClient(config);
+      const probePromise = client.checkAuthentication();
+      jest.advanceTimersByTime(120000);
+      expect(killSpy).toHaveBeenCalledWith(-4242, "SIGTERM");
+      // The CLI exits after the group kill: the probe is reported as timed out.
+      execCallback(null, "", "");
+      await expect(probePromise).rejects.toThrow(
+        "Qoder authentication check timed out after 120 seconds",
+      );
+    } finally {
+      jest.useRealTimers();
+      killSpy.mockRestore();
+    }
   });
 
   it("should use the default model for the authentication probe", async () => {
@@ -128,6 +210,7 @@ describe("QoderClient", () => {
 
     const client = new QoderClient(config, {
       defaultModel: "claude-sonnet-4-5",
+      defaultTimeout: null,
       actions: [],
     });
     await expect(client.checkAuthentication()).resolves.toBeUndefined();
@@ -279,7 +362,7 @@ describe("QoderClient", () => {
       "bypass_permissions",
     ]);
     expect(options).toMatchObject({
-      timeout: 3600000,
+      detached: true,
       cwd: taskDir,
     });
     expect(await fse.pathExists(summaryFile)).toBe(false);
@@ -287,6 +370,58 @@ describe("QoderClient", () => {
 
   it("should run the task with the configured timeout", async () => {
     config.TASK_TIMEOUT = 7200;
+    const taskDir = path.join(os.tmpdir(), "qoder-spec");
+    const notesFile = path.join(taskDir, "task-1-Agent.md");
+    await fse.ensureDir(taskDir);
+
+    const client = new QoderClient(config);
+    await expectGroupKillAtTimeout(
+      () =>
+        client.performTask(
+          {
+            id: "task-1",
+            projectId: "project-1",
+            title: "Implement feature",
+            status: "To Do",
+            description: "Add a feature",
+            comments: [],
+            attachments: [],
+          },
+          notesFile,
+        ),
+      7200000,
+      "Qoder task execution timed out after 7200 seconds",
+    );
+  });
+
+  it("should run the task with the timeout of the task options", async () => {
+    config.TASK_TIMEOUT = 7200;
+    const taskDir = path.join(os.tmpdir(), "qoder-spec");
+    const notesFile = path.join(taskDir, "task-1-Agent.md");
+    await fse.ensureDir(taskDir);
+
+    const client = new QoderClient(config);
+    await expectGroupKillAtTimeout(
+      () =>
+        client.performTask(
+          {
+            id: "task-1",
+            projectId: "project-1",
+            title: "Implement feature",
+            status: "To Do",
+            description: "Add a feature",
+            comments: [],
+            attachments: [],
+          },
+          notesFile,
+          { timeoutSeconds: 1800 },
+        ),
+      1800000,
+      "Qoder task execution timed out after 1800 seconds",
+    );
+  });
+
+  it("should spawn the CLI detached for the task execution", async () => {
     const taskDir = path.join(os.tmpdir(), "qoder-spec");
     const notesFile = path.join(taskDir, "task-1-Agent.md");
     await fse.ensureDir(taskDir);
@@ -314,7 +449,7 @@ describe("QoderClient", () => {
     );
 
     const [, , options] = mockExecFile.mock.calls[0];
-    expect(options).toMatchObject({ timeout: 7200000 });
+    expect(options).toMatchObject({ detached: true });
   });
 
   it("should document the organization token variables in the task prompt", async () => {
@@ -1083,7 +1218,16 @@ describe("QoderClient", () => {
       "--permission-mode",
       "bypass_permissions",
     ]);
-    expect(options).toMatchObject({ timeout: 600000 });
+    expect(options).toMatchObject({ detached: true });
+  });
+
+  it("should kill the prompt process group at the timeout", async () => {
+    const client = new QoderClient(config);
+    await expectGroupKillAtTimeout(
+      () => client.runPrompt("Write a note about the agent"),
+      600000,
+      "Qoder prompt timed out after 600 seconds",
+    );
   });
 
   it("should apply the default model to standalone prompts", async () => {
@@ -1098,6 +1242,7 @@ describe("QoderClient", () => {
 
     const client = new QoderClient(config, {
       defaultModel: "claude-sonnet-4-5",
+      defaultTimeout: null,
       actions: [],
     });
     await expect(client.runPrompt("hello")).resolves.toBe("reply");

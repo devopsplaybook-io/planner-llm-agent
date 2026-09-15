@@ -2,7 +2,7 @@
 
 LLM agent that connects to a [Planner](https://github.com/devopsplaybook-io/planner) instance and can be assigned tasks to execute.
 
-The agent polls the Planner API for tasks assigned to its user and executes the tasks selected by its _actions_ configuration (a YAML file, see [Agent actions](#agent-actions)). It runs the tasks with a coding-agent CLI (Qoder by default; Claude Code, Copilot CLI, Codex and Gemini CLI are also supported, see [CLI agent](#cli-agent)), posts the result as a task comment and moves the task to the end status of the matching action. For each task it maintains a documentation file at `/data/tasks/[id]-Agent.md` that keeps the context of the task across runs. Task attachments are downloaded to `/data/tasks/[id]/attachments/` and listed in the documentation file so the LLM can use them. When a task reaches the cleanup status (default `Done`) the agent deletes its local task folder, and periodically removes folders for tasks that are no longer assigned or have reached the cleanup status.
+The agent polls the Planner API for tasks assigned to its user and executes the tasks selected by its _actions_ configuration (a YAML file, see [Agent actions](#agent-actions)). It runs the tasks with a coding-agent CLI (Qoder by default; Claude Code, Copilot CLI, Codex and Gemini CLI are also supported, see [CLI agent](#cli-agent)), notifies the user with a one-line comment when it starts working on a task, posts the result as a task comment and moves the task to the end status of the matching action. For each task it maintains a documentation file at `/data/tasks/[id]-Agent.md` that keeps the context of the task across runs. Task attachments are downloaded to `/data/tasks/[id]/attachments/` and listed in the documentation file so the LLM can use them. When a task reaches the cleanup status (default `Done`) the agent deletes its local task folder, and periodically removes folders for tasks that are no longer assigned or have reached the cleanup status.
 
 Polling stays quiet: log entries are only emitted when a task is ready to be processed and during its processing (plus errors), not on every poll cycle.
 
@@ -29,7 +29,7 @@ Configuration values are resolved with the following priority:
 | `TASK_POLLING_INTERVAL` | `60`                          | Seconds between polls of assigned tasks                                   |
 | `TASK_STATUS_CLEANUP`   | `Done`                        | Local task folder is deleted when a task reaches this status              |
 | `TASK_MAX_PARALLEL`     | `1`                           | Maximum number of tasks processed in parallel                             |
-| `TASK_TIMEOUT`          | `3600`                        | Maximum duration of a task execution in seconds                           |
+| `TASK_TIMEOUT`          | `3600`                        | Maximum duration of a task execution in seconds (fallback when the actions configuration defines no timeout) |
 | `DATA_DIR`              | `/data`                       | Persistent data directory (task documentation files)                      |
 | `TMP_DIR`               | `/tmp`                        | Temporary directory                                                       |
 | `DEV_MODE`              | `false`                       | Development mode flag                                                     |
@@ -183,17 +183,19 @@ The agent actions file is provided by a ConfigMap mounted at `/etc/planner/llm-a
 
 ## Agent actions
 
-The actions of the agent are defined in a YAML file (path `AGENT_ACTIONS_FILE`, default `/etc/planner/llm-agent.yaml`). Each action binds a Planner project and a start status to an optional model, an optional instruction and an end status:
+The actions of the agent are defined in a YAML file (path `AGENT_ACTIONS_FILE`, default `/etc/planner/llm-agent.yaml`). Each action binds a Planner project and a start status to an optional model, an optional instruction, an optional timeout and an end status:
 
 ```yaml
 default:
   model: DeepSeek-Flash
+  timeout: 3600
 actions:
   - project: Web
     status_start: To Do
     status_end: In Review
     model: DeepSeek-Flash
     instruction: Follow the repository coding guidelines and open a PR when the task is done.
+    timeout: 1800
   - project: Backend
     status_start: To Do
     status_end: Done
@@ -201,8 +203,11 @@ actions:
 
 For every poll, the agent checks if an assigned task matches the project and the start status of an action. Matching tasks are processed with the action model and instruction (on top of the task information) and moved to the action end status once processed (including after a processing failure, same as the default behavior).
 
-- `project`, `status_start` and `status_end` are required; `model` and `instruction` are optional. `default.model` is the fallback model for actions without their own model.
-- The format is checked at startup: when the file exists but is invalid (bad YAML, missing or empty fields, unknown fields, duplicate project and start status), the agent exits immediately with the list of problems.
+- `project`, `status_start` and `status_end` are required; `model`, `instruction` and `timeout` are optional. `default.model` is the fallback model for actions without their own model, and `default.timeout` is the fallback timeout for actions without their own timeout.
+- The task timeout is resolved per task with the following priority: the `timeout` of the matching action, then `default.timeout`, then the global `TASK_TIMEOUT` configuration (default `3600` = 1 hour). It must be a positive integer in seconds.
+- When the task timeout expires, the whole CLI process group is killed (SIGTERM, then SIGKILL after a 10 seconds grace period), so processes spawned by the coding-agent CLI (shells, `git`, `npm test`, dev servers) cannot survive the timeout. The task then fails and is moved to the end status with an explanation.
+- When the agent starts working on a task, it posts a one-line comment on the task (`Agent '<AGENT_NAME>' started working on this task.`) to notify the user. This notification is best-effort: a failure to post it does not fail the task.
+- The format is checked at startup: when the file exists but is invalid (bad YAML, missing or empty fields, invalid timeouts, unknown fields, duplicate project and start status), the agent exits immediately with the list of problems.
 - When the file does not exist, the agent starts with no action and processes no task (a warning is logged at startup).
 - `TASK_STATUS_CLEANUP` still governs the deletion of the local task folder, whatever end status the task reached.
 - Changes to the file require a restart; the file is not watched.

@@ -143,6 +143,7 @@ export class Agent {
     logger.info(
       `Processing task '${task.title}' (${task.id}) in status '${task.status}'`,
     );
+    await this.postStartComment(task);
     try {
       const notesFile = this.getTaskNotesFile(task.id);
       await this.writeTaskNotes(task, notesFile);
@@ -151,9 +152,16 @@ export class Agent {
       // BaseCliAgent.resolveModel).
       const defaultModel =
         action.model || this.agentActions?.defaultModel || "";
+      // The timeout resolves to the action timeout, then the actions
+      // default timeout; when neither is configured the global TASK_TIMEOUT
+      // (which defaults to 1 hour) applies (see BaseCliAgent.performTask).
       const summary = await this.cliAgent.performTask(task, notesFile, {
         model: defaultModel,
         instruction: action.instruction,
+        timeoutSeconds:
+          action.timeout ??
+          this.agentActions?.defaultTimeout ??
+          this.config.TASK_TIMEOUT,
       });
       await this.planner.addTaskComment(task.id, summary);
       await this.planner.updateTaskStatus(task.id, action.statusEnd);
@@ -185,6 +193,22 @@ export class Agent {
       }
     } finally {
       this.processingTasks.delete(task.id);
+    }
+  }
+
+  // Notifies the user that the agent started working on the task.
+  // Best-effort: a notification failure is logged but must not fail the
+  // task processing.
+  private async postStartComment(task: PlannerTask): Promise<void> {
+    try {
+      await this.planner.addTaskComment(
+        task.id,
+        `Agent '${this.config.AGENT_NAME}' started working on this task.`,
+      );
+    } catch (error) {
+      logger.error(
+        `Failed to post the start notification for task '${task.title}' (${task.id}): ${(error as Error).message}`,
+      );
     }
   }
 
