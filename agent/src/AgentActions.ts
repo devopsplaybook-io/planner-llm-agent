@@ -2,13 +2,15 @@ import * as fse from "fs-extra";
 import { parse } from "yaml";
 
 /**
- * One action of the agent: the tasks matching the project and the start
- * status are processed with the optional model and instruction, then moved
- * to the end status. An empty project matches any project (used by the
- * legacy status-based fallback when no actions file is configured); an
- * empty model or instruction means the corresponding feature is not set.
- * The timeout is the task timeout in seconds for the tasks of this action;
- * null falls back to the actions default timeout.
+ * One action of the agent: the tasks matching the project pattern and the
+ * start status are processed with the optional model and instruction, then
+ * moved to the end status. An empty project matches any project (used by
+ * the legacy status-based fallback when no actions file is configured); a
+ * non-empty project is a glob pattern where '*' matches any sequence of
+ * characters (see matchProjectPattern). An empty model or instruction means
+ * the corresponding feature is not set. The timeout is the task timeout in
+ * seconds for the tasks of this action; null falls back to the actions
+ * default timeout.
  */
 export interface AgentAction {
   project: string;
@@ -39,7 +41,7 @@ export interface AgentActionsConfig {
  *   model: <model name>
  *   timeout: <seconds>
  * actions:
- *   - project: <project name>
+ *   - project: <project pattern>
  *     status_start: <status name>
  *     status_end: <status name>
  *     model: <model name>
@@ -47,8 +49,11 @@ export interface AgentActionsConfig {
  *     timeout: <seconds>
  *
  * 'default' and per-action 'model'/'instruction'/'timeout' are optional;
- * everything else is required and unknown fields are rejected. Throws an
- * Error listing every problem found when the configuration is invalid.
+ * 'project' is optional too: a missing, null or empty project matches any
+ * project, and a non-empty project is a glob pattern where '*' matches any
+ * sequence of characters. Everything else is required and unknown fields
+ * are rejected. Throws an Error listing every problem found when the
+ * configuration is invalid.
  */
 export function parseAgentActions(content: string): AgentActionsConfig {
   let parsed: unknown;
@@ -136,9 +141,8 @@ export function parseAgentActions(content: string): AgentActionsConfig {
           errors.push(`actions[${index}] has unknown field '${key}'`);
         }
       }
-      const project = readString(
+      const project = readProjectPattern(
         action,
-        "project",
         `actions[${index}].project`,
         errors,
       );
@@ -174,7 +178,7 @@ export function parseAgentActions(content: string): AgentActionsConfig {
         `actions[${index}].timeout`,
         errors,
       );
-      if (project !== null && statusStart !== null) {
+      if (statusStart !== null) {
         const key = `${project}\n${statusStart}`;
         if (seen.has(key)) {
           errors.push(
@@ -184,7 +188,7 @@ export function parseAgentActions(content: string): AgentActionsConfig {
           seen.add(key);
         }
       }
-      if (project !== null && statusStart !== null && statusEnd !== null) {
+      if (statusStart !== null && statusEnd !== null) {
         config.actions.push({
           project: project,
           statusStart: statusStart,
@@ -221,6 +225,47 @@ export async function loadAgentActions(
     return null;
   }
   return parseAgentActions(await fse.readFile(filePath, "utf8"));
+}
+
+/**
+ * Whether a project name matches an action project pattern. An empty
+ * pattern matches any project; otherwise the pattern is a glob with '*'
+ * wildcards only ('*' matches any sequence of characters, including the
+ * empty one) matched in full and case-sensitively.
+ */
+export function matchProjectPattern(
+  pattern: string,
+  projectName: string,
+): boolean {
+  if (pattern.length === 0) {
+    return true;
+  }
+  const regex = new RegExp(
+    `^${pattern
+      .split("*")
+      .map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+      .join(".*")}$`,
+  );
+  return regex.test(projectName);
+}
+
+// Reads the optional project pattern of an action: a missing, null or
+// empty value normalizes to '' (= matches any project). A non-string value
+// always produces a validation error so typos fail fast at startup.
+function readProjectPattern(
+  action: Record<string, unknown>,
+  label: string,
+  errors: string[],
+): string {
+  const value = action.project;
+  if (value === undefined || value === null) {
+    return "";
+  }
+  if (typeof value !== "string") {
+    errors.push(`'${label}' must be a string`);
+    return "";
+  }
+  return value.trim();
 }
 
 // Reads a required string field; optional fields report 'not set' (null)

@@ -1,6 +1,10 @@
 import * as fse from "fs-extra";
 import * as path from "path";
-import { AgentAction, AgentActionsConfig } from "./AgentActions";
+import {
+  AgentAction,
+  AgentActionsConfig,
+  matchProjectPattern,
+} from "./AgentActions";
 import { Config } from "./Config";
 import { createCliAgent } from "./clients/CliAgentRegistry";
 import type { CliAgentClient } from "./clients/CliAgent";
@@ -136,8 +140,8 @@ export class Agent {
   }
 
   // A task matches an action when its status is the action start status and
-  // its project is the action project (an empty project matches any
-  // project). A task whose project cannot be resolved never matches a
+  // its project matches the action project pattern (an empty pattern matches
+  // any project). A task whose project cannot be resolved never matches a
   // project-bound action.
   private matchesAction(
     task: PlannerTask,
@@ -153,7 +157,11 @@ export class Agent {
     if (projects === null || task.projectId.length === 0) {
       return false;
     }
-    return projects.get(task.projectId)?.name === action.project;
+    const projectName = projects.get(task.projectId)?.name;
+    if (projectName === undefined) {
+      return false;
+    }
+    return matchProjectPattern(action.project, projectName);
   }
 
   private async processTask(

@@ -183,7 +183,7 @@ The agent actions file is provided by a ConfigMap mounted at `/etc/planner/llm-a
 
 ## Agent actions
 
-The actions of the agent are defined in a YAML file (path `AGENT_ACTIONS_FILE`, default `/etc/planner/llm-agent.yaml`). Each action binds a Planner project and a start status to an optional model, an optional instruction, an optional timeout and an end status:
+The actions of the agent are defined in a YAML file (path `AGENT_ACTIONS_FILE`, default `/etc/planner/llm-agent.yaml`). Each action binds a Planner project pattern and a start status to an optional model, an optional instruction, an optional timeout and an end status:
 
 ```yaml
 default:
@@ -196,18 +196,21 @@ actions:
     model: DeepSeek-Flash
     instruction: Follow the repository coding guidelines and open a PR when the task is done.
     timeout: 1800
-  - project: Backend
-    status_start: To Do
+  - project: Project*
+    status_start: Blocked
+    status_end: Done
+  - status_start: In Progress
     status_end: Done
 ```
 
-For every poll, the agent checks if an assigned task matches the project and the start status of an action. Matching tasks are processed with the action model and instruction (on top of the task information) and moved to the action end status once processed (including after a processing failure, same as the default behavior).
+For every poll, the agent checks if an assigned task matches the project pattern and the start status of an action. Matching tasks are processed with the action model and instruction (on top of the task information) and moved to the action end status once processed (including after a processing failure, same as the default behavior).
 
-- `project`, `status_start` and `status_end` are required; `model`, `instruction` and `timeout` are optional. `default.model` is the fallback model for actions without their own model, and `default.timeout` is the fallback timeout for actions without their own timeout.
+- `status_start` and `status_end` are required; `project`, `model`, `instruction` and `timeout` are optional. `project` matches any project when missing, null or empty; otherwise it is a case-sensitive glob pattern where `*` matches any sequence of characters (e.g. `Project*` matches `Projects` and `Projects - Planner`). Overlapping patterns are allowed: the first matching action in the list processes the task, and a task whose project cannot be resolved never matches a project-bound action.
+- `default.model` is the fallback model for actions without their own model, and `default.timeout` is the fallback timeout for actions without their own timeout.
 - The task timeout is resolved per task with the following priority: the `timeout` of the matching action, then `default.timeout`, then the global `TASK_TIMEOUT` configuration (default `3600` = 1 hour). It must be a positive integer in seconds.
 - When the task timeout expires, the whole CLI process group is killed (SIGTERM, then SIGKILL after a 10 seconds grace period), so processes spawned by the coding-agent CLI (shells, `git`, `npm test`, dev servers) cannot survive the timeout. The task then fails and is moved to the end status with an explanation.
 - When the agent starts working on a task, it posts a one-line comment on the task (`Agent '<AGENT_NAME>' started working on this task.`) to notify the user. This notification is best-effort: a failure to post it does not fail the task.
-- The format is checked at startup: when the file exists but is invalid (bad YAML, missing or empty fields, invalid timeouts, unknown fields, duplicate project and start status), the agent exits immediately with the list of problems.
+- The format is checked at startup: when the file exists but is invalid (bad YAML, missing or empty required fields, non-string projects, invalid timeouts, unknown fields, duplicate project pattern and start status), the agent exits immediately with the list of problems.
 - When the file does not exist, the agent starts with no action and processes no task (a warning is logged at startup).
 - `TASK_STATUS_CLEANUP` still governs the deletion of the local task folder, whatever end status the task reached.
 - Changes to the file require a restart; the file is not watched.

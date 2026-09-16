@@ -20,3 +20,12 @@ data:
       - project: Backend
         status_start: To Do
         status_end: Done
+      # 'project' supports '*' wildcards (any sequence of characters,
+      # case-sensitive full match):
+      # - project: Project*
+      #   status_start: Blocked
+      #   status_end: Done
+      # 'project' is optional: a missing, null or empty 'project' matches
+      # any project.
+      # - status_start: In Progress
+      #   status_end: Done
