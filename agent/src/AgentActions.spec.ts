@@ -4,6 +4,7 @@ import * as path from "path";
 import {
   AgentActionsConfig,
   loadAgentActions,
+  matchProjectPattern,
   parseAgentActions,
 } from "./AgentActions";
 
@@ -148,7 +149,74 @@ describe("AgentActions", () => {
           ].join("\n"),
         );
       expect(failure).toThrow(/actions\[0\]\.status_start' is required/);
-      expect(failure).toThrow(/actions\[1\]\.project' is required/);
+    });
+
+    it("should parse actions without a project as matching any project", () => {
+      const config = parseAgentActions(
+        [
+          "actions:",
+          "  - status_start: To Do",
+          "    status_end: Done",
+        ].join("\n"),
+      );
+      expect(config.actions[0].project).toBe("");
+    });
+
+    it("should parse a null or empty project as matching any project", () => {
+      const config = parseAgentActions(
+        [
+          "actions:",
+          "  - project:",
+          "    status_start: To Do",
+          "    status_end: Done",
+          '  - project: ""',
+          "    status_start: Blocked",
+          "    status_end: Done",
+          '  - project: "   "',
+          "    status_start: In Progress",
+          "    status_end: Done",
+        ].join("\n"),
+      );
+      expect(config.actions.map((action) => action.project)).toEqual([
+        "",
+        "",
+        "",
+      ]);
+    });
+
+    it("should parse project wildcard patterns", () => {
+      const config = parseAgentActions(
+        [
+          "actions:",
+          "  - project: Project*",
+          "    status_start: To Do",
+          "    status_end: Done",
+          "  - project: '*'",
+          "    status_start: Blocked",
+          "    status_end: Done",
+          "  - project: '*Reader'",
+          "    status_start: In Progress",
+          "    status_end: Done",
+        ].join("\n"),
+      );
+      expect(config.actions.map((action) => action.project)).toEqual([
+        "Project*",
+        "*",
+        "*Reader",
+      ]);
+    });
+
+    it("should throw on a non-string project", () => {
+      expect(() =>
+        parseAgentActions(
+          [
+            "actions:",
+            "  - project: 42",
+            "    status_start: To Do",
+            "    status_end: Done",
+          ].join("\n"),
+        ),
+      ).toThrow(/actions\[0\]\.project' must be a string/);
     });
 
     it("should throw on unknown action fields", () => {
@@ -235,9 +303,7 @@ describe("AgentActions", () => {
           ].join("\n"),
         );
       expect(failure).toThrow(/'default\.model' must be a non-empty string/);
-      expect(failure).toThrow(
-        /actions\[0\]\.project' must be a non-empty string/,
-      );
+      expect(failure).toThrow(/actions\[0\]\.project' must be a string/);
       expect(failure).toThrow(
         /actions\[0\]\.status_end' must be a non-empty string/,
       );
@@ -274,6 +340,89 @@ describe("AgentActions", () => {
         ].join("\n"),
       );
       expect(config.actions).toHaveLength(2);
+    });
+
+    it("should throw on duplicate project patterns with the same start status", () => {
+      expect(() =>
+        parseAgentActions(
+          [
+            "actions:",
+            "  - project: Project*",
+            "    status_start: To Do",
+            "    status_end: Done",
+            "  - project: Project*",
+            "    status_start: To Do",
+            "    status_end: In Review",
+          ].join("\n"),
+        ),
+      ).toThrow(
+        /actions\[1\] duplicates the project 'Project\*' and status_start 'To Do'/,
+      );
+    });
+
+    it("should throw on duplicate any-project actions with the same start status", () => {
+      expect(() =>
+        parseAgentActions(
+          [
+            "actions:",
+            "  - status_start: To Do",
+            "    status_end: Done",
+            "  - status_start: To Do",
+            "    status_end: In Review",
+          ].join("\n"),
+        ),
+      ).toThrow(/actions\[1\] duplicates the project '' and status_start 'To Do'/);
+    });
+  });
+
+  describe("matchProjectPattern", () => {
+    it("should match any project with an empty pattern", () => {
+      expect(matchProjectPattern("", "Web")).toBe(true);
+      expect(matchProjectPattern("", "")).toBe(true);
+    });
+
+    it("should match any project with a bare wildcard", () => {
+      expect(matchProjectPattern("*", "Web")).toBe(true);
+      expect(matchProjectPattern("*", "Projects")).toBe(true);
+      expect(matchProjectPattern("*", "")).toBe(true);
+    });
+
+    it("should match prefix wildcards", () => {
+      expect(matchProjectPattern("Project*", "Projects")).toBe(true);
+      expect(matchProjectPattern("Project*", "Projects - Planner")).toBe(true);
+      expect(matchProjectPattern("Project*", "Project")).toBe(true);
+      expect(matchProjectPattern("Project*", "Planner")).toBe(false);
+    });
+
+    it("should match suffix wildcards", () => {
+      expect(matchProjectPattern("*Reader", "ChineseTextReader")).toBe(true);
+      expect(matchProjectPattern("*Reader", "Reader")).toBe(true);
+      expect(matchProjectPattern("*Reader", "ChineseTextViewer")).toBe(false);
+    });
+
+    it("should match inner wildcards", () => {
+      expect(matchProjectPattern("Cloud*Manager", "CloudPhotoManager")).toBe(
+        true,
+      );
+      expect(matchProjectPattern("Cloud*Manager", "CloudManager")).toBe(true);
+      expect(matchProjectPattern("Cloud*Manager", "PhotoManager")).toBe(false);
+    });
+
+    it("should not match partially without a wildcard", () => {
+      expect(matchProjectPattern("Project", "Projects")).toBe(false);
+      expect(matchProjectPattern("Project", "Project")).toBe(true);
+    });
+
+    it("should match case-sensitively", () => {
+      expect(matchProjectPattern("project*", "Projects")).toBe(false);
+      expect(matchProjectPattern("Project*", "Projects")).toBe(true);
+    });
+
+    it("should treat regex special characters literally", () => {
+      expect(matchProjectPattern("C++ (dev)", "C++ (dev)")).toBe(true);
+      expect(matchProjectPattern("C++ (dev)", "Cxx dev")).toBe(false);
+      expect(matchProjectPattern("a.b", "a.b")).toBe(true);
+      expect(matchProjectPattern("a.b", "axb")).toBe(false);
     });
   });
 

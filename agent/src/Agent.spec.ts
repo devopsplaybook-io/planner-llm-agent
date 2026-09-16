@@ -829,6 +829,105 @@ describe("Agent", () => {
     agent.stop();
   });
 
+  it("should only process the tasks matching the action project pattern", async () => {
+    mockPlanner.listProjects.mockResolvedValue([
+      { id: "p1", name: "Projects", description: "" },
+      { id: "p2", name: "Planner", description: "" },
+    ]);
+    mockPlanner.listAssignedTasks.mockResolvedValue([
+      {
+        id: "task-1",
+        projectId: "p1",
+        title: "Fix the build",
+        status: "To Do",
+        description: "The build is broken",
+        comments: [],
+        attachments: [],
+      },
+      {
+        id: "task-2",
+        projectId: "p2",
+        title: "Other project task",
+        status: "To Do",
+        description: "Not for this action",
+        comments: [],
+        attachments: [],
+      },
+    ]);
+    mockQoder.performTask.mockResolvedValue("Done");
+
+    const agent = createAgent({
+      defaultTimeout: null,
+      defaultModel: "",
+      actions: [
+        {
+          project: "Project*",
+          statusStart: "To Do",
+          statusEnd: "In Review",
+          model: "",
+          instruction: "",
+          timeout: null,
+        },
+      ],
+    });
+    agent.start();
+    await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
+
+    expect(mockQoder.performTask).toHaveBeenCalledTimes(1);
+    expect(mockQoder.performTask).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "task-1" }),
+      expect.any(String),
+      expect.anything(),
+    );
+    expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith(
+      "task-1",
+      "In Review",
+    );
+    expect(mockPlanner.updateTaskStatus).not.toHaveBeenCalledWith(
+      "task-2",
+      expect.anything(),
+    );
+    agent.stop();
+  });
+
+  it("should not process a task whose project cannot be resolved for a pattern-bound action", async () => {
+    mockPlanner.listProjects.mockResolvedValue([
+      { id: "p1", name: "Web", description: "" },
+    ]);
+    mockPlanner.listAssignedTasks.mockResolvedValue([
+      {
+        id: "task-1",
+        projectId: "p-deleted",
+        title: "Fix the build",
+        status: "To Do",
+        description: "",
+        comments: [],
+        attachments: [],
+      },
+    ]);
+
+    const agent = createAgent({
+      defaultTimeout: null,
+      defaultModel: "",
+      actions: [
+        {
+          project: "Web*",
+          statusStart: "To Do",
+          statusEnd: "Done",
+          model: "",
+          instruction: "",
+          timeout: null,
+        },
+      ],
+    });
+    agent.start();
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    expect(mockQoder.performTask).not.toHaveBeenCalled();
+    expect(mockPlanner.updateTaskStatus).not.toHaveBeenCalled();
+    agent.stop();
+  });
+
   it("should apply the action model and instruction to the task", async () => {
     mockPlanner.listProjects.mockResolvedValue([
       { id: "p1", name: "Web", description: "" },
