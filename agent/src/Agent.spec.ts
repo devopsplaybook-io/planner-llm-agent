@@ -1656,6 +1656,61 @@ describe("Agent", () => {
     agent.stop();
   });
 
+  it("should never run more CLI processes than the budget count, whatever the weights", async () => {
+    config.TASK_POLLING_INTERVAL = 1;
+    config.TASK_MAX_PARALLEL = 1.9;
+    config.AGENT_UTILITY_MODEL = "utility-model";
+    // The utility model evaluates every hint-less task to a small weight:
+    // the weight budget (1.9) alone would admit 7 of them at once.
+    mockQoder.runPrompt.mockResolvedValue(
+      JSON.stringify({ weight: 0.25, conflicts: [], kind: "code-light" }),
+    );
+    mockPlannerTasks(
+      [1, 2, 3, 4, 5, 6].map((n) => ({
+        id: `task-${n}`,
+        title: `Small task ${n}`,
+        status: "To Do",
+        description: "Hint-less work",
+        comments: [],
+        attachments: [],
+      })),
+    );
+    const resolvers: ((value: string) => void)[] = [];
+    mockQoder.performTask.mockImplementation(
+      () =>
+        new Promise<string>((resolve) => {
+          resolvers.push(resolve);
+        }),
+    );
+
+    const agent = createAgent();
+    agent.start();
+    // 6 x 0.25 = 1.5 fits the weight budget, but every task is one full CLI
+    // process: at most ceil(1.9) = 2 run concurrently, the rest is deferred
+    // with a capacity reason and retried on the following polls. Running
+    // all of them at once OOM-kills the container (the CLI heap is sized
+    // from the container memory limit).
+    await waitFor(() => mockQoder.performTask.mock.calls.length === 2);
+    await new Promise((resolve) => setTimeout(resolve, 1200));
+    expect(mockQoder.performTask).toHaveBeenCalledTimes(2);
+    // Only the tasks that can still be admitted this round are evaluated.
+    expect(mockQoder.runPrompt).toHaveBeenCalledTimes(2);
+    expect(
+      logSpy.mock.calls.some((call) =>
+        String(call[0]).includes(
+          "picked: 'Small task 1' (weight 0.25), 'Small task 2' (weight 0.25)",
+        ),
+      ),
+    ).toBe(true);
+    expect(
+      logSpy.mock.calls.some((call) =>
+        String(call[0]).includes("deferred: 'Small task 3' (capacity)"),
+      ),
+    ).toBe(true);
+    resolvers.forEach((resolve) => resolve("done"));
+    agent.stop();
+  });
+
   it("should defer a task conflicting with a running task and keep picking unrelated tasks", async () => {
     config.TASK_POLLING_INTERVAL = 1;
     config.TASK_MAX_PARALLEL = 2;

@@ -119,7 +119,9 @@ export class AgentNote {
       "",
       "Write the updated content of the agent note. Structure it with short markdown sections (About, Skills, Recent activity, Status). Only use the facts above; do not invent information. Keep it concise (maximum 40 lines). Reply with the note content only.",
     ].join("\n");
-    const content = (await this.cliAgent.runPrompt(prompt)).trim();
+    const content = (
+      await this.cliAgent.runPrompt(prompt, { purpose: "agent note" })
+    ).trim();
     if (content.length === 0) {
       throw new Error("Agent note content generation returned an empty reply");
     }

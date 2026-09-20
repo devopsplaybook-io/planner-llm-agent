@@ -28,7 +28,7 @@ Configuration values are resolved with the following priority:
 | `PLANNER_API_KEY`       | (empty)                       | Planner API key (required)                                                |
 | `TASK_POLLING_INTERVAL` | `60`                          | Seconds between polls of assigned tasks                                   |
 | `TASK_STATUS_CLEANUP`   | `Done`                        | Local task folder is deleted when a task reaches this status              |
-| `TASK_MAX_PARALLEL`     | `1`                           | Weighted capacity budget of the parallel scheduling (decimals allowed, e.g. `1.9`; see [Parallel scheduling](#parallel-scheduling)) |
+| `TASK_MAX_PARALLEL`     | `1`                           | Weighted capacity budget of the parallel scheduling (decimals allowed, e.g. `1.9`; at most ceil(budget) CLI processes run concurrently; see [Parallel scheduling](#parallel-scheduling)) |
 | `TASK_SMART_SCHEDULING` | `true`                        | Weighted, conflict-aware scheduling when `true`; `false` restores the historical count-based parallelism |
 | `TASK_CONFLICT_MODE`    | `repo`                        | Automatic conflict keys derived from the task content: `repo`, `project` or `none` (see [Parallel scheduling](#parallel-scheduling)) |
 | `AGENT_UTILITY_MODEL`   | (empty)                       | Fast/cheap model (on the configured CLI) pre-evaluating the weight and repositories of hint-less tasks; empty disables it (zero LLM calls) |
@@ -188,6 +188,8 @@ The agent actions file is provided by a ConfigMap mounted at `/etc/planner/llm-a
 
 When `TASK_SMART_SCHEDULING` is `true` (the default), `TASK_MAX_PARALLEL` is a weighted capacity budget instead of a task count. Every task is assigned a scheduling weight between `0.25` and `1` (a large task can occupy a full slot, a tiny one a quarter of a slot) and the agent walks the ready tasks in the queue order (priority, then oldest update), admitting every task whose weight fits the remaining budget. A task that does not fit — or that conflicts with a resource claimed by a running or already-picked task — is deferred with a logged reason (`capacity` or `conflict:<key>`) and retried naturally on the next poll; the walk continues, so a blocked high-priority task never prevents unrelated lower-priority tasks from starting (no head-of-line blocking).
 
+Every running task executes one full CLI process, whatever its scheduling weight, and the CLI is a Node.js process whose heap is sized from the container memory limit — the process count, not the weight sum, is what the container memory must hold. The scheduler therefore never runs more CLI processes than the budget count (`ceil(TASK_MAX_PARALLEL)`): small weights pack several small tasks into the same process slots, they never multiply the process count (`TASK_MAX_PARALLEL=1.9` runs at most 2 CLI processes at a time, the default budget `1` exactly one). Size the container memory for the agent plus `ceil(TASK_MAX_PARALLEL)` concurrent CLI processes and their build toolchains.
+
 The weight of a task is resolved with the cheapest source first:
 
 1. An `agent-weight: <n>` line in the task description (per-task hint)
@@ -217,7 +219,7 @@ When `AGENT_UTILITY_MODEL` is set to a model available on the configured CLI, th
 
 - The prompt contains the task title, project and description (plus the latest comments) and expects a single JSON reply: `{"weight": <number>, "conflicts": ["repo:owner/name", ...], "kind": "<code-heavy|code-light|non-code>"}`.
 - The evaluated weight fills the same slot as an action weight (the description directive still wins) and the repository keys returned by the model are merged into the conflict keys. Only keys with the `repo:` shape are accepted, so a model answer cannot inject arbitrary locks; everything else fails open (fallback weight `1`, no extra conflicts).
-- Evaluations are cached per task content version (a task is evaluated once per update, not per poll), only the tasks that could still be admitted this round are evaluated, at most 3 evaluations run concurrently and each is bounded by a 60 seconds timeout. A failing or slow utility model never blocks the scheduling: the task falls back to the default weight and the deterministic conflict keys, and the failure is logged once per content version.
+- Evaluations are cached per task content version (a task is evaluated once per update, not per poll), only the tasks that could still be admitted this round are evaluated, at most 3 evaluations run concurrently and never more than the process cap of the scheduler (every evaluation is one CLI process), and each is bounded by a 60 seconds timeout. A failing or slow utility model never blocks the scheduling: the task falls back to the default weight and the deterministic conflict keys, and the failure is logged once per content version.
 - When `AGENT_UTILITY_MODEL` is empty (the default) the evaluator makes zero LLM calls.
 
 ### Working directory and instances

@@ -8,23 +8,37 @@ import type { RunCliOptions } from "./CliUtils";
 import type { PlannerTask } from "./PlannerClient";
 import type { PromptOptions, TaskOptions } from "./clients/CliAgent";
 
-jest.mock("./OTelContext", () => ({
-  OTelTracer: jest.fn(() => ({
-    startSpan: jest.fn(() => ({
-      end: jest.fn(),
-      setAttribute: jest.fn(),
-      recordException: jest.fn(),
+jest.mock("./OTelContext", () => {
+  // One logger instance per module name: tests can assert the lines logged
+  // by a specific module (e.g. 'cli-agent').
+  const moduleLoggers: Record<
+    string,
+    { debug: jest.Mock; info: jest.Mock; warn: jest.Mock; error: jest.Mock }
+  > = {};
+  return {
+    OTelTracer: jest.fn(() => ({
+      startSpan: jest.fn(() => ({
+        end: jest.fn(),
+        setAttribute: jest.fn(),
+        recordException: jest.fn(),
+      })),
     })),
-  })),
-  OTelLogger: jest.fn(() => ({
-    createModuleLogger: jest.fn(() => ({
-      debug: jest.fn(),
-      info: jest.fn(),
-      warn: jest.fn(),
-      error: jest.fn(),
+    OTelLogger: jest.fn(() => ({
+      createModuleLogger: jest.fn((module: string) => {
+        if (!moduleLoggers[module]) {
+          moduleLoggers[module] = {
+            debug: jest.fn(),
+            info: jest.fn(),
+            warn: jest.fn(),
+            error: jest.fn(),
+          };
+        }
+        return moduleLoggers[module];
+      }),
     })),
-  })),
-}));
+    __moduleLoggers: moduleLoggers,
+  };
+});
 
 jest.mock("./CliUtils", () => ({
   runCli: jest.fn(),
@@ -32,6 +46,15 @@ jest.mock("./CliUtils", () => ({
 }));
 
 const MockedRunCli = runCli as unknown as jest.Mock;
+
+// BaseCliAgent logs through the 'cli-agent' module logger: grab its info
+// mock to assert the logged lines.
+const moduleLoggers = (
+  jest.requireMock("./OTelContext") as {
+    __moduleLoggers: Record<string, { info: jest.Mock }>;
+  }
+).__moduleLoggers;
+const baseCliAgentLogInfo = moduleLoggers["cli-agent"].info;
 
 // Concrete adapter exposing the abstract methods with recorded calls.
 class TestCliAgent extends BaseCliAgent {
@@ -143,6 +166,22 @@ describe("BaseCliAgent", () => {
 
       const { args } = lastCall();
       expect(args.slice(0, 2)).toEqual(["--model", "auto"]);
+    });
+
+    it("labels the usage lines with the prompt purpose", async () => {
+      await agent.runPrompt("Estimate this task", {
+        purpose: "utility-model evaluation 'Task 1'",
+      });
+
+      const messages = baseCliAgentLogInfo.mock.calls.map(
+        (call) => call[0] as string,
+      );
+      expect(messages).toContain(
+        "Units before prompt (utility-model evaluation 'Task 1'): unknown",
+      );
+      expect(messages).toContain(
+        "Units after prompt (utility-model evaluation 'Task 1'): unknown",
+      );
     });
   });
 

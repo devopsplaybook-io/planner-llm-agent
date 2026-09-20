@@ -241,6 +241,21 @@ export function sanitizeBudget(maxParallel: number): number {
   return Number.isFinite(maxParallel) && maxParallel > 0 ? maxParallel : 1;
 }
 
+/**
+ * Process-count cap of the capacity budget: every running task executes one
+ * full CLI process, whatever its scheduling weight, and the CLI heap is
+ * sized from the container memory limit — the process count, not the weight
+ * sum, is what the container memory must hold. The weighted budget never
+ * runs more CLI processes than the historical count semantics of the same
+ * budget value (ceil), so upgrading from the count-based scheduler cannot
+ * multiply the concurrent processes: TASK_MAX_PARALLEL=1.9 keeps running at
+ * most 2 CLI processes at a time, and small weights only change which tasks
+ * fill those process slots.
+ */
+export function maxConcurrentTasks(maxParallel: number): number {
+  return Math.ceil(sanitizeBudget(maxParallel));
+}
+
 export function normalizeConflictMode(mode: string): ConflictMode {
   return (TASK_CONFLICT_MODES as readonly string[]).includes(mode)
     ? (mode as ConflictMode)
@@ -272,12 +287,19 @@ export function selectEvaluationShortlist(
 ): SchedulerCandidate[] {
   const budget = sanitizeBudget(options.maxParallel);
   const conflictMode = normalizeConflictMode(options.conflictMode);
+  // The evaluations are CLI processes too: no task beyond the process cap
+  // of this round is worth a utility-model call.
+  const freeProcessSlots = maxConcurrentTasks(options.maxParallel) - running.size;
   let usedWeight = runningWeight(running);
   const claimedKeys = claimedRunningKeys(running);
   const shortlist: SchedulerCandidate[] = [];
+  let admitted = 0;
   for (const candidate of candidates) {
-    if (budget - usedWeight < MIN_TASK_WEIGHT - WEIGHT_EPSILON) {
-      // No candidate can fit the remaining budget anymore.
+    if (
+      budget - usedWeight < MIN_TASK_WEIGHT - WEIGHT_EPSILON ||
+      admitted >= freeProcessSlots
+    ) {
+      // No candidate can fit the remaining budget or process slots anymore.
       break;
     }
     const conflictKeys = resolveStaticConflictKeys(candidate, conflictMode);
@@ -301,6 +323,7 @@ export function selectEvaluationShortlist(
     }
     // Simulate the optimistic admission for the following candidates.
     usedWeight += assumedWeight;
+    admitted++;
     for (const key of conflictKeys) {
       claimedKeys.add(key);
     }
@@ -324,6 +347,9 @@ export function selectTasks(
 ): SchedulerSelection {
   const budget = sanitizeBudget(options.maxParallel);
   const conflictMode = normalizeConflictMode(options.conflictMode);
+  // Every picked task is one full CLI process: the weighted budget fills
+  // the process slots left by the running tasks (see maxConcurrentTasks).
+  const freeProcessSlots = maxConcurrentTasks(options.maxParallel) - running.size;
   let usedWeight = runningWeight(running);
   const claimedKeys = claimedRunningKeys(running);
   const picks: SchedulerPick[] = [];
@@ -356,7 +382,10 @@ export function selectTasks(
       });
       continue;
     }
-    if (usedWeight + weight > budget + WEIGHT_EPSILON) {
+    if (
+      usedWeight + weight > budget + WEIGHT_EPSILON ||
+      picks.length >= freeProcessSlots
+    ) {
       deferrals.push({ task: candidate.task, reason: "capacity" });
       continue;
     }
