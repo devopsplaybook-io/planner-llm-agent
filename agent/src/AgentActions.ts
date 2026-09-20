@@ -10,7 +10,9 @@ import { parse } from "yaml";
  * characters (see matchProjectPattern). An empty model or instruction means
  * the corresponding feature is not set. The timeout is the task timeout in
  * seconds for the tasks of this action; null falls back to the actions
- * default timeout.
+ * default timeout. The weight is the scheduling weight (task units) of the
+ * tasks of this action in the weighted budget (see the Scheduler module);
+ * null falls back to the default weight.
  */
 export interface AgentAction {
   project: string;
@@ -19,6 +21,7 @@ export interface AgentAction {
   model: string;
   instruction: string;
   timeout: number | null;
+  weight: number | null;
 }
 
 /**
@@ -48,12 +51,12 @@ export interface AgentActionsConfig {
  *     instruction: <instruction>
  *     timeout: <seconds>
  *
- * 'default' and per-action 'model'/'instruction'/'timeout' are optional;
- * 'project' is optional too: a missing, null or empty project matches any
- * project, and a non-empty project is a glob pattern where '*' matches any
- * sequence of characters. Everything else is required and unknown fields
- * are rejected. Throws an Error listing every problem found when the
- * configuration is invalid.
+ * 'default' and per-action 'model'/'instruction'/'timeout'/'weight' are
+ * optional; 'project' is optional too: a missing, null or empty project
+ * matches any project, and a non-empty project is a glob pattern where '*'
+ * matches any sequence of characters. Everything else is required and
+ * unknown fields are rejected. Throws an Error listing every problem found
+ * when the configuration is invalid.
  */
 export function parseAgentActions(content: string): AgentActionsConfig {
   let parsed: unknown;
@@ -136,6 +139,7 @@ export function parseAgentActions(content: string): AgentActionsConfig {
             "model",
             "instruction",
             "timeout",
+            "weight",
           ].includes(key)
         ) {
           errors.push(`actions[${index}] has unknown field '${key}'`);
@@ -178,6 +182,12 @@ export function parseAgentActions(content: string): AgentActionsConfig {
         `actions[${index}].timeout`,
         errors,
       );
+      const weight = readPositiveWeight(
+        action,
+        "weight",
+        `actions[${index}].weight`,
+        errors,
+      );
       if (statusStart !== null) {
         const key = `${project}\n${statusStart}`;
         if (seen.has(key)) {
@@ -196,6 +206,7 @@ export function parseAgentActions(content: string): AgentActionsConfig {
           model: model ?? "",
           instruction: instruction ?? "",
           timeout: timeout,
+          weight: weight,
         });
       }
     });
@@ -308,6 +319,31 @@ function readPositiveInteger(
   }
   if (typeof value !== "number" || !Number.isInteger(value) || value <= 0) {
     errors.push(`'${label}' must be a positive integer (seconds)`);
+    return null;
+  }
+  return value;
+}
+
+// Reads an optional scheduling weight (a number in (0, 1]); missing fields
+// report 'not set' (null). Zero, negative, non-finite or values above 1
+// always produce a validation error so typos fail fast at startup.
+function readPositiveWeight(
+  source: Record<string, unknown>,
+  field: string,
+  label: string,
+  errors: string[],
+): number | null {
+  const value = source[field];
+  if (value === undefined) {
+    return null;
+  }
+  if (
+    typeof value !== "number" ||
+    !Number.isFinite(value) ||
+    value <= 0 ||
+    value > 1
+  ) {
+    errors.push(`'${label}' must be a number greater than 0 and at most 1`);
     return null;
   }
   return value;

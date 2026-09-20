@@ -42,6 +42,10 @@ describe("Config", () => {
       expect(config.TASK_POLLING_INTERVAL).toBe(60);
       expect(config.TASK_STATUS_CLEANUP).toBe("Done");
       expect(config.TASK_TIMEOUT).toBe(3600);
+      expect(config.TASK_MAX_PARALLEL).toBe(1);
+      expect(config.TASK_SMART_SCHEDULING).toBe(true);
+      expect(config.TASK_CONFLICT_MODE).toBe("repo");
+      expect(config.AGENT_UTILITY_MODEL).toBe("");
       expect(config.GITHUB_TOKENS).toBe("");
       expect(config.AGENT_CLI).toBe("qoder");
       expect(config.AGENT_AUTH_CHECK).toBe("true");
@@ -144,6 +148,56 @@ describe("Config", () => {
       expect(config.TASK_TIMEOUT).toBe(7200);
 
       await fs.remove(tmpDir);
+    });
+
+    it("should load the scheduling settings from the config file and environment", async () => {
+      const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-config-"));
+      const configFile = path.join(tmpDir, "config.json");
+      await fs.writeJson(configFile, {
+        TASK_MAX_PARALLEL: 1.5,
+        TASK_SMART_SCHEDULING: false,
+        TASK_CONFLICT_MODE: "project",
+        AGENT_UTILITY_MODEL: "file-utility-model",
+      });
+      process.env.CONFIG_FILE = configFile;
+      // The environment wins over the config file; the parallel budget keeps
+      // its decimals and the boolean flag accepts 0/1 as well as true/false.
+      process.env.TASK_MAX_PARALLEL = "1.9";
+      process.env.TASK_SMART_SCHEDULING = "true";
+      process.env.TASK_CONFLICT_MODE = "none";
+      process.env.AGENT_UTILITY_MODEL = "env-utility-model";
+
+      const config = new Config();
+      await config.reload();
+      expect(config.TASK_MAX_PARALLEL).toBe(1.9);
+      expect(config.TASK_SMART_SCHEDULING).toBe(true);
+      expect(config.TASK_CONFLICT_MODE).toBe("none");
+      expect(config.AGENT_UTILITY_MODEL).toBe("env-utility-model");
+
+      await fs.remove(tmpDir);
+    });
+
+    it("should parse the boolean scheduling flag from the environment", async () => {
+      const reload = async (): Promise<Config> => {
+        const config = new Config();
+        await config.reload();
+        return config;
+      };
+
+      process.env.TASK_SMART_SCHEDULING = "0";
+      expect((await reload()).TASK_SMART_SCHEDULING).toBe(false);
+
+      process.env.TASK_SMART_SCHEDULING = "false";
+      expect((await reload()).TASK_SMART_SCHEDULING).toBe(false);
+
+      process.env.TASK_SMART_SCHEDULING = "1";
+      expect((await reload()).TASK_SMART_SCHEDULING).toBe(true);
+
+      process.env.TASK_SMART_SCHEDULING = "anything-else";
+      expect((await reload()).TASK_SMART_SCHEDULING).toBe(true);
+
+      delete process.env.TASK_SMART_SCHEDULING;
+      expect((await reload()).TASK_SMART_SCHEDULING).toBe(true);
     });
 
     it("should load the agent note settings from the config file", async () => {
@@ -269,7 +323,26 @@ describe("Config", () => {
 
       const errors = config.validate();
       expect(errors).toEqual([
-        "TASK_MAX_PARALLEL must be a positive integer (current value: '0')",
+        "TASK_MAX_PARALLEL must be a positive number (current value: '0')",
+      ]);
+    });
+
+    it("should accept a fractional TASK_MAX_PARALLEL", () => {
+      const config = new Config();
+      config.PLANNER_API_KEY = "key";
+      config.TASK_MAX_PARALLEL = 1.9;
+
+      expect(config.validate()).toEqual([]);
+    });
+
+    it("should report an invalid TASK_CONFLICT_MODE", () => {
+      const config = new Config();
+      config.PLANNER_API_KEY = "key";
+      config.TASK_CONFLICT_MODE = "serial";
+
+      const errors = config.validate();
+      expect(errors).toEqual([
+        "TASK_CONFLICT_MODE must be one of repo, project, none (current value: 'serial')",
       ]);
     });
 

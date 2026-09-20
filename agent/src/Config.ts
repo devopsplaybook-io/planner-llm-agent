@@ -28,6 +28,9 @@ export class Config {
   public TASK_STATUS_CLEANUP: string;
   public TASK_MAX_PARALLEL: number;
   public TASK_TIMEOUT: number;
+  public TASK_SMART_SCHEDULING: boolean;
+  public TASK_CONFLICT_MODE: string;
+  public AGENT_UTILITY_MODEL: string;
   public AGENT_NOTE_PROJECT: string;
   public AGENT_NOTE_INTERVAL: number;
 
@@ -92,6 +95,9 @@ export class Config {
     this.TASK_STATUS_CLEANUP = "Done";
     this.TASK_MAX_PARALLEL = 1;
     this.TASK_TIMEOUT = 3600;
+    this.TASK_SMART_SCHEDULING = true;
+    this.TASK_CONFLICT_MODE = "repo";
+    this.AGENT_UTILITY_MODEL = "";
     this.AGENT_NOTE_PROJECT = "";
     this.AGENT_NOTE_INTERVAL = 86400;
 
@@ -159,6 +165,15 @@ export class Config {
     }
     if (config.TASK_TIMEOUT) {
       this.TASK_TIMEOUT = config.TASK_TIMEOUT as number;
+    }
+    if (config.TASK_SMART_SCHEDULING !== undefined) {
+      this.TASK_SMART_SCHEDULING = config.TASK_SMART_SCHEDULING === true;
+    }
+    if (config.TASK_CONFLICT_MODE) {
+      this.TASK_CONFLICT_MODE = config.TASK_CONFLICT_MODE as string;
+    }
+    if (config.AGENT_UTILITY_MODEL !== undefined) {
+      this.AGENT_UTILITY_MODEL = (config.AGENT_UTILITY_MODEL ?? "") as string;
     }
     if (config.AGENT_NOTE_PROJECT) {
       this.AGENT_NOTE_PROJECT = config.AGENT_NOTE_PROJECT as string;
@@ -274,10 +289,22 @@ export class Config {
       this.TASK_STATUS_CLEANUP = process.env.TASK_STATUS_CLEANUP;
     }
     if (process.env.TASK_MAX_PARALLEL) {
-      this.TASK_MAX_PARALLEL = parseInt(process.env.TASK_MAX_PARALLEL);
+      this.TASK_MAX_PARALLEL = parseFloat(process.env.TASK_MAX_PARALLEL);
     }
     if (process.env.TASK_TIMEOUT) {
       this.TASK_TIMEOUT = parseInt(process.env.TASK_TIMEOUT);
+    }
+    if (process.env.TASK_SMART_SCHEDULING !== undefined) {
+      this.TASK_SMART_SCHEDULING = parseBooleanFlag(
+        process.env.TASK_SMART_SCHEDULING,
+        this.TASK_SMART_SCHEDULING,
+      );
+    }
+    if (process.env.TASK_CONFLICT_MODE) {
+      this.TASK_CONFLICT_MODE = process.env.TASK_CONFLICT_MODE;
+    }
+    if (process.env.AGENT_UTILITY_MODEL !== undefined) {
+      this.AGENT_UTILITY_MODEL = process.env.AGENT_UTILITY_MODEL ?? "";
     }
     if (process.env.AGENT_NOTE_PROJECT) {
       this.AGENT_NOTE_PROJECT = process.env.AGENT_NOTE_PROJECT;
@@ -402,17 +429,23 @@ export class Config {
     }
 
     if (
-      !Number.isInteger(this.TASK_MAX_PARALLEL) ||
+      !Number.isFinite(this.TASK_MAX_PARALLEL) ||
       this.TASK_MAX_PARALLEL <= 0
     ) {
       errors.push(
-        `TASK_MAX_PARALLEL must be a positive integer (current value: '${this.TASK_MAX_PARALLEL}')`,
+        `TASK_MAX_PARALLEL must be a positive number (current value: '${this.TASK_MAX_PARALLEL}')`,
       );
     }
 
     if (!Number.isInteger(this.TASK_TIMEOUT) || this.TASK_TIMEOUT <= 0) {
       errors.push(
         `TASK_TIMEOUT must be a positive integer (current value: '${this.TASK_TIMEOUT}')`,
+      );
+    }
+
+    if (!TASK_CONFLICT_MODES.includes(this.TASK_CONFLICT_MODE as ConflictMode)) {
+      errors.push(
+        `TASK_CONFLICT_MODE must be one of ${TASK_CONFLICT_MODES.join(", ")} (current value: '${this.TASK_CONFLICT_MODE}')`,
       );
     }
 
@@ -518,6 +551,27 @@ export const CLI_AGENT_NAMES = [
 ] as const;
 
 export type CliAgentName = (typeof CLI_AGENT_NAMES)[number];
+
+// How automatic conflict keys are derived for smart scheduling (see the
+// Scheduler module): 'repo' extracts repository slugs from the task
+// description and comments, 'project' additionally serializes the tasks of
+// the same Planner project, 'none' only honors explicit agent-lock keys.
+export const TASK_CONFLICT_MODES = ["repo", "project", "none"] as const;
+
+export type ConflictMode = (typeof TASK_CONFLICT_MODES)[number];
+
+// Parses a boolean environment flag accepting 'true'/'1' and 'false'/'0';
+// any other value keeps the current one.
+export function parseBooleanFlag(value: string, current: boolean): boolean {
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "true" || normalized === "1") {
+    return true;
+  }
+  if (normalized === "false" || normalized === "0") {
+    return false;
+  }
+  return current;
+}
 
 export interface GithubTokenEntry {
   organization: string;

@@ -24,6 +24,18 @@ spec:
               value: "planner-llm-agent"
             - name: PLANNER_URL
               value: "http://planner:8080"
+            # Parallel scheduling (see the "Parallel scheduling" section of
+            # the README): weighted capacity budget, conflict mode and the
+            # optional utility model pre-evaluating hint-less tasks. The
+            # defaults below are the built-in ones.
+            # - name: TASK_MAX_PARALLEL
+            #   value: "1.9"
+            # - name: TASK_SMART_SCHEDULING
+            #   value: "true"
+            # - name: TASK_CONFLICT_MODE
+            #   value: "repo"
+            # - name: AGENT_UTILITY_MODEL
+            #   value: "DeepSeek-Flash"
             - name: PLANNER_API_KEY
               valueFrom:
                 secretKeyRef:

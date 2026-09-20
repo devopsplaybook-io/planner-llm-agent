@@ -40,6 +40,7 @@ describe("AgentActions", () => {
             model: "action-model",
             instruction: "Follow the guidelines",
             timeout: 1800,
+            weight: null,
           },
           {
             project: "Backend",
@@ -48,6 +49,7 @@ describe("AgentActions", () => {
             model: "",
             instruction: "",
             timeout: null,
+            weight: null,
           },
         ],
       });
@@ -74,6 +76,7 @@ describe("AgentActions", () => {
             model: "",
             instruction: "",
             timeout: null,
+            weight: null,
           },
         ],
       });
@@ -290,6 +293,51 @@ describe("AgentActions", () => {
       );
     });
 
+    it("should parse the action weight", () => {
+      const config = parseAgentActions(
+        [
+          "actions:",
+          "  - project: Web",
+          "    status_start: To Do",
+          "    status_end: Done",
+          "    weight: 0.5",
+          "  - project: Backend",
+          "    status_start: To Do",
+          "    status_end: Done",
+          "    weight: 1",
+        ].join("\n"),
+      );
+      expect(config.actions[0].weight).toBe(0.5);
+      expect(config.actions[1].weight).toBe(1);
+    });
+
+    it("should throw on invalid action weight values", () => {
+      const failure = (value: string): (() => unknown) => () =>
+        parseAgentActions(
+          [
+            "actions:",
+            "  - project: Web",
+            "    status_start: To Do",
+            "    status_end: Done",
+            `    weight: ${value}`,
+          ].join("\n"),
+        );
+      // Weights above 1 would let a single task consume more than one slot
+      // of the parallel budget, so the action weight is bounded to (0, 1].
+      expect(failure("0")).toThrow(
+        /'actions\[0\]\.weight' must be a number greater than 0 and at most 1/,
+      );
+      expect(failure("-0.5")).toThrow(
+        /'actions\[0\]\.weight' must be a number greater than 0 and at most 1/,
+      );
+      expect(failure("1.5")).toThrow(
+        /'actions\[0\]\.weight' must be a number greater than 0 and at most 1/,
+      );
+      expect(failure('"big"')).toThrow(
+        /'actions\[0\]\.weight' must be a number greater than 0 and at most 1/,
+      );
+    });
+
     it("should throw on empty or non-string values", () => {
       const failure = (): unknown =>
         parseAgentActions(
@@ -470,6 +518,7 @@ describe("AgentActions", () => {
             model: "",
             instruction: "Do it well",
             timeout: null,
+            weight: null,
           },
         ],
       });
