@@ -158,7 +158,11 @@ describe("TaskEvaluator", () => {
       expect(prompt).toContain("Task title: Task t1");
       expect(prompt).toContain("Project: Web");
       expect(prompt).toContain("Implement the feature");
-      expect(options).toEqual({ model: "qwen3-flash", timeoutMs: 60000 });
+      expect(options).toEqual({
+        model: "qwen3-flash",
+        timeoutMs: 60000,
+        purpose: "utility-model evaluation 'Task t1'",
+      });
     });
 
     it("trims the description and the latest comments in the prompt", () => {

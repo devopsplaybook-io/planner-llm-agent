@@ -273,10 +273,15 @@ export abstract class BaseCliAgent implements CliAgentClient {
       model.length > 0 ? model : null,
     );
     const timeoutMs = options?.timeoutMs ?? PROMPT_TIMEOUT_MS;
+    // Concurrent prompts share one usage log: the purpose keeps the
+    // interleaved lines distinguishable (agent note, utility-model
+    // evaluations, ...).
+    const purpose = options?.purpose?.trim() ?? "";
+    const purposeSuffix = purpose.length > 0 ? ` (${purpose})` : "";
     try {
       const usageBefore = await this.readUsage();
       logger.info(
-        `${this.usageLabel()} before prompt: ${formatUsageValue(usageBefore)}`,
+        `${this.usageLabel()} before prompt${purposeSuffix}: ${formatUsageValue(usageBefore)}`,
       );
       const result = await this.runAgentCli(args, {
         timeout: timeoutMs,
@@ -289,7 +294,7 @@ export abstract class BaseCliAgent implements CliAgentClient {
         await this.writeUsage(usageAfter);
       }
       logger.info(
-        `${this.usageLabel()} after prompt: ${formatUsageValue(usageAfter)}`,
+        `${this.usageLabel()} after prompt${purposeSuffix}: ${formatUsageValue(usageAfter)}`,
       );
       const reply = this.parseReply(result);
       if (reply !== null && reply.length > 0) {

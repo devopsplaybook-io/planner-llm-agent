@@ -108,6 +108,19 @@ describe("AgentNote", () => {
       expect(qoder.runPrompt).toHaveBeenCalledTimes(1);
     });
 
+    it("labels the generation prompt as the agent note", async () => {
+      planner.listProjects.mockResolvedValue([project]);
+      planner.listNotes.mockResolvedValue([]);
+      qoder.runPrompt.mockResolvedValue("content");
+      planner.createNote.mockResolvedValue({ id: "n1" });
+
+      await agentNote.update();
+
+      expect(qoder.runPrompt).toHaveBeenCalledWith(expect.any(String), {
+        purpose: "agent note",
+      });
+    });
+
     it("should update the existing note named after the agent", async () => {
       planner.listProjects.mockResolvedValue([project]);
       planner.listNotes.mockResolvedValue([

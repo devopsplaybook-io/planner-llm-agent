@@ -19,6 +19,9 @@ export interface TaskOptions {
 export interface PromptOptions {
   model?: string;
   timeoutMs?: number;
+  // Context logged with the usage lines so concurrent prompts (agent note,
+  // utility-model evaluations) stay distinguishable in the logs.
+  purpose?: string;
 }
 
 /**

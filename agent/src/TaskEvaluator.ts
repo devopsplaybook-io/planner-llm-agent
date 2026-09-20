@@ -174,6 +174,7 @@ export class TaskEvaluator {
         this.cliAgent.runPrompt(prompt, {
           model: this.config.AGENT_UTILITY_MODEL.trim(),
           timeoutMs: this.timeoutMs,
+          purpose: `utility-model evaluation '${task.title.trim()}'`,
         }),
         new Promise<never>((_, reject) => {
           timeout = setTimeout(
