@@ -11,6 +11,7 @@ import {
   extractAgentLockKeys,
   extractAgentWeight,
   extractRepoConflictKeys,
+  maxConcurrentTasks,
   normalizeConflictMode,
   resolveStaticConflictKeys,
   resolveTaskWeight,
@@ -221,6 +222,61 @@ describe("Scheduler", () => {
       expect(selection.deferrals[0].reason).toBe("capacity");
     });
 
+    it("never runs more CLI processes than the budget count (ceil), whatever the weights", () => {
+      const candidates = ["t1", "t2", "t3", "t4", "t5"].map((id) =>
+        buildCandidate(
+          buildTask({ id, description: "agent-weight: 0.25" }),
+        ),
+      );
+      const selection = selectTasks(
+        candidates,
+        new Map(),
+        options({ maxParallel: 1.9 }),
+      );
+      // 5 x 0.25 fits the 1.9 weight budget, but every task is one full CLI
+      // process: the budget keeps running at most ceil(1.9) = 2 of them.
+      expect(selection.picks.map((pick) => pick.task.id)).toEqual([
+        "t1",
+        "t2",
+      ]);
+      expect(selection.deferrals.map((deferral) => deferral.task.id)).toEqual([
+        "t3",
+        "t4",
+        "t5",
+      ]);
+      expect(
+        selection.deferrals.every(
+          (deferral) => deferral.reason === "capacity",
+        ),
+      ).toBe(true);
+    });
+
+    it("counts the running tasks against the process cap even when they are small", () => {
+      const candidates = ["t1", "t2", "t3"].map((id) =>
+        buildCandidate(
+          buildTask({ id, description: "agent-weight: 0.25" }),
+        ),
+      );
+      const running = mapOf([
+        buildRunning({ taskId: "r1", weight: 0.25 }),
+      ]);
+      const selection = selectTasks(
+        candidates,
+        running,
+        options({ maxParallel: 2.5 }),
+      );
+      // The weight budget still has 1.75 free, but ceil(2.5) = 3 processes
+      // minus the one already running leaves 2 process slots.
+      expect(selection.picks.map((pick) => pick.task.id)).toEqual([
+        "t1",
+        "t2",
+      ]);
+      expect(selection.deferrals.map((deferral) => deferral.task.id)).toEqual([
+        "t3",
+      ]);
+      expect(selection.deferrals[0].reason).toBe("capacity");
+    });
+
     it("adds the picked weights and keys of the same round to the claimed state", () => {
       const candidates = [
         buildCandidate(
@@ -409,8 +465,29 @@ describe("Scheduler", () => {
       const shortlist = selectEvaluationShortlist(
         candidates,
         new Map(),
-        options({ maxParallel: 1 }),
+        options({ maxParallel: 2.5 }),
       );
+      // Budget 2.5 and the process cap ceil(2.5) = 3: t1 and t2 are
+      // evaluated (hint-less), the explicit 0.25 hint of t3 needs no
+      // evaluation; with all three simulated the cap is reached.
+      expect(shortlist.map((candidate) => candidate.task.id)).toEqual([
+        "t1",
+        "t2",
+      ]);
+    });
+
+    it("stops shortlisting at the process cap of the round", () => {
+      const candidates = ["t1", "t2", "t3"].map((id) =>
+        buildCandidate(buildTask({ id })),
+      );
+      const shortlist = selectEvaluationShortlist(
+        candidates,
+        new Map(),
+        options({ maxParallel: 1.9 }),
+      );
+      // Every 0.25-optimistic weight fits the 1.9 budget, but at most
+      // ceil(1.9) = 2 CLI processes can run: only the first two candidates
+      // can still be admitted this round, so only they are evaluated.
       expect(shortlist.map((candidate) => candidate.task.id)).toEqual([
         "t1",
         "t2",
@@ -454,8 +531,11 @@ describe("Scheduler", () => {
       const shortlist = selectEvaluationShortlist(
         candidates,
         running,
-        options({ maxParallel: 0.5 }),
+        options({ maxParallel: 1.5 }),
       );
+      // The process cap ceil(1.5) = 2 leaves one free slot (one task is
+      // running): the conflicting candidate is skipped, the next one is
+      // shortlisted and fills the slot.
       expect(shortlist.map((candidate) => candidate.task.id)).toEqual([
         "t-fits",
       ]);
@@ -469,6 +549,16 @@ describe("Scheduler", () => {
       expect(sanitizeBudget(0)).toBe(1);
       expect(sanitizeBudget(-1)).toBe(1);
       expect(sanitizeBudget(Number.NaN)).toBe(1);
+    });
+
+    it("derives the process cap from the budget", () => {
+      expect(maxConcurrentTasks(1)).toBe(1);
+      expect(maxConcurrentTasks(1.9)).toBe(2);
+      expect(maxConcurrentTasks(2)).toBe(2);
+      expect(maxConcurrentTasks(2.5)).toBe(3);
+      expect(maxConcurrentTasks(0.5)).toBe(1);
+      expect(maxConcurrentTasks(0)).toBe(1);
+      expect(maxConcurrentTasks(Number.NaN)).toBe(1);
     });
 
     it("falls back to the repo mode on invalid hot-reloaded values", () => {

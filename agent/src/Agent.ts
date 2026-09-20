@@ -18,6 +18,7 @@ import {
   SchedulerSelection,
   RunningTask,
   actionKeyOf,
+  maxConcurrentTasks,
   normalizeConflictMode,
   runningWeight,
   sanitizeBudget,
@@ -203,6 +204,9 @@ export class Agent {
         task: candidate.task,
         projectName: candidate.projectName,
       })),
+      // The evaluations are CLI processes too: they share the process cap
+      // of the scheduler instead of stacking on top of the running tasks.
+      { maxConcurrent: maxConcurrentTasks(maxParallel) },
     );
     const selection = selectTasks(schedulerCandidates, this.processingTasks, {
       ...options,

@@ -279,5 +279,31 @@ describe("TaskEvaluator", () => {
       expect(mockCli.runPrompt).toHaveBeenCalledTimes(5);
       expect(maxConcurrent).toBe(2);
     });
+
+    it("lowers the batch concurrency to the process cap of the scheduler", async () => {
+      const mockCli = buildMockCli();
+      let concurrent = 0;
+      let maxObserved = 0;
+      mockCli.runPrompt.mockImplementation(async () => {
+        concurrent++;
+        maxObserved = Math.max(maxObserved, concurrent);
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        concurrent--;
+        return '{"weight": 0.5, "conflicts": [], "kind": "code-light"}';
+      });
+      const evaluator = buildEvaluator(mockCli, { concurrency: 3 });
+      const evaluations = await evaluator.evaluateAll(
+        ["t1", "t2", "t3", "t4"].map((id) => ({
+          task: buildTask({ id }),
+          projectName: "Web",
+        })),
+        // A scheduler process cap of 1: every evaluation is one CLI
+        // process, so the batch runs strictly serially.
+        { maxConcurrent: 1 },
+      );
+      expect(evaluations.size).toBe(4);
+      expect(mockCli.runPrompt).toHaveBeenCalledTimes(4);
+      expect(maxObserved).toBe(1);
+    });
   });
 });

@@ -35,6 +35,13 @@ export interface TaskEvaluatorOptions {
   concurrency?: number;
 }
 
+export interface EvaluateAllOptions {
+  // Process-count cap of the calling scheduler: every evaluation runs one
+  // full CLI process, so the batch concurrency is lowered to it (never
+  // raised above the configured concurrency).
+  maxConcurrent?: number;
+}
+
 /**
  * Optional fast/cheap LLM pre-evaluation ("utility model") of the tasks
  * without explicit hints: it estimates the scheduling weight and the
@@ -85,16 +92,18 @@ export class TaskEvaluator {
    */
   public async evaluateAll(
     inputs: EvaluationInput[],
+    options?: EvaluateAllOptions,
   ): Promise<Map<string, TaskEvaluation>> {
     const evaluations = new Map<string, TaskEvaluation>();
     if (!this.isEnabled() || inputs.length === 0) {
       return evaluations;
     }
+    const concurrencyLimit = this.evaluationLimit(options?.maxConcurrent);
     await Promise.all(
       inputs.map(async (input) => {
         evaluations.set(
           input.task.id,
-          await this.evaluateTask(input.task, input.projectName),
+          await this.evaluateTask(input.task, input.projectName, concurrencyLimit),
         );
       }),
     );
@@ -104,12 +113,13 @@ export class TaskEvaluator {
   public async evaluateTask(
     task: PlannerTask,
     projectName: string,
+    concurrencyLimit?: number,
   ): Promise<TaskEvaluation> {
     const cached = this.cache.get(task.id);
     if (cached && cached.dateUpdated === task.dateUpdated) {
       return cached.evaluation;
     }
-    await this.acquire();
+    await this.acquire(this.evaluationLimit(concurrencyLimit));
     try {
       // Re-check the cache once the slot is granted: another evaluation of
       // the same content version may have completed in the meantime.
@@ -127,8 +137,17 @@ export class TaskEvaluator {
     }
   }
 
-  private async acquire(): Promise<void> {
-    if (this.active < this.concurrency) {
+  // The effective concurrency of a batch: the caller may lower the
+  // configured concurrency to its process cap, never raise it.
+  private evaluationLimit(maxConcurrent?: number): number {
+    return Math.max(
+      1,
+      Math.min(this.concurrency, maxConcurrent ?? this.concurrency),
+    );
+  }
+
+  private async acquire(limit: number): Promise<void> {
+    if (this.active < limit) {
       this.active++;
       return;
     }

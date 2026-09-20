@@ -81,7 +81,9 @@ spec:
                   key: GITHUB_TOKEN
           # The Qoder CLI runs as a child process of the agent and needs a
           # large Node.js heap (it OOMs with the default heap sized from a
-          # 500Mi cgroup limit).
+          # 500Mi cgroup limit). Every running task is one CLI process and
+          # the scheduler runs at most ceil(TASK_MAX_PARALLEL) of them at a
+          # time: size the limit for the agent plus those CLI processes.
           resources:
             limits:
               memory: 2Gi
