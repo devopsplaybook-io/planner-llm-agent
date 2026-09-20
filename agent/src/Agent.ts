@@ -8,8 +8,24 @@ import {
 import { Config } from "./Config";
 import { createCliAgent } from "./clients/CliAgentRegistry";
 import type { CliAgentClient } from "./clients/CliAgent";
-import { OTelLogger } from "./OTelContext";
+import { resolveModel } from "./clients/BaseCliAgent";
+import { OTelLogger, OTelMeter } from "./OTelContext";
 import { PlannerClient, PlannerProject, PlannerTask } from "./PlannerClient";
+import {
+  DEFAULT_TASK_WEIGHT,
+  SchedulerOptions,
+  SchedulerPick,
+  SchedulerSelection,
+  RunningTask,
+  actionKeyOf,
+  normalizeConflictMode,
+  runningWeight,
+  sanitizeBudget,
+  selectEvaluationShortlist,
+  selectTasks,
+  selectTasksLegacy,
+} from "./Scheduler";
+import { TaskEvaluator } from "./TaskEvaluator";
 
 const logger = OTelLogger().createModuleLogger("agent");
 
@@ -24,16 +40,41 @@ export class Agent {
   private agentActions: AgentActionsConfig | null;
   private planner: PlannerClient;
   private cliAgent: CliAgentClient;
+  private taskEvaluator: TaskEvaluator;
   private pollingTimer?: NodeJS.Timeout;
-  // Tasks currently being processed: they are never picked again by a
-  // subsequent poll while their processing is still running.
-  private processingTasks = new Set<string>();
+  // Tasks currently being processed with their scheduling metadata: they
+  // are never picked again by a subsequent poll while their processing is
+  // still running. In-memory only: one agent process per agent identity is
+  // assumed; cross-instance scheduling is not supported.
+  private processingTasks = new Map<string, RunningTask>();
+  // Single-flight guard: while a poll is still running (task selection,
+  // utility-model evaluations or processing start), the next tick is
+  // skipped, so tasks can never be registered twice (double-pick race).
+  private polling = false;
+  // Scheduling metrics (disabled when OpenTelemetry is not initialized).
+  private schedulerMetrics: {
+    runningWeight: ReturnType<
+      ReturnType<typeof OTelMeter>["createObservableGauge"]
+    >;
+    queueDepth: ReturnType<
+      ReturnType<typeof OTelMeter>["createObservableGauge"]
+    >;
+    picked: ReturnType<ReturnType<typeof OTelMeter>["createCounter"]>;
+    deferred: ReturnType<ReturnType<typeof OTelMeter>["createCounter"]>;
+  } | null = null;
+  private lastRunningWeight = 0;
+  private lastQueueDepth = 0;
+  // Invalid hot-reloaded values are reported once per value.
+  private warnedBudgetValue: string | null = null;
+  private warnedConflictModeValue: string | null = null;
 
   constructor(config: Config, agentActions?: AgentActionsConfig | null) {
     this.config = config;
     this.agentActions = agentActions ?? null;
     this.planner = new PlannerClient(config);
     this.cliAgent = createCliAgent(config, this.agentActions);
+    this.taskEvaluator = new TaskEvaluator(config, this.cliAgent);
+    this.initSchedulerMetrics();
   }
 
   public start(): void {
@@ -55,10 +96,23 @@ export class Agent {
   }
 
   private async pollForTasks(): Promise<void> {
+    if (this.polling) {
+      return;
+    }
+    this.polling = true;
+    try {
+      await this.pollOnce();
+    } finally {
+      this.polling = false;
+    }
+  }
+
+  private async pollOnce(): Promise<void> {
     try {
       const user = await this.planner.getCurrentUser();
       const tasks = await this.planner.listAssignedTasks(user);
       await this.cleanupCompletedTasks(tasks);
+      this.logRunningTasks();
       const actions = this.getActions();
       if (actions.length === 0 || tasks.length === 0) {
         return;
@@ -80,12 +134,10 @@ export class Agent {
       }
       // Only tasks matching an action are ready, and a task already being
       // processed is never picked again by a subsequent poll. Every matching
-      // (task, action) pair is a candidate; the free slots are then filled
-      // from the candidates sorted by queue priority. The parallel limit is
-      // shared by every action.
-      const freeSlots =
-        this.config.TASK_MAX_PARALLEL - this.processingTasks.size;
-      const candidates: { task: PlannerTask; action: AgentAction }[] = [];
+      // (task, action) pair is a candidate; the scheduler then fills the
+      // capacity budget from the candidates sorted by queue priority. The
+      // budget is shared by every action.
+      const candidates: SchedulerPickless[] = [];
       for (const action of actions) {
         for (const task of tasks) {
           if (
@@ -98,6 +150,9 @@ export class Agent {
           candidates.push({ task, action });
         }
       }
+      if (candidates.length === 0) {
+        return;
+      }
       // Queue order: higher priorities first; within the same priority the
       // task whose last update is the oldest is picked first. The sort is
       // stable, so equal candidates keep the actions configuration order.
@@ -107,28 +162,282 @@ export class Agent {
           dateUpdatedValue(a.task.dateUpdated) -
             dateUpdatedValue(b.task.dateUpdated),
       );
-      const tasksToProcess = candidates.slice(0, Math.max(freeSlots, 0));
-      if (tasksToProcess.length === 0) {
-        return;
+      if (this.isSmartSchedulingEnabled()) {
+        await this.selectTasksWithScheduler(candidates, loadProjects);
+      } else {
+        await this.selectTasksWithKillSwitch(candidates, loadProjects);
       }
-      const projectMap = await loadProjects();
-      for (const { task } of tasksToProcess) {
-        this.processingTasks.add(task.id);
-      }
-      // Each task manages its own error handling and in-flight cleanup.
-      await Promise.all(
-        tasksToProcess.map(({ task, action }) =>
-          this.processTask(
-            task,
-            action,
-            projectMap.get(task.projectId) ?? null,
-          ),
-        ),
-      );
     } catch (error) {
       logger.error(
         `Failed to poll tasks from Planner: ${(error as Error).message}`,
       );
+    }
+  }
+
+  // Smart scheduling (default): weighted capacity budget, conflict-aware
+  // greedy first-fit selection and the optional utility-model
+  // pre-evaluation of the tasks without explicit hints.
+  private async selectTasksWithScheduler(
+    candidates: SchedulerPickless[],
+    loadProjects: () => Promise<Map<string, PlannerProject>>,
+  ): Promise<void> {
+    // The project names feed the conflict keys, the utility-model prompt
+    // and the running-task metadata.
+    const projectMap = await loadProjects();
+    const { maxParallel, conflictMode } = this.schedulerOptions();
+    const schedulerCandidates = candidates.map((candidate) => ({
+      task: candidate.task,
+      action: candidate.action,
+      projectName: projectMap.get(candidate.task.projectId)?.name ?? "",
+    }));
+    const options: SchedulerOptions = { maxParallel, conflictMode };
+    // Cost control: only the tasks that could actually be admitted this
+    // poll are pre-evaluated by the utility model.
+    const shortlist = selectEvaluationShortlist(
+      schedulerCandidates,
+      this.processingTasks,
+      options,
+    );
+    const evaluations = await this.taskEvaluator.evaluateAll(
+      shortlist.map((candidate) => ({
+        task: candidate.task,
+        projectName: candidate.projectName,
+      })),
+    );
+    const selection = selectTasks(schedulerCandidates, this.processingTasks, {
+      ...options,
+      evaluations,
+    });
+    this.logSchedulingRound(selection);
+    if (selection.picks.length === 0) {
+      this.recordSchedulerMetrics(selection, candidates.length);
+      return;
+    }
+    this.registerPicks(selection.picks);
+    this.recordSchedulerMetrics(selection, candidates.length - selection.picks.length);
+    // Each task manages its own error handling and in-flight cleanup. The
+    // processing is detached from the poll: the single-flight guard only
+    // protects the selection (through the synchronous registration), so
+    // polling continues while the tasks are running.
+    void this.processPicks(selection.picks, loadProjects);
+  }
+
+  // Kill switch (TASK_SMART_SCHEDULING=false): exactly the historical
+  // count-based selection; weights, conflicts and the utility model are
+  // ignored.
+  private async selectTasksWithKillSwitch(
+    candidates: SchedulerPickless[],
+    loadProjects: () => Promise<Map<string, PlannerProject>>,
+  ): Promise<void> {
+    const tasksToProcess = selectTasksLegacy(
+      candidates,
+      this.config.TASK_MAX_PARALLEL,
+      this.processingTasks.size,
+    );
+    if (tasksToProcess.length === 0) {
+      return;
+    }
+    const picks: SchedulerPick[] = tasksToProcess.map(({ task, action }) => ({
+      task,
+      action,
+      projectName: "",
+      weight: DEFAULT_TASK_WEIGHT,
+      conflictKeys: [],
+    }));
+    this.registerPicks(picks);
+    void this.processPicks(picks, loadProjects);
+  }
+
+  // Registers the picked tasks into the in-flight map synchronously,
+  // before any await: the next poll can never pick them again (double-pick
+  // race). The map is also the metadata backbone of the running-tasks log
+  // and of the capacity and conflict decisions of the following rounds.
+  private registerPicks(picks: SchedulerPick[]): void {
+    const startedAt = Date.now();
+    for (const pick of picks) {
+      this.processingTasks.set(pick.task.id, {
+        taskId: pick.task.id,
+        title: pick.task.title,
+        projectName: pick.projectName,
+        actionKey: actionKeyOf(pick.action),
+        weight: pick.weight,
+        conflictKeys: pick.conflictKeys,
+        startedAt,
+        model: this.resolveTaskModel(pick.task, pick.action),
+      });
+    }
+  }
+
+  // Starts the picked tasks and keeps the in-flight registration paired
+  // with the per-task cleanup: tasks that never reach processTask are
+  // unregistered here so they are picked again on the next poll.
+  private async processPicks(
+    picks: SchedulerPick[],
+    loadProjects: () => Promise<Map<string, PlannerProject>>,
+  ): Promise<void> {
+    const started = new Set<string>();
+    try {
+      const projectMap = await loadProjects();
+      for (const pick of picks) {
+        const runningTask = this.processingTasks.get(pick.task.id);
+        if (runningTask && runningTask.projectName.length === 0) {
+          runningTask.projectName =
+            projectMap.get(pick.task.projectId)?.name ?? "";
+        }
+      }
+      await Promise.all(
+        picks.map(async (pick) => {
+          started.add(pick.task.id);
+          await this.processTask(
+            pick.task,
+            pick.action,
+            projectMap.get(pick.task.projectId) ?? null,
+          );
+        }),
+      );
+    } catch (error) {
+      logger.error(
+        `Failed to start the picked tasks: ${(error as Error).message}`,
+      );
+    } finally {
+      for (const pick of picks) {
+        if (!started.has(pick.task.id)) {
+          this.processingTasks.delete(pick.task.id);
+        }
+      }
+    }
+  }
+
+  private isSmartSchedulingEnabled(): boolean {
+    return this.config.TASK_SMART_SCHEDULING !== false;
+  }
+
+  // Defensive read of the scheduling configuration: validate() runs at
+  // startup only, so a hot-reloaded invalid value falls back to the
+  // default (reported once per value).
+  private schedulerOptions(): { maxParallel: number; conflictMode: ReturnType<typeof normalizeConflictMode> } {
+    const rawBudget = this.config.TASK_MAX_PARALLEL;
+    const maxParallel = sanitizeBudget(rawBudget);
+    if (maxParallel !== rawBudget && this.warnedBudgetValue !== String(rawBudget)) {
+      this.warnedBudgetValue = String(rawBudget);
+      logger.warn(
+        `Invalid TASK_MAX_PARALLEL '${String(rawBudget)}': falling back to ${maxParallel}`,
+      );
+    }
+    const rawMode = this.config.TASK_CONFLICT_MODE;
+    const conflictMode = normalizeConflictMode(rawMode);
+    if (conflictMode !== rawMode && this.warnedConflictModeValue !== String(rawMode)) {
+      this.warnedConflictModeValue = String(rawMode);
+      logger.warn(
+        `Invalid TASK_CONFLICT_MODE '${String(rawMode)}': falling back to '${conflictMode}'`,
+      );
+    }
+    return { maxParallel, conflictMode };
+  }
+
+  // The model resolves to the action model, then the actions default
+  // model; the task description still overrides both (see
+  // BaseCliAgent.resolveModel).
+  private resolveTaskModel(task: PlannerTask, action: AgentAction): string {
+    const defaultModel = action.model || this.agentActions?.defaultModel || "";
+    return resolveModel(task, defaultModel)?.model ?? "";
+  }
+
+  // The running tasks are reported on every poll while tasks are running
+  // (title, project, weight, elapsed time, model): the only intentional
+  // deviation from strict polling silence, so the parallel activity stays
+  // observable in the logs.
+  private logRunningTasks(): void {
+    if (this.processingTasks.size === 0) {
+      return;
+    }
+    const running = [...this.processingTasks.values()];
+    const descriptions = running.map((runningTask) => {
+      const parts = [
+        `weight ${runningTask.weight.toFixed(2)}`,
+        `running ${formatElapsed(Date.now() - runningTask.startedAt)}`,
+      ];
+      if (runningTask.projectName.length > 0) {
+        parts.unshift(`project ${runningTask.projectName}`);
+      }
+      if (runningTask.model.length > 0) {
+        parts.push(`model ${runningTask.model}`);
+      }
+      return `'${runningTask.title}' (${parts.join(", ")})`;
+    });
+    logger.info(
+      `Tasks running (${running.length}, total weight ${runningWeight(this.processingTasks).toFixed(2)}): ${descriptions.join(", ")}`,
+    );
+  }
+
+  // One scheduling-round line per poll when something was picked or
+  // deferred (with the deferral reason), nothing otherwise.
+  private logSchedulingRound(selection: SchedulerSelection): void {
+    if (selection.picks.length === 0 && selection.deferrals.length === 0) {
+      return;
+    }
+    const parts = [
+      selection.picks.length > 0
+        ? `picked: ${selection.picks
+            .map((pick) => `'${pick.task.title}' (weight ${pick.weight.toFixed(2)})`)
+            .join(", ")}`
+        : "picked: none",
+    ];
+    if (selection.deferrals.length > 0) {
+      parts.push(
+        `deferred: ${selection.deferrals
+          .map((deferral) => `'${deferral.task.title}' (${deferral.reason})`)
+          .join(", ")}`,
+      );
+    }
+    logger.info(`Scheduling round: ${parts.join("; ")}`);
+  }
+
+  private initSchedulerMetrics(): void {
+    try {
+      const meter = OTelMeter();
+      this.schedulerMetrics = {
+        runningWeight: meter.createObservableGauge(
+          "scheduler.running-weight",
+          (result) => result.observe(this.lastRunningWeight),
+          "Total scheduling weight of the tasks currently running",
+        ),
+        queueDepth: meter.createObservableGauge(
+          "scheduler.queue-depth",
+          (result) => result.observe(this.lastQueueDepth),
+          "Ready tasks waiting to be admitted by the scheduler",
+        ),
+        picked: meter.createCounter("scheduler.tasks.picked"),
+        deferred: meter.createCounter("scheduler.tasks.deferred"),
+      };
+    } catch {
+      // OpenTelemetry not initialized (e.g. in tests): the metrics stay
+      // disabled and the scheduling keeps working.
+      this.schedulerMetrics = null;
+    }
+  }
+
+  private recordSchedulerMetrics(
+    selection: SchedulerSelection,
+    queueDepth: number,
+  ): void {
+    this.lastRunningWeight = runningWeight(this.processingTasks);
+    this.lastQueueDepth = queueDepth;
+    if (this.schedulerMetrics === null) {
+      return;
+    }
+    if (selection.picks.length > 0) {
+      this.schedulerMetrics.picked.add(selection.picks.length);
+    }
+    const deferredByReason = new Map<string, number>();
+    for (const deferral of selection.deferrals) {
+      const reason = deferral.reason.startsWith("conflict:")
+        ? "conflict"
+        : deferral.reason;
+      deferredByReason.set(reason, (deferredByReason.get(reason) ?? 0) + 1);
+    }
+    for (const [reason, count] of deferredByReason) {
+      this.schedulerMetrics.deferred.add(count, { reason });
     }
   }
 
@@ -176,6 +485,11 @@ export class Agent {
     try {
       const notesFile = this.getTaskNotesFile(task.id);
       await this.writeTaskNotes(task, notesFile, project);
+      // Each task runs in its own working directory so parallel tasks never
+      // share one and cannot collide on the filesystem (the directory is
+      // also stated in the task prompt; see BaseCliAgent.buildTaskPrompt).
+      const taskDir = this.getTaskDir(task.id);
+      await fse.ensureDir(taskDir);
       // The model resolves to the action model, then the actions default
       // model; the task description still overrides both (see
       // BaseCliAgent.resolveModel).
@@ -191,6 +505,7 @@ export class Agent {
           action.timeout ??
           this.agentActions?.defaultTimeout ??
           this.config.TASK_TIMEOUT,
+        cwd: taskDir,
       });
       await this.planner.addTaskComment(task.id, summary);
       await this.planner.updateTaskStatus(task.id, action.statusEnd);
@@ -410,6 +725,26 @@ function extractTaskId(entry: string): string | undefined {
     /^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i,
   );
   return match ? match[1].toLowerCase() : undefined;
+}
+
+// A ready (task, action) pair, before the scheduler resolves the project
+// name and the scheduling metadata.
+interface SchedulerPickless {
+  task: PlannerTask;
+  action: AgentAction;
+}
+
+// Compact elapsed-time rendering for the running-tasks log line.
+function formatElapsed(elapsedMs: number): string {
+  const seconds = Math.max(0, Math.round(elapsedMs / 1000));
+  if (seconds < 60) {
+    return `${seconds}s`;
+  }
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) {
+    return `${minutes}m`;
+  }
+  return `${Math.floor(minutes / 60)}h${minutes % 60}m`;
 }
 
 // Queue order of the priorities: higher ranks are picked first. Unknown or

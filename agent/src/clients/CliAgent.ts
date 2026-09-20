@@ -5,11 +5,20 @@ import type { PlannerTask } from "../PlannerClient";
 // default model, the instruction is prepended to the task information and
 // the timeout is the effective task timeout in seconds (action timeout,
 // then actions default.timeout; missing values fall back to the global
-// TASK_TIMEOUT configuration).
+// TASK_TIMEOUT configuration). The cwd is the per-task working directory
+// (each task runs in its own directory so parallel tasks never share one).
 export interface TaskOptions {
   model?: string;
   instruction?: string;
   timeoutSeconds?: number;
+  cwd?: string;
+}
+
+// Options of a standalone prompt: the model overrides the actions default
+// model and the timeout bounds the CLI call.
+export interface PromptOptions {
+  model?: string;
+  timeoutMs?: number;
 }
 
 /**
@@ -30,7 +39,7 @@ export interface CliAgentClient {
     notesFile: string,
     options?: TaskOptions,
   ): Promise<string>;
-  runPrompt(prompt: string): Promise<string>;
+  runPrompt(prompt: string, options?: PromptOptions): Promise<string>;
   // Models available to the account, or null when the CLI cannot list them
   // (model validation is then skipped).
   listModels(): Promise<string[] | null>;

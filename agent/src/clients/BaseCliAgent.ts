@@ -6,7 +6,7 @@ import { Config, githubTokenEnvName } from "../Config";
 import { ExecFileError, extractErrorDetail, runCli, RunCliOptions } from "../CliUtils";
 import { OTelLogger, OTelTracer } from "../OTelContext";
 import type { PlannerTask } from "../PlannerClient";
-import { CliAgentClient, TaskOptions } from "./CliAgent";
+import { CliAgentClient, PromptOptions, TaskOptions } from "./CliAgent";
 
 const logger = OTelLogger().createModuleLogger("cli-agent");
 
@@ -156,6 +156,10 @@ export abstract class BaseCliAgent implements CliAgentClient {
     options?: TaskOptions,
   ): Promise<string> {
     const span = OTelTracer().startSpan(`${this.name}-client.perform-task`);
+    // Every task runs in its own working directory (provided by the caller)
+    // so parallel tasks never share one and cannot collide on the
+    // filesystem; the notes file directory is the fallback.
+    const workingDir = options?.cwd ?? path.dirname(notesFile);
     const summaryFile = getSummaryFile(notesFile);
     try {
       // Remove any summary file left over from a previous run so only the
@@ -165,7 +169,7 @@ export abstract class BaseCliAgent implements CliAgentClient {
       } catch {
         // Non-fatal: the CLI overwrites the file anyway.
       }
-      const prompt = this.buildTaskPrompt(notesFile, options);
+      const prompt = this.buildTaskPrompt(notesFile, workingDir, options);
       // The model of the matching action or the actions default model; the
       // task description still takes priority over both.
       const model = resolveModel(task, options?.model?.trim() ?? "");
@@ -189,7 +193,7 @@ export abstract class BaseCliAgent implements CliAgentClient {
           timeout:
             (options?.timeoutSeconds ?? this.config.TASK_TIMEOUT) * 1000,
           windowsHide: true,
-          cwd: path.dirname(notesFile),
+          cwd: workingDir,
           maxBuffer: MAX_BUFFER_BYTES,
           killProcessGroup: true,
         },
@@ -255,21 +259,27 @@ export abstract class BaseCliAgent implements CliAgentClient {
   }
 
   // Run a standalone prompt through the CLI and return the reply text.
-  // Used for content generation outside of task execution.
-  public async runPrompt(prompt: string): Promise<string> {
+  // Used for content generation outside of task execution (agent note,
+  // utility-model evaluations, ...). The model defaults to the actions
+  // default model and the timeout to the prompt timeout.
+  public async runPrompt(
+    prompt: string,
+    options?: PromptOptions,
+  ): Promise<string> {
     const span = OTelTracer().startSpan(`${this.name}-client.run-prompt`);
-    const defaultModel = this.defaultModel();
+    const model = options?.model?.trim() || this.defaultModel();
     const args = this.buildPromptArgs(
       prompt,
-      defaultModel.length > 0 ? defaultModel : null,
+      model.length > 0 ? model : null,
     );
+    const timeoutMs = options?.timeoutMs ?? PROMPT_TIMEOUT_MS;
     try {
       const usageBefore = await this.readUsage();
       logger.info(
         `${this.usageLabel()} before prompt: ${formatUsageValue(usageBefore)}`,
       );
       const result = await this.runAgentCli(args, {
-        timeout: PROMPT_TIMEOUT_MS,
+        timeout: timeoutMs,
         windowsHide: true,
         maxBuffer: MAX_BUFFER_BYTES,
         killProcessGroup: true,
@@ -398,6 +408,7 @@ export abstract class BaseCliAgent implements CliAgentClient {
 
   private buildTaskPrompt(
     notesFile: string,
+    workingDir: string,
     options?: TaskOptions,
   ): string {
     const summaryFile = getSummaryFile(notesFile);
@@ -416,6 +427,7 @@ export abstract class BaseCliAgent implements CliAgentClient {
     promptLines.push(
       `Task documentation file: ${notesFile}`,
       "Read the documentation file first: it contains the task description and all comments.",
+      `Working directory: ${workingDir} (this task runs in its own working directory; create all task files there — other tasks may run in parallel in their own directories).`,
       "Git and the GitHub CLI (gh) are already configured with authentication for Git and GitHub operations.",
     );
     const githubTokenEntries = this.config.githubTokenEntries();
@@ -455,8 +467,9 @@ function getSummaryFile(notesFile: string): string {
 // The model is resolved with the task description taking priority over the
 // configured default: a task can request a specific model with an
 // 'agent-model: <model>' line in its description (the legacy
-// 'qoder-model:' line is still accepted).
-function resolveModel(
+// 'qoder-model:' line is still accepted). Exported so the Agent can fill
+// the running-task metadata with the model that will be used.
+export function resolveModel(
   task: PlannerTask,
   defaultModel: string,
 ): { model: string; source: string } | null {
@@ -471,7 +484,7 @@ function resolveModel(
   return null;
 }
 
-function extractTaskModel(description: string): string | null {
+export function extractTaskModel(description: string): string | null {
   const generic = description.match(/^\s*agent-model:\s*(\S+)/im);
   if (generic) {
     return generic[1];

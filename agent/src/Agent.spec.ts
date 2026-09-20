@@ -28,6 +28,7 @@ const mockPlanner = {
 const mockQoder = {
   checkAuthentication: jest.fn(),
   performTask: jest.fn(),
+  runPrompt: jest.fn(),
 };
 
 const AGENT_NOTES_MARKER =
@@ -46,6 +47,7 @@ const WILDCARD_ACTIONS: AgentActionsConfig = {
       model: "",
       instruction: "",
       timeout: null,
+      weight: null,
     },
   ],
 };
@@ -94,6 +96,7 @@ describe("Agent", () => {
       description: string;
       comments: unknown[];
       attachments: unknown[];
+      projectId?: string;
       priority?: string;
       dateUpdated?: string;
     }[],
@@ -131,6 +134,7 @@ describe("Agent", () => {
       mockPlanner.downloadTaskAttachment,
       mockQoder.checkAuthentication,
       mockQoder.performTask,
+      mockQoder.runPrompt,
     ]) {
       mock.mockReset();
     }
@@ -170,11 +174,28 @@ describe("Agent", () => {
 
   it("should poll for tasks immediately and at the configured interval", async () => {
     jest.useFakeTimers();
+    // A poll that is still running makes the next tick skip (single-flight
+    // guard): let the real I/O of each poll complete before advancing to
+    // the next interval.
+    const realSetTimeout = jest.requireActual("timers").setTimeout;
+    const flushPoll = async (): Promise<void> => {
+      await new Promise((resolve) => realSetTimeout(resolve, 5));
+    };
     const agent = createAgent();
     agent.start();
     expect(mockPlanner.getCurrentUser).toHaveBeenCalledTimes(1); // initial poll
+    await flushPoll();
 
-    await jest.advanceTimersByTimeAsync(15000);
+    await jest.advanceTimersByTimeAsync(5000);
+    await flushPoll();
+    expect(mockPlanner.getCurrentUser).toHaveBeenCalledTimes(2);
+
+    await jest.advanceTimersByTimeAsync(5000);
+    await flushPoll();
+    expect(mockPlanner.getCurrentUser).toHaveBeenCalledTimes(3);
+
+    await jest.advanceTimersByTimeAsync(5000);
+    await flushPoll();
     expect(mockPlanner.getCurrentUser).toHaveBeenCalledTimes(4); // initial + 3 polls
     agent.stop();
   });
@@ -764,6 +785,7 @@ describe("Agent", () => {
           model: "",
           instruction: "",
           timeout: null,
+          weight: null,
         },
       ],
     });
@@ -818,6 +840,7 @@ describe("Agent", () => {
           model: "",
           instruction: "",
           timeout: null,
+          weight: null,
         },
       ],
     });
@@ -867,6 +890,7 @@ describe("Agent", () => {
           model: "",
           instruction: "",
           timeout: null,
+          weight: null,
         },
       ],
     });
@@ -917,6 +941,7 @@ describe("Agent", () => {
           model: "",
           instruction: "",
           timeout: null,
+          weight: null,
         },
       ],
     });
@@ -956,6 +981,7 @@ describe("Agent", () => {
           model: "action-model",
           instruction: "Follow the coding guidelines",
           timeout: null,
+          weight: null,
         },
       ],
     });
@@ -1001,6 +1027,7 @@ describe("Agent", () => {
           model: "",
           instruction: "",
           timeout: null,
+          weight: null,
         },
       ],
     });
@@ -1043,6 +1070,7 @@ describe("Agent", () => {
           model: "",
           instruction: "",
           timeout: null,
+          weight: null,
         },
       ],
     });
@@ -1158,6 +1186,7 @@ describe("Agent", () => {
           model: "",
           instruction: "",
           timeout: 1800,
+          weight: null,
         },
       ],
     });
@@ -1200,6 +1229,7 @@ describe("Agent", () => {
           model: "",
           instruction: "",
           timeout: null,
+          weight: null,
         },
       ],
     });
@@ -1243,6 +1273,7 @@ describe("Agent", () => {
           model: "",
           instruction: "",
           timeout: null,
+          weight: null,
         },
       ],
     });
@@ -1557,6 +1588,440 @@ describe("Agent", () => {
 
     expect(mockQoder.performTask).not.toHaveBeenCalled();
     expect(mockPlanner.updateTaskStatus).not.toHaveBeenCalled();
+    agent.stop();
+  });
+
+  it("should fill the weighted capacity budget with fractional TASK_MAX_PARALLEL", async () => {
+    config.TASK_POLLING_INTERVAL = 1;
+    config.TASK_MAX_PARALLEL = 1.9;
+    const resolvers: ((value: string) => void)[] = [];
+    mockPlannerTasks([
+      {
+        id: "task-a",
+        title: "Heavy task",
+        status: "To Do",
+        description: "agent-weight: 1\nDo the heavy work",
+        comments: [],
+        attachments: [],
+      },
+      {
+        id: "task-b",
+        title: "Small task",
+        status: "To Do",
+        description: "agent-weight: 0.5\nDo a small fix",
+        comments: [],
+        attachments: [],
+      },
+      {
+        id: "task-c",
+        title: "Overflowing task",
+        status: "To Do",
+        description: "agent-weight: 0.5\nWould exceed the budget",
+        comments: [],
+        attachments: [],
+      },
+    ]);
+    mockQoder.performTask.mockImplementation(
+      () =>
+        new Promise<string>((resolve) => {
+          resolvers.push(resolve);
+        }),
+    );
+
+    const agent = createAgent();
+    agent.start();
+    // The heavy task and the small task fit 1.9 (1.5 used); the third one
+    // does not fit and is deferred with a reason instead of blocking.
+    await waitFor(() => mockQoder.performTask.mock.calls.length === 2);
+    await new Promise((resolve) => setTimeout(resolve, 1200));
+    expect(mockQoder.performTask).toHaveBeenCalledTimes(2);
+    expect(mockQoder.performTask).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "task-a" }),
+      expect.any(String),
+      expect.anything(),
+    );
+    expect(mockQoder.performTask).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "task-b" }),
+      expect.any(String),
+      expect.anything(),
+    );
+    expect(logSpy.mock.calls.some((call) =>
+      String(call[0]).includes(
+        "Scheduling round: picked: 'Heavy task' (weight 1.00), 'Small task' (weight 0.50); deferred: 'Overflowing task' (capacity)",
+      ),
+    )).toBe(true);
+    // Explicit weight hints need no utility-model evaluation.
+    expect(mockQoder.runPrompt).not.toHaveBeenCalled();
+    resolvers.forEach((resolve) => resolve("done"));
+    agent.stop();
+  });
+
+  it("should defer a task conflicting with a running task and keep picking unrelated tasks", async () => {
+    config.TASK_POLLING_INTERVAL = 1;
+    config.TASK_MAX_PARALLEL = 2;
+    mockPlanner.listProjects.mockResolvedValue([
+      { id: "p1", name: "Web", description: "" },
+    ]);
+    mockPlannerTasks([
+      {
+        id: "task-1",
+        projectId: "p1",
+        title: "Web migration",
+        status: "To Do",
+        description:
+          "Migrate the web app\nagent-lock: repo:acme/web\nSee https://github.com/acme/web",
+        comments: [],
+        attachments: [],
+      },
+      {
+        id: "task-2",
+        projectId: "p1",
+        title: "Web follow-up",
+        status: "To Do",
+        description: "Touch the same https://github.com/acme/web repository",
+        comments: [],
+        attachments: [],
+      },
+      {
+        id: "task-3",
+        projectId: "p1",
+        title: "API fix",
+        status: "To Do",
+        description: "Fix https://github.com/acme/api instead",
+        comments: [],
+        attachments: [],
+      },
+    ]);
+    const resolvers: ((value: string) => void)[] = [];
+    mockQoder.performTask.mockImplementation(
+      () =>
+        new Promise<string>((resolve) => {
+          resolvers.push(resolve);
+        }),
+    );
+
+    const agent = createAgent();
+    agent.start();
+    // Round 1: the migration is picked, the follow-up is deferred with its
+    // conflict key, and the unrelated API task is still picked in the same
+    // round (no head-of-line blocking).
+    await waitFor(() => mockQoder.performTask.mock.calls.length === 2);
+    expect(mockQoder.performTask).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "task-1" }),
+      expect.any(String),
+      expect.anything(),
+    );
+    expect(mockQoder.performTask).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "task-3" }),
+      expect.any(String),
+      expect.anything(),
+    );
+    await waitFor(() =>
+      logSpy.mock.calls.some((call) =>
+        String(call[0]).includes(
+          "deferred: 'Web follow-up' (conflict:repo:acme/web)",
+        ),
+      ),
+    );
+
+    // Round 2: the API task completes, but the migration still claims
+    // 'repo:acme/web' while running, so the follow-up stays deferred.
+    resolvers[1]("API fix done");
+    await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length === 1);
+    await new Promise((resolve) => setTimeout(resolve, 1300));
+    expect(mockQoder.performTask).toHaveBeenCalledTimes(2);
+
+    // Round 3: the migration completes and releases the lock; the follow-up
+    // is finally picked.
+    resolvers[0]("Web migration done");
+    await waitFor(
+      () => mockQoder.performTask.mock.calls.length === 3,
+      5000,
+    );
+    expect(mockQoder.performTask).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "task-2" }),
+      expect.any(String),
+      expect.anything(),
+    );
+    resolvers[2]("Web follow-up done");
+    agent.stop();
+  });
+
+  it("should evaluate hint-less tasks with the utility model and serialize them by repository", async () => {
+    config.TASK_POLLING_INTERVAL = 1;
+    config.TASK_MAX_PARALLEL = 2;
+    config.AGENT_UTILITY_MODEL = "utility-model";
+    mockPlannerTasks([
+      {
+        id: "task-1",
+        title: "Refactor the service",
+        status: "To Do",
+        description: "Refactor the billing service",
+        comments: [],
+        attachments: [],
+      },
+      {
+        id: "task-2",
+        title: "Update the billing docs",
+        status: "To Do",
+        description: "Update the documentation of the billing service",
+        comments: [],
+        attachments: [],
+      },
+    ]);
+    // Both evaluations return the same repository: the second task must not
+    // run in parallel with the first one.
+    mockQoder.runPrompt.mockImplementation(() =>
+      Promise.resolve(
+        JSON.stringify({
+          weight: 0.5,
+          conflicts: ["repo:ACME/Billing"],
+          kind: "code-light",
+        }),
+      ),
+    );
+    let resolveFirst: (value: string) => void = () => undefined;
+    mockQoder.performTask
+      .mockImplementationOnce(
+        () =>
+          new Promise<string>((resolve) => {
+            resolveFirst = resolve;
+          }),
+      )
+      .mockResolvedValue("Done");
+
+    const agent = createAgent();
+    agent.start();
+    await waitFor(() => mockQoder.performTask.mock.calls.length === 1);
+    expect(mockQoder.runPrompt).toHaveBeenCalledTimes(2);
+    expect(mockQoder.runPrompt).toHaveBeenCalledWith(
+      expect.stringContaining("Task title: Refactor the service"),
+      expect.objectContaining({ model: "utility-model" }),
+    );
+    // The evaluated weight (0.5, normalized conflicts) shows in the log.
+    expect(logSpy.mock.calls.some((call) =>
+      String(call[0]).includes("picked: 'Refactor the service' (weight 0.50)"),
+    )).toBe(true);
+
+    await new Promise((resolve) => setTimeout(resolve, 1200));
+    expect(mockQoder.performTask).toHaveBeenCalledTimes(1);
+    expect(logSpy.mock.calls.some((call) =>
+      String(call[0]).includes(
+        "deferred: 'Update the billing docs' (conflict:repo:acme/billing)",
+      ),
+    )).toBe(true);
+    // The evaluations are cached per task content version: the next poll
+    // makes no new utility-model call.
+    await new Promise((resolve) => setTimeout(resolve, 1100));
+    expect(mockQoder.runPrompt).toHaveBeenCalledTimes(2);
+
+    resolveFirst("Refactor done");
+    agent.stop();
+  });
+
+  it("should not call the utility model when AGENT_UTILITY_MODEL is not set", async () => {
+    config.TASK_MAX_PARALLEL = 2;
+    mockPlannerTasks([
+      {
+        id: "task-1",
+        title: "Plain task",
+        status: "To Do",
+        description: "No hints at all",
+        comments: [],
+        attachments: [],
+      },
+    ]);
+    mockQoder.performTask.mockResolvedValue("Done");
+
+    const agent = createAgent();
+    agent.start();
+    await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
+
+    expect(mockQoder.runPrompt).not.toHaveBeenCalled();
+    expect(mockQoder.performTask).toHaveBeenCalledTimes(1);
+    agent.stop();
+  });
+
+  it("should ignore weights, conflicts and the utility model when the smart scheduling is disabled", async () => {
+    config.TASK_POLLING_INTERVAL = 1;
+    config.TASK_SMART_SCHEDULING = false;
+    config.TASK_MAX_PARALLEL = 2;
+    config.AGENT_UTILITY_MODEL = "utility-model";
+    const resolvers: ((value: string) => void)[] = [];
+    mockPlannerTasks([
+      {
+        id: "task-1",
+        title: "Locked task",
+        status: "To Do",
+        description: "agent-lock: repo:acme/web\nFirst work",
+        comments: [],
+        attachments: [],
+      },
+      {
+        id: "task-2",
+        title: "Conflicting task",
+        status: "To Do",
+        description: "agent-lock: repo:acme/web\nSecond work",
+        comments: [],
+        attachments: [],
+      },
+    ]);
+    mockQoder.performTask.mockImplementation(
+      () =>
+        new Promise<string>((resolve) => {
+          resolvers.push(resolve);
+        }),
+    );
+
+    const agent = createAgent();
+    agent.start();
+    // The historical count-based selection picks both tasks although they
+    // share a lock and the utility model is never consulted.
+    await waitFor(() => mockQoder.performTask.mock.calls.length === 2);
+    expect(mockQoder.performTask).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "task-1" }),
+      expect.any(String),
+      expect.anything(),
+    );
+    expect(mockQoder.performTask).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "task-2" }),
+      expect.any(String),
+      expect.anything(),
+    );
+    expect(mockQoder.runPrompt).not.toHaveBeenCalled();
+    resolvers.forEach((resolve) => resolve("done"));
+    agent.stop();
+  });
+
+  it("should run each task in its own working directory under the tasks folder", async () => {
+    config.TASK_STATUS_CLEANUP = "Archived";
+    mockPlannerTasks([
+      {
+        id: "task-1",
+        title: "Implement feature",
+        status: "To Do",
+        description: "Add a feature",
+        comments: [],
+        attachments: [],
+      },
+    ]);
+    mockQoder.performTask.mockResolvedValue("Feature implemented");
+
+    const agent = createAgent();
+    agent.start();
+    await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
+
+    const taskDir = path.join(dataDir, "tasks", "task-1");
+    expect(mockQoder.performTask).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.any(String),
+      expect.objectContaining({ cwd: taskDir }),
+    );
+    expect(await fse.pathExists(taskDir)).toBe(true);
+    agent.stop();
+  });
+
+  it("should log the running tasks with their weight and model on the following polls", async () => {
+    config.TASK_POLLING_INTERVAL = 1;
+    config.TASK_MAX_PARALLEL = 2;
+    const resolvers: ((value: string) => void)[] = [];
+    mockPlannerTasks([
+      {
+        id: "task-1",
+        title: "Small task",
+        status: "To Do",
+        description: "agent-weight: 0.5\nSmall work",
+        comments: [],
+        attachments: [],
+      },
+      {
+        id: "task-2",
+        title: "Large task",
+        status: "To Do",
+        description: "agent-weight: 1\nLarge work",
+        comments: [],
+        attachments: [],
+      },
+    ]);
+    mockQoder.performTask.mockImplementation(
+      () =>
+        new Promise<string>((resolve) => {
+          resolvers.push(resolve);
+        }),
+    );
+
+    const agent = createAgent(
+      {
+        defaultModel: "default-model",
+        defaultTimeout: null,
+        actions: [
+          {
+            project: "",
+            statusStart: "To Do",
+            statusEnd: "Done",
+            model: "",
+            instruction: "",
+            timeout: null,
+            weight: null,
+          },
+        ],
+      },
+    );
+    agent.start();
+    await waitFor(() => mockQoder.performTask.mock.calls.length === 2);
+    await waitFor(() =>
+      logSpy.mock.calls.some((call) =>
+        String(call[0]).includes(
+          "Tasks running (2, total weight 1.50): 'Small task' (weight 0.50",
+        ),
+      ),
+    );
+    expect(logSpy.mock.calls.some((call) =>
+      String(call[0]).includes("'Large task' (weight 1.00") &&
+      String(call[0]).includes("model default-model"),
+    )).toBe(true);
+    resolvers.forEach((resolve) => resolve("done"));
+    agent.stop();
+  });
+
+  it("should never pick a task twice while a poll or its processing is in flight", async () => {
+    config.TASK_POLLING_INTERVAL = 1;
+    // The first poll stalls on the projects request: the following ticks must
+    // be skipped instead of running a second concurrent selection.
+    let resolveProjects: (value: { id: string; name: string; description: string }[]) => void =
+      () => undefined;
+    mockPlanner.listProjects.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveProjects = resolve;
+        }),
+    );
+    mockPlannerTasks([
+      {
+        id: "task-1",
+        title: "Single task",
+        status: "To Do",
+        description: "",
+        comments: [],
+        attachments: [],
+      },
+    ]);
+    mockQoder.performTask.mockImplementation(
+      () => new Promise<string>(() => undefined),
+    );
+
+    const agent = createAgent();
+    agent.start();
+    await waitFor(() => mockPlanner.listProjects.mock.calls.length === 1);
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    expect(mockPlanner.listProjects).toHaveBeenCalledTimes(1);
+
+    // Once the poll completes, the task is picked exactly once and never
+    // again while its processing runs.
+    resolveProjects([{ id: "p1", name: "Web", description: "" }]);
+    await waitFor(() => mockQoder.performTask.mock.calls.length === 1);
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    expect(mockQoder.performTask).toHaveBeenCalledTimes(1);
     agent.stop();
   });
 });

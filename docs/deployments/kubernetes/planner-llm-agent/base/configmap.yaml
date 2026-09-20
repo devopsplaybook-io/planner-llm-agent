@@ -17,6 +17,10 @@ data:
         instruction: Follow the repository coding guidelines and open a PR when the task is done.
         # Per-action task timeout in seconds (optional).
         # timeout: 1800
+        # Scheduling weight of the tasks handled by this action: a number
+        # greater than 0 and at most 1 (optional, default 1; see the
+        # "Parallel scheduling" section of the README).
+        # weight: 0.5
       - project: Backend
         status_start: To Do
         status_end: Done

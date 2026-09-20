@@ -288,6 +288,7 @@ describe("AgentNote", () => {
             model: "DeepSeek-Flash",
             instruction: "Do not modify any code. Post an implementation plan.",
             timeout: null,
+            weight: null,
           },
           {
             project: "Projects",
@@ -296,6 +297,7 @@ describe("AgentNote", () => {
             model: "",
             instruction: "",
             timeout: null,
+            weight: null,
           },
         ],
       };
@@ -337,6 +339,7 @@ describe("AgentNote", () => {
             model: "",
             instruction: longInstruction,
             timeout: null,
+            weight: null,
           },
         ],
       };
@@ -372,6 +375,7 @@ describe("AgentNote", () => {
             model: "",
             instruction: "",
             timeout: null,
+            weight: null,
           },
         ],
       };
