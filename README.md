@@ -325,7 +325,7 @@ Example configuration (hourly updates):
 
 ```bash
 npm run build   # compile TypeScript
-npm run lint    # eslint
+npm run lint    # oxlint
 npm test        # jest
 npm run dev     # run locally against a Planner instance
 ```
