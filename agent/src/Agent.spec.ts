@@ -1591,6 +1591,73 @@ describe("Agent", () => {
     agent.stop();
   });
 
+  it("should use the updated actions on the next poll when they change in place", async () => {
+    config.TASK_POLLING_INTERVAL = 1;
+    const actions: AgentActionsConfig = {
+      defaultModel: "",
+      defaultTimeout: null,
+      actions: [
+        {
+          project: "",
+          statusStart: "To Do",
+          statusEnd: "Done",
+          model: "",
+          instruction: "",
+          timeout: null,
+          weight: null,
+        },
+      ],
+    };
+    mockPlannerTasks([
+      {
+        id: "task-1",
+        title: "Implement feature",
+        status: "To Do",
+        description: "",
+        comments: [],
+        attachments: [],
+      },
+      {
+        id: "task-2",
+        title: "Fix the bug",
+        status: "Backlog",
+        description: "",
+        comments: [],
+        attachments: [],
+      },
+    ]);
+    mockQoder.performTask.mockResolvedValue("Task done");
+
+    const agent = createAgent(actions);
+    agent.start();
+    await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
+    expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith("task-1", "Done");
+
+    // The actions object is updated in place, as AgentActionsManager does on
+    // a configuration change: the next poll uses the new actions.
+    actions.actions = [
+      {
+        project: "",
+        statusStart: "Backlog",
+        statusEnd: "Archived",
+        model: "",
+        instruction: "",
+        timeout: null,
+        weight: null,
+      },
+    ];
+
+    await waitFor(
+      () => mockPlanner.updateTaskStatus.mock.calls.length > 1,
+      4000,
+    );
+    expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith(
+      "task-2",
+      "Archived",
+    );
+    agent.stop();
+  });
+
   it("should fill the weighted capacity budget with fractional TASK_MAX_PARALLEL", async () => {
     config.TASK_POLLING_INTERVAL = 1;
     config.TASK_MAX_PARALLEL = 1.9;
@@ -1747,13 +1814,24 @@ describe("Agent", () => {
         attachments: [],
       },
     ]);
-    const resolvers: ((value: string) => void)[] = [];
+    // The two round-1 tasks are processed in parallel: performTask is
+    // called in a non-deterministic order, so the pending executions are
+    // keyed by task id (a positional index could resolve the migration
+    // instead of the API task and release the conflict lock too early).
+    const resolvers = new Map<string, (value: string) => void>();
     mockQoder.performTask.mockImplementation(
-      () =>
+      (task: { id: string }) =>
         new Promise<string>((resolve) => {
-          resolvers.push(resolve);
+          resolvers.set(task.id, resolve);
         }),
     );
+    const resolveTask = (id: string, value: string): void => {
+      const resolve = resolvers.get(id);
+      if (resolve === undefined) {
+        throw new Error(`No task execution pending for '${id}'`);
+      }
+      resolve(value);
+    };
 
     const agent = createAgent();
     agent.start();
@@ -1781,14 +1859,14 @@ describe("Agent", () => {
 
     // Round 2: the API task completes, but the migration still claims
     // 'repo:acme/web' while running, so the follow-up stays deferred.
-    resolvers[1]("API fix done");
+    resolveTask("task-3", "API fix done");
     await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length === 1);
     await new Promise((resolve) => setTimeout(resolve, 1300));
     expect(mockQoder.performTask).toHaveBeenCalledTimes(2);
 
     // Round 3: the migration completes and releases the lock; the follow-up
     // is finally picked.
-    resolvers[0]("Web migration done");
+    resolveTask("task-1", "Web migration done");
     await waitFor(
       () => mockQoder.performTask.mock.calls.length === 3,
       5000,
@@ -1798,7 +1876,7 @@ describe("Agent", () => {
       expect.any(String),
       expect.anything(),
     );
-    resolvers[2]("Web follow-up done");
+    resolveTask("task-2", "Web follow-up done");
     agent.stop();
   });
 

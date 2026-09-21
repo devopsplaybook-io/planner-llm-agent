@@ -1,6 +1,6 @@
 {
   "name": "agent",
-  "version": "0.14.0",
+  "version": "0.15.0",
   "description": "LLM agent that connects to a Planner instance and executes assigned tasks",
   "author": "",
   "license": "MIT",

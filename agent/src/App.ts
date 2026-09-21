@@ -1,6 +1,6 @@
 import { watchFile } from "fs-extra";
 import { Agent } from "./Agent";
-import { AgentActionsConfig, loadAgentActions } from "./AgentActions";
+import { AgentActionsManager } from "./AgentActionsManager";
 import { AgentConfigRepository } from "./AgentConfigRepository";
 import { AgentNote } from "./AgentNote";
 import { Config } from "./Config";
@@ -50,10 +50,15 @@ Promise.resolve().then(async () => {
   // Agent actions: the YAML file binding projects and start statuses to a
   // model, an instruction and an end status. The format is checked strictly
   // at startup so a misconfiguration fails fast; when the file is missing
-  // the agent starts with no action and processes no task.
-  let agentActions: AgentActionsConfig | null = null;
+  // the agent starts with no action and processes no task. The file is
+  // watched at runtime: a change is applied without a restart, keeping the
+  // last valid configuration when the new content is invalid.
+  const agentActionsManager = new AgentActionsManager(
+    config.AGENT_ACTIONS_FILE,
+  );
+  let actionsFileFound: boolean;
   try {
-    agentActions = await loadAgentActions(config.AGENT_ACTIONS_FILE);
+    actionsFileFound = (await agentActionsManager.load()) !== null;
   } catch (error) {
     logger.error(
       `Invalid agent actions configuration file '${config.AGENT_ACTIONS_FILE}': ${(error as Error).message}`,
@@ -61,15 +66,16 @@ Promise.resolve().then(async () => {
     );
     process.exit(1);
   }
-  if (agentActions === null) {
+  if (!actionsFileFound) {
     logger.warn(
       `Agent actions file not found at '${config.AGENT_ACTIONS_FILE}': no task will be processed`,
     );
   } else {
     logger.info(
-      `Agent actions loaded from '${config.AGENT_ACTIONS_FILE}' (${agentActions.actions.length} action(s))`,
+      `Agent actions loaded from '${config.AGENT_ACTIONS_FILE}' (${agentActionsManager.config.actions.length} action(s))`,
     );
   }
+  agentActionsManager.start();
 
   // OpenTelemetry
   try {
@@ -120,7 +126,7 @@ Promise.resolve().then(async () => {
   // CLI agent client shared by the authentication check and the agent note
   let cliAgent: CliAgentClient;
   try {
-    cliAgent = createCliAgent(config, agentActions);
+    cliAgent = createCliAgent(config, agentActionsManager.config);
   } catch (error) {
     logger.error((error as Error).message, error as Error);
     process.exit(1);
@@ -146,7 +152,7 @@ Promise.resolve().then(async () => {
   }
 
   // Agent
-  const agent = new Agent(config, agentActions);
+  const agent = new Agent(config, agentActionsManager.config);
   agent.start();
 
   // Agent note: a single Planner note named after the agent, regularly
@@ -157,7 +163,7 @@ Promise.resolve().then(async () => {
     config,
     new PlannerClient(config),
     cliAgent,
-    agentActions,
+    agentActionsManager.config,
   );
   if (agentNote.isEnabled()) {
     const updateAgentNote = () => {
