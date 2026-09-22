@@ -94,9 +94,11 @@ spec:
           volumeMounts:
             - mountPath: /data
               name: pod-volume
+            # Mounted as a directory (no subPath): Kubernetes only
+            # propagates ConfigMap updates to directory-mounted volumes, so
+            # the agent can hot-reload the actions file without a restart.
             - name: config-volume
-              mountPath: /etc/planner/llm-agent.yaml
-              subPath: llm-agent.yaml
+              mountPath: /etc/planner
       volumes:
         - name: pod-volume
           persistentVolumeClaim:

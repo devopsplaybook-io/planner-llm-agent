@@ -23,7 +23,7 @@ Configuration values are resolved with the following priority:
 | Variable                | Default                       | Description                                                               |
 | ----------------------- | ----------------------------- | ------------------------------------------------------------------------- |
 | `AGENT_NAME`            | `planner-llm-agent`           | Planner user name the agent acts as (also used in the agent note title)   |
-| `AGENT_ACTIONS_FILE`    | `/etc/planner/llm-agent.yaml` | Path of the agent actions YAML file (see [Agent actions](#agent-actions)) |
+| `AGENT_ACTIONS_FILE`    | `/etc/planner/llm-agent.yaml` | Path of the agent actions YAML file, watched for changes at runtime (see [Agent actions](#agent-actions)) |
 | `PLANNER_URL`           | `http://localhost:8080`       | Planner instance base URL                                                 |
 | `PLANNER_API_KEY`       | (empty)                       | Planner API key (required)                                                |
 | `TASK_POLLING_INTERVAL` | `60`                          | Seconds between polls of assigned tasks                                   |
@@ -266,7 +266,11 @@ For every poll, the agent checks if an assigned task matches the project pattern
 - The format is checked at startup: when the file exists but is invalid (bad YAML, missing or empty required fields, non-string projects, invalid timeouts or weights, unknown fields, duplicate project pattern and start status), the agent exits immediately with the list of problems.
 - When the file does not exist, the agent starts with no action and processes no task (a warning is logged at startup).
 - `TASK_STATUS_CLEANUP` still governs the deletion of the local task folder, whatever end status the task reached.
-- Changes to the file require a restart; the file is not watched.
+- The file is watched while the agent runs: a change is applied without restarting the agent (a few seconds at most after the file changes, plus the Kubernetes ConfigMap propagation delay of about one minute on a volume mount). A file created or fixed after a missing or invalid start is picked up too.
+- A change applies to the tasks picked after it: a running task keeps the model, instruction and timeout resolved when it started. The CLI authentication check and the model validation still run only at startup.
+- A change is a no-op when the file content did not change. When the new content is invalid or the file disappears at runtime (e.g. a transient volume state), the error is logged and the last valid configuration is kept: the agent keeps processing tasks with it and applies the fix as soon as the file is valid again.
+- The file must be mounted as a directory when Kubernetes provides it through a ConfigMap (e.g. `mountPath: /etc/planner`, without `subPath`): Kubernetes only propagates a ConfigMap update to a directory-mounted volume, while a `subPath` single-file mount keeps the content frozen until the pod is recreated (see [Deploying with Kubernetes](docs/deployments/kubernetes/README.md)).
+- The path is resolved at startup: changing `AGENT_ACTIONS_FILE` at runtime (through `config.json`) does not move the watcher; restart the agent to change the path.
 
 The model resolution order combining the actions with the environment configuration is described in [Model selection](#model-selection).
 

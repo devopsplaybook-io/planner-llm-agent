@@ -3,6 +3,9 @@ kind: ConfigMap
 metadata:
   name: planner-llm-agent-config
 data:
+  # Agent actions configuration: the agent watches this file and applies a
+  # change without a restart (the volume is mounted as a directory so
+  # Kubernetes propagates the ConfigMap updates).
   llm-agent.yaml: |
     default:
       model: auto
