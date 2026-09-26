@@ -246,7 +246,7 @@ actions:
     status_start: To Do
     status_end: In Review
     agent: copilot-cli
-    model: DeepSeek-Flash
+    model: GPT-6 Luna
     instruction: Follow the repository coding guidelines and open a PR when the task is done.
     timeout: 1800
     weight: 0.75
