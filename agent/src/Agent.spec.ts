@@ -30,6 +30,11 @@ const mockQoder = {
   performTask: jest.fn(),
   runPrompt: jest.fn(),
 };
+const mockCopilot = {
+  checkAuthentication: jest.fn(),
+  performTask: jest.fn(),
+  runPrompt: jest.fn(),
+};
 
 const AGENT_NOTES_MARKER =
   "<!-- AGENT-NOTES: the content below is maintained by the planner agent. Do not remove this marker. -->";
@@ -124,7 +129,10 @@ describe("Agent", () => {
     config.DATA_DIR = dataDir;
 
     MockedPlannerClient.mockImplementation(() => mockPlanner);
-    MockedCreateCliAgent.mockImplementation(() => mockQoder);
+    MockedCreateCliAgent.mockImplementation(
+      (_config: Config, _actions: AgentActionsConfig, agentName: string) =>
+        agentName === "copilot-cli" ? mockCopilot : mockQoder,
+    );
     for (const mock of [
       mockPlanner.getCurrentUser,
       mockPlanner.listAssignedTasks,
@@ -135,6 +143,9 @@ describe("Agent", () => {
       mockQoder.checkAuthentication,
       mockQoder.performTask,
       mockQoder.runPrompt,
+      mockCopilot.checkAuthentication,
+      mockCopilot.performTask,
+      mockCopilot.runPrompt,
     ]) {
       mock.mockReset();
     }
@@ -169,6 +180,49 @@ describe("Agent", () => {
     expect(console.log).toHaveBeenCalledWith(
       expect.stringContaining("polling every 5 seconds"),
     );
+    agent.stop();
+  });
+
+  it("should dispatch an action to its configured CLI agent", async () => {
+    mockPlannerTasks([
+      {
+        id: "task-1",
+        title: "Project task",
+        status: "To Do",
+        description: "Implement the project change",
+        comments: [],
+        attachments: [],
+      },
+    ]);
+    mockCopilot.performTask.mockResolvedValue("Completed with Copilot");
+    const actions: AgentActionsConfig = {
+      defaultAgent: "qoder",
+      defaultModel: "",
+      defaultTimeout: null,
+      actions: [
+        {
+          project: "",
+          statusStart: "To Do",
+          statusEnd: "Done",
+          agent: "copilot-cli",
+          model: "",
+          instruction: "",
+          timeout: null,
+          weight: null,
+        },
+      ],
+    };
+
+    const agent = createAgent(actions);
+    agent.start();
+    await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
+
+    expect(mockCopilot.performTask).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "task-1" }),
+      expect.any(String),
+      expect.objectContaining({ cwd: expect.any(String) }),
+    );
+    expect(mockQoder.performTask).not.toHaveBeenCalled();
     agent.stop();
   });
 

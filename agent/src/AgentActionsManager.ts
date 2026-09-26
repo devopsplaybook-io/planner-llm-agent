@@ -28,9 +28,11 @@ const WATCH_INTERVAL_MS = 5000;
 export class AgentActionsManager {
   public readonly filePath: string;
   public readonly watchIntervalMs: number;
+  private readonly fallbackAgent: string;
 
   /** The live configuration, updated in place by every successful reload. */
   public readonly config: AgentActionsConfig = {
+    defaultAgent: "qoder",
     defaultModel: "",
     defaultTimeout: null,
     actions: [],
@@ -42,9 +44,15 @@ export class AgentActionsManager {
   private reloadPending = false;
   private watchListener: (() => void) | null = null;
 
-  constructor(filePath: string, watchIntervalMs: number = WATCH_INTERVAL_MS) {
+  constructor(
+    filePath: string,
+    watchIntervalMs: number = WATCH_INTERVAL_MS,
+    fallbackAgent: string = "qoder",
+  ) {
     this.filePath = filePath;
     this.watchIntervalMs = watchIntervalMs;
+    this.fallbackAgent = fallbackAgent;
+    this.config.defaultAgent = fallbackAgent;
   }
 
   /**
@@ -55,7 +63,12 @@ export class AgentActionsManager {
    */
   public async load(): Promise<AgentActionsConfig | null> {
     if (!(await fse.pathExists(this.filePath))) {
-      this.apply({ defaultModel: "", defaultTimeout: null, actions: [] });
+      this.apply({
+        defaultAgent: this.fallbackAgent,
+        defaultModel: "",
+        defaultTimeout: null,
+        actions: [],
+      });
       this.lastContent = null;
       this.missing = true;
       return null;
@@ -164,8 +177,15 @@ export class AgentActionsManager {
 
   // Updates the stable configuration object in place (one synchronous step).
   private apply(parsed: AgentActionsConfig): void {
+    const defaultAgent = (parsed.defaultAgent || this.fallbackAgent)
+      .trim()
+      .toLowerCase();
+    this.config.defaultAgent = defaultAgent;
     this.config.defaultModel = parsed.defaultModel;
     this.config.defaultTimeout = parsed.defaultTimeout;
-    this.config.actions = parsed.actions;
+    this.config.actions = parsed.actions.map((action) => ({
+      ...action,
+      agent: (action.agent || defaultAgent).trim().toLowerCase(),
+    }));
   }
 }

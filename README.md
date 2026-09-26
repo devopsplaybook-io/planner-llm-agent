@@ -238,13 +238,15 @@ The actions of the agent are defined in a YAML file (path `AGENT_ACTIONS_FILE`, 
 
 ```yaml
 default:
+  agent: qoder
   model: DeepSeek-Flash
   timeout: 3600
 actions:
   - project: Web
     status_start: To Do
     status_end: In Review
-    model: DeepSeek-Flash
+    agent: copilot-cli
+    model: GPT-6 Luna
     instruction: Follow the repository coding guidelines and open a PR when the task is done.
     timeout: 1800
     weight: 0.75
@@ -257,7 +259,8 @@ actions:
 
 For every poll, the agent checks if an assigned task matches the project pattern and the start status of an action. Matching tasks are processed with the action model and instruction (on top of the task information) and moved to the action end status once processed (including after a processing failure, same as the default behavior).
 
-- `status_start` and `status_end` are required; `project`, `model`, `instruction`, `timeout` and `weight` are optional. `project` matches any project when missing, null or empty; otherwise it is a case-sensitive glob pattern where `*` matches any sequence of characters (e.g. `Project*` matches `Projects` and `Projects - Planner`). Overlapping patterns are allowed: the first matching action in the list processes the task, and a task whose project cannot be resolved never matches a project-bound action.
+- `status_start` and `status_end` are required; `project`, `agent`, `model`, `instruction`, `timeout` and `weight` are optional. `project` matches any project when missing, null or empty; otherwise it is a case-sensitive glob pattern where `*` matches any sequence of characters (e.g. `Project*` matches `Projects` and `Projects - Planner`). Overlapping patterns are allowed: the first matching action in the list processes the task, and a task whose project cannot be resolved never matches a project-bound action.
+- `default.agent` selects the CLI agent used by default; when omitted, `AGENT_CLI` is used (Qoder by default). An action-level `agent` overrides it. Supported values are `qoder`, `claude-code`, `copilot-cli`, `codex` and `gemini-cli`. Every distinct configured agent is validated and its authentication is checked at startup when `AGENT_AUTH_CHECK` is enabled. `default.model` applies to the default agent; set `model` on an action that uses another agent when it needs a specific model.
 - `weight` is the scheduling weight of the tasks handled by the action (a number greater than 0 and at most 1, e.g. `0.5` for a batch of small routine tasks); an `agent-weight:` line in the task description still takes precedence (see [Parallel scheduling](#parallel-scheduling)).
 - `default.model` is the fallback model for actions without their own model, and `default.timeout` is the fallback timeout for actions without their own timeout.
 - The task timeout is resolved per task with the following priority: the `timeout` of the matching action, then `default.timeout`, then the global `TASK_TIMEOUT` configuration (default `3600` = 1 hour). It must be a positive integer in seconds.
@@ -267,7 +270,7 @@ For every poll, the agent checks if an assigned task matches the project pattern
 - When the file does not exist, the agent starts with no action and processes no task (a warning is logged at startup).
 - `TASK_STATUS_CLEANUP` still governs the deletion of the local task folder, whatever end status the task reached.
 - The file is watched while the agent runs: a change is applied without restarting the agent (a few seconds at most after the file changes, plus the Kubernetes ConfigMap propagation delay of about one minute on a volume mount). A file created or fixed after a missing or invalid start is picked up too.
-- A change applies to the tasks picked after it: a running task keeps the model, instruction and timeout resolved when it started. The CLI authentication check and the model validation still run only at startup.
+- A change applies to the tasks picked after it: a running task keeps the agent, model, instruction and timeout resolved when it started. The CLI authentication check and the model validation still run only at startup.
 - A change is a no-op when the file content did not change. When the new content is invalid or the file disappears at runtime (e.g. a transient volume state), the error is logged and the last valid configuration is kept: the agent keeps processing tasks with it and applies the fix as soon as the file is valid again.
 - The file must be mounted as a directory when Kubernetes provides it through a ConfigMap (e.g. `mountPath: /etc/planner`, without `subPath`): Kubernetes only propagates a ConfigMap update to a directory-mounted volume, while a `subPath` single-file mount keeps the content frozen until the pod is recreated (see [Deploying with Kubernetes](docs/deployments/kubernetes/README.md)).
 - The path is resolved at startup: changing `AGENT_ACTIONS_FILE` at runtime (through `config.json`) does not move the watcher; restart the agent to change the path.

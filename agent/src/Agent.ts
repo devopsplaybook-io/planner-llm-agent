@@ -41,6 +41,8 @@ export class Agent {
   private agentActions: AgentActionsConfig | null;
   private planner: PlannerClient;
   private cliAgent: CliAgentClient;
+  private cliAgents: Map<string, CliAgentClient>;
+  private defaultAgent: string;
   private taskEvaluator: TaskEvaluator;
   private pollingTimer?: NodeJS.Timeout;
   // Tasks currently being processed with their scheduling metadata: they
@@ -69,11 +71,24 @@ export class Agent {
   private warnedBudgetValue: string | null = null;
   private warnedConflictModeValue: string | null = null;
 
-  constructor(config: Config, agentActions?: AgentActionsConfig | null) {
+  constructor(
+    config: Config,
+    agentActions?: AgentActionsConfig | null,
+    cliAgents?: Map<string, CliAgentClient>,
+  ) {
     this.config = config;
     this.agentActions = agentActions ?? null;
     this.planner = new PlannerClient(config);
-    this.cliAgent = createCliAgent(config, this.agentActions);
+    this.defaultAgent =
+      this.agentActions?.defaultAgent || config.AGENT_CLI;
+    this.cliAgents = cliAgents ?? new Map();
+    if (!this.cliAgents.has(this.defaultAgent)) {
+      this.cliAgents.set(
+        this.defaultAgent,
+        createCliAgent(config, this.agentActions, this.defaultAgent),
+      );
+    }
+    this.cliAgent = this.cliAgents.get(this.defaultAgent)!;
     this.taskEvaluator = new TaskEvaluator(config, this.cliAgent);
     this.initSchedulerMetrics();
   }
@@ -497,12 +512,20 @@ export class Agent {
       // The model resolves to the action model, then the actions default
       // model; the task description still overrides both (see
       // BaseCliAgent.resolveModel).
+      const currentDefaultAgent =
+        this.agentActions?.defaultAgent || this.config.AGENT_CLI;
+      const selectedAgent = action.agent || currentDefaultAgent;
       const defaultModel =
-        action.model || this.agentActions?.defaultModel || "";
+        action.model ||
+        (selectedAgent === currentDefaultAgent
+          ? this.agentActions?.defaultModel
+          : "") ||
+        "";
       // The timeout resolves to the action timeout, then the actions
       // default timeout; when neither is configured the global TASK_TIMEOUT
       // (which defaults to 1 hour) applies (see BaseCliAgent.performTask).
-      const summary = await this.cliAgent.performTask(task, notesFile, {
+      const cliAgent = this.getCliAgent(selectedAgent);
+      const summary = await cliAgent.performTask(task, notesFile, {
         model: defaultModel,
         instruction: action.instruction,
         timeoutSeconds:
@@ -542,6 +565,15 @@ export class Agent {
     } finally {
       this.processingTasks.delete(task.id);
     }
+  }
+
+  private getCliAgent(agentName: string): CliAgentClient {
+    let cliAgent = this.cliAgents.get(agentName);
+    if (!cliAgent) {
+      cliAgent = createCliAgent(this.config, this.agentActions, agentName);
+      this.cliAgents.set(agentName, cliAgent);
+    }
+    return cliAgent;
   }
 
   // Notifies the user that the agent started working on the task.

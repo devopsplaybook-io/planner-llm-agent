@@ -47,14 +47,16 @@ Promise.resolve().then(async () => {
     });
   });
 
-  // Agent actions: the YAML file binding projects and start statuses to a
-  // model, an instruction and an end status. The format is checked strictly
+  // Agent actions: the YAML file binds projects and start statuses to a
+  // CLI agent, model, instruction and end status. The format is checked strictly
   // at startup so a misconfiguration fails fast; when the file is missing
   // the agent starts with no action and processes no task. The file is
   // watched at runtime: a change is applied without a restart, keeping the
   // last valid configuration when the new content is invalid.
   const agentActionsManager = new AgentActionsManager(
     config.AGENT_ACTIONS_FILE,
+    undefined,
+    config.AGENT_CLI,
   );
   let actionsFileFound: boolean;
   try {
@@ -123,36 +125,54 @@ Promise.resolve().then(async () => {
     logger.info("Agent config repository not configured");
   }
 
-  // CLI agent client shared by the authentication check and the agent note
-  let cliAgent: CliAgentClient;
+  // Create and validate every CLI agent selected by the default or an action.
+  const configuredAgents = new Set([
+    agentActionsManager.config.defaultAgent || config.AGENT_CLI,
+    ...agentActionsManager.config.actions.map(
+      (action) =>
+        action.agent ||
+        agentActionsManager.config.defaultAgent ||
+        config.AGENT_CLI,
+    ),
+  ]);
+  const cliAgents = new Map<string, CliAgentClient>();
   try {
-    cliAgent = createCliAgent(config, agentActionsManager.config);
+    for (const agentName of configuredAgents) {
+      cliAgents.set(
+        agentName,
+        createCliAgent(config, agentActionsManager.config, agentName),
+      );
+    }
   } catch (error) {
     logger.error((error as Error).message, error as Error);
     process.exit(1);
   }
 
-  // Check the CLI agent authentication
+  // Check authentication for every CLI agent used by the actions.
   if (config.AGENT_AUTH_CHECK === "true" || config.AGENT_AUTH_CHECK === "1") {
-    try {
-      await cliAgent.checkAuthentication();
-      logger.info(
-        `${cliAgent.displayName} authentication verified (CLI: ${cliAgent.name})`,
-      );
-    } catch (error) {
-      logger.error(
-        `${cliAgent.displayName} authentication check failed`,
-        error as Error,
-      );
-      logger.error(cliAgent.authHint);
-      process.exit(1);
+    for (const cliAgent of cliAgents.values()) {
+      try {
+        await cliAgent.checkAuthentication();
+        logger.info(
+          `${cliAgent.displayName} authentication verified (CLI: ${cliAgent.name})`,
+        );
+      } catch (error) {
+        logger.error(
+          `${cliAgent.displayName} authentication check failed`,
+          error as Error,
+        );
+        logger.error(cliAgent.authHint);
+        process.exit(1);
+      }
     }
   } else {
-    logger.info(`${cliAgent.displayName} authentication check disabled`);
+    for (const cliAgent of cliAgents.values()) {
+      logger.info(`${cliAgent.displayName} authentication check disabled`);
+    }
   }
 
   // Agent
-  const agent = new Agent(config, agentActionsManager.config);
+  const agent = new Agent(config, agentActionsManager.config, cliAgents);
   agent.start();
 
   // Agent note: a single Planner note named after the agent, regularly
@@ -162,7 +182,7 @@ Promise.resolve().then(async () => {
   const agentNote = new AgentNote(
     config,
     new PlannerClient(config),
-    cliAgent,
+    cliAgents.get(agentActionsManager.config.defaultAgent || config.AGENT_CLI)!,
     agentActionsManager.config,
   );
   if (agentNote.isEnabled()) {
