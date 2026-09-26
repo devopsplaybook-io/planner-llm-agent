@@ -68,8 +68,15 @@ describe("AgentActionsManager", () => {
   const writeActions = (content: string): Promise<void> =>
     fse.writeFile(filePath, content);
 
-  const createManager = (watchIntervalMs = 10): AgentActionsManager => {
-    const manager = new AgentActionsManager(filePath, watchIntervalMs);
+  const createManager = (
+    watchIntervalMs = 10,
+    fallbackAgent = "qoder",
+  ): AgentActionsManager => {
+    const manager = new AgentActionsManager(
+      filePath,
+      watchIntervalMs,
+      fallbackAgent,
+    );
     managers.push(manager);
     return manager;
   };
@@ -100,6 +107,7 @@ describe("AgentActionsManager", () => {
 
     expect(config).toBe(manager.config);
     expect(manager.config).toEqual({
+      defaultAgent: "qoder",
       defaultModel: "default-model",
       defaultTimeout: null,
       actions: [
@@ -113,10 +121,45 @@ describe("AgentActionsManager", () => {
 
     await expect(manager.load()).resolves.toBeNull();
     expect(manager.config).toEqual({
+      defaultAgent: "qoder",
       defaultModel: "",
       defaultTimeout: null,
       actions: [],
     });
+  });
+
+  it("should use the configured default agent unless an action overrides it", async () => {
+    await writeActions(
+      [
+        "default:",
+        "  agent: qoder",
+        "actions:",
+        "  - status_start: To Do",
+        "    status_end: Done",
+        "  - status_start: Plan",
+        "    status_end: Review",
+        "    agent: copilot-cli",
+      ].join("\n"),
+    );
+    const manager = createManager(10, "claude-code");
+
+    await manager.load();
+
+    expect(manager.config.defaultAgent).toBe("qoder");
+    expect(manager.config.actions.map((action) => action.agent)).toEqual([
+      "qoder",
+      "copilot-cli",
+    ]);
+  });
+
+  it("should fall back to AGENT_CLI when the YAML has no default agent", async () => {
+    await writeActions(VALID_ACTIONS);
+    const manager = createManager(10, "copilot-cli");
+
+    await manager.load();
+
+    expect(manager.config.defaultAgent).toBe("copilot-cli");
+    expect(manager.config.actions[0].agent).toBe("copilot-cli");
   });
 
   it("should throw when the file exists but is invalid", async () => {

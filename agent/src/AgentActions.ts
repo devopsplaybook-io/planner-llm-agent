@@ -1,5 +1,6 @@
 import * as fse from "fs-extra";
 import { parse } from "yaml";
+import { CLI_AGENT_NAMES } from "./Config";
 
 /**
  * One action of the agent: the tasks matching the project pattern and the
@@ -18,6 +19,7 @@ export interface AgentAction {
   project: string;
   statusStart: string;
   statusEnd: string;
+  agent?: string;
   model: string;
   instruction: string;
   timeout: number | null;
@@ -31,6 +33,7 @@ export interface AgentAction {
  * themselves.
  */
 export interface AgentActionsConfig {
+  defaultAgent?: string;
   defaultModel: string;
   defaultTimeout: number | null;
   actions: AgentAction[];
@@ -41,18 +44,20 @@ export interface AgentActionsConfig {
  * checked strictly so a misconfiguration fails fast at startup:
  *
  * default:
+ *   agent: <CLI agent name>
  *   model: <model name>
  *   timeout: <seconds>
  * actions:
  *   - project: <project pattern>
  *     status_start: <status name>
  *     status_end: <status name>
+ *     agent: <CLI agent name>
  *     model: <model name>
  *     instruction: <instruction>
  *     timeout: <seconds>
  *
- * 'default' and per-action 'model'/'instruction'/'timeout'/'weight' are
- * optional; 'project' is optional too: a missing, null or empty project
+ * 'default' and per-action 'agent'/'model'/'instruction'/'timeout'/'weight'
+ * are optional; 'project' is optional too: a missing, null or empty project
  * matches any project, and a non-empty project is a glob pattern where '*'
  * matches any sequence of characters. Everything else is required and
  * unknown fields are rejected. Throws an Error listing every problem found
@@ -94,9 +99,18 @@ export function parseAgentActions(content: string): AgentActionsConfig {
     } else {
       const defaults = root.default as Record<string, unknown>;
       for (const key of Object.keys(defaults)) {
-        if (key !== "model" && key !== "timeout") {
+        if (key !== "agent" && key !== "model" && key !== "timeout") {
           errors.push(`Unknown 'default' field '${key}'`);
         }
+      }
+      const agent = readAgent(
+        defaults,
+        "agent",
+        "default.agent",
+        errors,
+      );
+      if (agent !== null) {
+        config.defaultAgent = agent;
       }
       const model = defaults.model;
       if (model !== undefined) {
@@ -136,6 +150,7 @@ export function parseAgentActions(content: string): AgentActionsConfig {
             "project",
             "status_start",
             "status_end",
+            "agent",
             "model",
             "instruction",
             "timeout",
@@ -160,6 +175,12 @@ export function parseAgentActions(content: string): AgentActionsConfig {
         action,
         "status_end",
         `actions[${index}].status_end`,
+        errors,
+      );
+      const agent = readAgent(
+        action,
+        "agent",
+        `actions[${index}].agent`,
         errors,
       );
       const model = readString(
@@ -203,6 +224,7 @@ export function parseAgentActions(content: string): AgentActionsConfig {
           project: project,
           statusStart: statusStart,
           statusEnd: statusEnd,
+          ...(agent === null ? {} : { agent }),
           model: model ?? "",
           instruction: instruction ?? "",
           timeout: timeout,
@@ -302,6 +324,26 @@ function readString(
     return null;
   }
   return value.trim();
+}
+
+function readAgent(
+  source: Record<string, unknown>,
+  field: string,
+  label: string,
+  errors: string[],
+): string | null {
+  const agent = readString(source, field, label, errors, true);
+  if (agent === null) {
+    return null;
+  }
+  const selector = agent.toLowerCase();
+  if (!CLI_AGENT_NAMES.includes(selector as (typeof CLI_AGENT_NAMES)[number])) {
+    errors.push(
+      `'${label}' must be one of ${CLI_AGENT_NAMES.join(", ")} (current value: '${agent}')`,
+    );
+    return null;
+  }
+  return selector;
 }
 
 // Reads an optional positive integer field (a timeout in seconds); missing

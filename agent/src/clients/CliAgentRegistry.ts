@@ -8,29 +8,37 @@ import { GeminiClient } from "./GeminiClient";
 import { QoderClient } from "./QoderClient";
 
 /**
- * Creates the CLI agent client selected by AGENT_CLI. The value is matched
+ * Creates the requested CLI agent client. The value is matched
  * case-insensitively; an unknown value throws so a misconfiguration fails
  * fast at startup.
  */
 export function createCliAgent(
   config: Config,
   agentActions?: AgentActionsConfig | null,
+  agentName: string = config.AGENT_CLI,
 ): CliAgentClient {
-  const selector = config.AGENT_CLI.trim().toLowerCase();
+  const selector = agentName.trim().toLowerCase();
+  const defaultAgent = (
+    agentActions?.defaultAgent || config.AGENT_CLI
+  ).trim().toLowerCase();
+  const clientActions =
+    agentActions && selector !== defaultAgent
+      ? { ...agentActions, defaultModel: "" }
+      : agentActions;
   switch (selector) {
     case "qoder":
-      return new QoderClient(config, agentActions);
+      return new QoderClient(config, clientActions);
     case "claude-code":
-      return new ClaudeCodeClient(config, agentActions);
+      return new ClaudeCodeClient(config, clientActions);
     case "copilot-cli":
-      return new CopilotCliClient(config, agentActions);
+      return new CopilotCliClient(config, clientActions);
     case "codex":
-      return new CodexClient(config, agentActions);
+      return new CodexClient(config, clientActions);
     case "gemini-cli":
-      return new GeminiClient(config, agentActions);
+      return new GeminiClient(config, clientActions);
     default:
       throw new Error(
-        `AGENT_CLI '${config.AGENT_CLI}' is not supported (supported CLIs: ${CLI_AGENT_NAMES.join(", ")})`,
+        `Agent '${agentName}' is not supported (supported CLIs: ${CLI_AGENT_NAMES.join(", ")})`,
       );
   }
 }

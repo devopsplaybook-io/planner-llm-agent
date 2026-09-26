@@ -55,6 +55,23 @@ describe("AgentActions", () => {
       });
     });
 
+    it("should parse default and per-action CLI agents", () => {
+      const config = parseAgentActions(
+        [
+          "default:",
+          "  agent: qoder",
+          "actions:",
+          "  - project: Project*",
+          "    status_start: To Do",
+          "    status_end: Done",
+          "    agent: copilot-cli",
+        ].join("\n"),
+      );
+
+      expect(config.defaultAgent).toBe("qoder");
+      expect(config.actions[0].agent).toBe("copilot-cli");
+    });
+
     it("should parse a minimal configuration without defaults", () => {
       const config = parseAgentActions(
         [
@@ -247,6 +264,31 @@ describe("AgentActions", () => {
           ].join("\n"),
         ),
       ).toThrow(/Unknown 'default' field 'instruction'/);
+    });
+
+    it("should reject an empty configured agent", () => {
+      expect(() =>
+        parseAgentActions(
+          [
+            "default:",
+            '  agent: " "',
+            "actions: []",
+          ].join("\n"),
+        ),
+      ).toThrow(/'default.agent' must be a non-empty string/);
+    });
+
+    it("should reject an unsupported configured agent", () => {
+      expect(() =>
+        parseAgentActions(
+          [
+            "actions:",
+            "  - status_start: To Do",
+            "    status_end: Done",
+            "    agent: unknown-cli",
+          ].join("\n"),
+        ),
+      ).toThrow(/'actions\[0\]\.agent' must be one of qoder/);
     });
 
     it("should throw on invalid default timeout values", () => {

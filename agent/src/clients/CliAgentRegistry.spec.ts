@@ -50,6 +50,35 @@ describe("CliAgentRegistry", () => {
     expect(createCliAgent(config)).toBeInstanceOf(ClaudeCodeClient);
   });
 
+  it("should allow an action to select a different CLI agent", () => {
+    const config = new Config();
+    config.AGENT_CLI = "qoder";
+
+    expect(createCliAgent(config, null, "copilot-cli")).toBeInstanceOf(
+      CopilotCliClient,
+    );
+  });
+
+  it("should not apply the default agent model to another CLI", () => {
+    const config = new Config();
+    const actions = {
+      defaultAgent: "qoder",
+      defaultModel: "DeepSeek-Flash",
+      defaultTimeout: null,
+      actions: [],
+    };
+    const client = createCliAgent(config, actions, "copilot-cli") as
+      | CopilotCliClient
+      | QoderClient;
+    const probeArgs = (
+      client as unknown as {
+        buildAuthCheckArgs: (prompt: string) => string[];
+      }
+    ).buildAuthCheckArgs("Reply with exactly: OK");
+
+    expect(probeArgs).not.toContain("DeepSeek-Flash");
+  });
+
   it("should pass the agent actions to the created client", () => {
     const config = new Config();
     const agentActions = {
@@ -79,7 +108,7 @@ describe("CliAgentRegistry", () => {
     const config = new Config();
     config.AGENT_CLI = "unknown-cli";
     expect(() => createCliAgent(config)).toThrow(
-      "AGENT_CLI 'unknown-cli' is not supported (supported CLIs: qoder, claude-code, copilot-cli, codex, gemini-cli)",
+      "Agent 'unknown-cli' is not supported (supported CLIs: qoder, claude-code, copilot-cli, codex, gemini-cli)",
     );
   });
 });
