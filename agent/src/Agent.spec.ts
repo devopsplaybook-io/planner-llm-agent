@@ -5,6 +5,7 @@ import { Agent } from "./Agent";
 import { AgentActionsConfig } from "./AgentActions";
 import { Config } from "./Config";
 import { createCliAgent } from "./clients/CliAgentRegistry";
+import type { CliAgentClient } from "./clients/CliAgent";
 import { PlannerClient } from "./PlannerClient";
 
 jest.mock("./PlannerClient", () => ({
@@ -27,11 +28,13 @@ const mockPlanner = {
 };
 const mockQoder = {
   checkAuthentication: jest.fn(),
+  prepare: jest.fn(),
   performTask: jest.fn(),
   runPrompt: jest.fn(),
 };
 const mockCopilot = {
   checkAuthentication: jest.fn(),
+  prepare: jest.fn(),
   performTask: jest.fn(),
   runPrompt: jest.fn(),
 };
@@ -141,9 +144,11 @@ describe("Agent", () => {
       mockPlanner.updateTaskStatus,
       mockPlanner.downloadTaskAttachment,
       mockQoder.checkAuthentication,
+      mockQoder.prepare,
       mockQoder.performTask,
       mockQoder.runPrompt,
       mockCopilot.checkAuthentication,
+      mockCopilot.prepare,
       mockCopilot.performTask,
       mockCopilot.runPrompt,
     ]) {
@@ -223,6 +228,58 @@ describe("Agent", () => {
       expect.objectContaining({ cwd: expect.any(String) }),
     );
     expect(mockQoder.performTask).not.toHaveBeenCalled();
+    agent.stop();
+  });
+
+  it("should prepare a CLI agent introduced by an action loaded after startup", async () => {
+    mockPlannerTasks([
+      {
+        id: "task-1",
+        title: "Hot-reloaded task",
+        status: "To Do",
+        description: "Implement the project change",
+        comments: [],
+        attachments: [],
+      },
+    ]);
+    const order: string[] = [];
+    mockCopilot.prepare.mockImplementation(async () => {
+      order.push("prepare");
+    });
+    mockCopilot.performTask.mockImplementation(async () => {
+      order.push("performTask");
+      return "Completed with Copilot";
+    });
+    const actions: AgentActionsConfig = {
+      defaultAgent: "qoder",
+      defaultModel: "",
+      defaultTimeout: null,
+      actions: [
+        {
+          project: "",
+          statusStart: "To Do",
+          statusEnd: "Done",
+          agent: "copilot-cli",
+          model: "",
+          instruction: "",
+          timeout: null,
+          weight: null,
+        },
+      ],
+    };
+    // The startup map only holds the default agent: copilot-cli is created
+    // at runtime, when the action requiring it is processed.
+    const startupAgents = new Map<string, CliAgentClient>([
+      ["qoder", mockQoder as unknown as CliAgentClient],
+    ]);
+
+    const agent = new Agent(config, actions, startupAgents);
+    agents.push(agent);
+    agent.start();
+    await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
+
+    expect(mockCopilot.prepare).toHaveBeenCalledTimes(1);
+    expect(order).toEqual(["prepare", "performTask"]);
     agent.stop();
   });
 

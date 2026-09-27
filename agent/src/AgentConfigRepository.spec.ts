@@ -286,6 +286,21 @@ describe("AgentConfigRepository", () => {
       expect(skills[0].description.endsWith("...")).toBe(true);
       expect(skills[0].description.startsWith("Use when very")).toBe(true);
     });
+
+    it("reads the skills when the configured folder is the skills folder", async () => {
+      config.AGENT_CONFIG_REPOSITORY = REPOSITORY;
+      config.AGENT_CONFIG_FOLDER = "skills";
+      await writeSkill(
+        "direct",
+        ["---", "name: direct", "description: Kept directly.", "---"].join(
+          "\n",
+        ),
+      );
+
+      await expect(listAgentSkills(config)).resolves.toEqual([
+        { name: "direct", description: "Kept directly." },
+      ]);
+    });
   });
 
   it("skips the sync while another sync is already running", async () => {

@@ -35,7 +35,13 @@ function normalizeFolderPath(value: string): string {
  * (one directory per skill, each with its SKILL.md file).
  */
 export function getAgentSkillsPath(config: Config): string {
-  return path.join(getAgentConfigContentPath(config), "skills");
+  const contentPath = getAgentConfigContentPath(config);
+  // AGENT_CONFIG_FOLDER may point at the skills folder itself (e.g. a
+  // sparse checkout of the repository's 'skills' folder): the synced
+  // content path then already is the skills directory.
+  return path.basename(contentPath) === "skills"
+    ? contentPath
+    : path.join(contentPath, "skills");
 }
 
 // A skill of the config repository, with its name and a short description

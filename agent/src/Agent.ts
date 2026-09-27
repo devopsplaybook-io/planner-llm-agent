@@ -7,7 +7,7 @@ import {
 } from "./AgentActions";
 import { Config } from "./Config";
 import { createCliAgent } from "./clients/CliAgentRegistry";
-import type { CliAgentClient } from "./clients/CliAgent";
+import { prepareCliAgent, type CliAgentClient } from "./clients/CliAgent";
 import { resolveModel } from "./clients/BaseCliAgent";
 import { OTelLogger, OTelMeter } from "./OTelContext";
 import { PlannerClient, PlannerProject, PlannerTask } from "./PlannerClient";
@@ -524,7 +524,7 @@ export class Agent {
       // The timeout resolves to the action timeout, then the actions
       // default timeout; when neither is configured the global TASK_TIMEOUT
       // (which defaults to 1 hour) applies (see BaseCliAgent.performTask).
-      const cliAgent = this.getCliAgent(selectedAgent);
+      const cliAgent = await this.getCliAgent(selectedAgent);
       const summary = await cliAgent.performTask(task, notesFile, {
         model: defaultModel,
         instruction: action.instruction,
@@ -567,11 +567,14 @@ export class Agent {
     }
   }
 
-  private getCliAgent(agentName: string): CliAgentClient {
+  private async getCliAgent(agentName: string): Promise<CliAgentClient> {
     let cliAgent = this.cliAgents.get(agentName);
     if (!cliAgent) {
       cliAgent = createCliAgent(this.config, this.agentActions, agentName);
       this.cliAgents.set(agentName, cliAgent);
+      // A CLI introduced by a hot-reloaded action is created outside the
+      // startup preparation pass, so prepare it on first use.
+      await prepareCliAgent(cliAgent);
     }
     return cliAgent;
   }

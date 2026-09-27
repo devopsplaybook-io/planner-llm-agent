@@ -1,4 +1,7 @@
 import type { PlannerTask } from "../PlannerClient";
+import { OTelLogger } from "../OTelContext";
+
+const logger = OTelLogger().createModuleLogger("cli-agent");
 
 // Task execution options coming from the matching action of the agent
 // actions configuration: the model is the action model or the actions
@@ -54,4 +57,19 @@ export interface CliAgentClient {
   readUsage(): Promise<number | null>;
   // Human-readable usage fact for the agent note.
   usageSummary(): Promise<string>;
+}
+
+// Runs the optional preparation of a CLI agent (startup, or first use when
+// an action introduced the CLI at runtime); a failure is logged and must
+// not stop the agent.
+export async function prepareCliAgent(
+  cliAgent: CliAgentClient,
+): Promise<void> {
+  try {
+    await cliAgent.prepare?.();
+  } catch (error) {
+    logger.warn(
+      `${cliAgent.displayName} preparation failed (continuing): ${(error as Error).message}`,
+    );
+  }
 }
