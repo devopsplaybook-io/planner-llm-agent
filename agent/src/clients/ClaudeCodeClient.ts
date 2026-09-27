@@ -1,4 +1,9 @@
-import { extractEnvelopeNumber, extractEnvelopeString } from "./CliOutput";
+import type { AgentSessionTokens } from "../AgentSessionMetrics";
+import {
+  extractClaudeStyleTokenUsage,
+  extractEnvelopeNumber,
+  extractEnvelopeString,
+} from "./CliOutput";
 import { BaseCliAgent } from "./BaseCliAgent";
 
 // Claude Code (https://code.claude.com/docs/en/headless): a headless run
@@ -45,6 +50,11 @@ export class ClaudeCodeClient extends BaseCliAgent {
 
   protected extractUsage(stdout: string): number | null {
     return extractEnvelopeNumber(stdout, "total_cost_usd");
+  }
+
+  // The envelope reports a 'usage' object with the token counts of the run.
+  protected extractTokenUsage(stdout: string): AgentSessionTokens | null {
+    return extractClaudeStyleTokenUsage(stdout);
   }
 
   protected buildListModelArgs(): string[] | null {

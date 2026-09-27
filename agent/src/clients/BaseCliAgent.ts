@@ -2,6 +2,10 @@ import * as fse from "fs-extra";
 import * as path from "path";
 import type { AgentActionsConfig } from "../AgentActions";
 import { getAgentConfigContentPath, listAgentSkills } from "../AgentConfigRepository";
+import {
+  AgentSessionMetrics,
+  AgentSessionTokens,
+} from "../AgentSessionMetrics";
 import { Config, githubTokenEnvName } from "../Config";
 import { ExecFileError, extractErrorDetail, runCli, RunCliOptions } from "../CliUtils";
 import { OTelLogger, OTelTracer } from "../OTelContext";
@@ -25,6 +29,9 @@ const MAX_BUFFER_BYTES = 10 * 1024 * 1024;
 export abstract class BaseCliAgent implements CliAgentClient {
   protected config: Config;
   protected agentActions: AgentActionsConfig | null;
+  // One session per task execution is recorded (metrics are disabled when
+  // OpenTelemetry is not initialized).
+  protected sessionMetrics = new AgentSessionMetrics();
   // Models available to the account, fetched once from the CLI and cached
   // for the lifetime of the client (undefined until the first fetch).
   private availableModels: string[] | undefined;
@@ -64,6 +71,12 @@ export abstract class BaseCliAgent implements CliAgentClient {
   // Usage metric reported by this run (credits balance, cost, ...); null
   // when the CLI does not report one.
   protected abstract extractUsage(stdout: string): number | null;
+
+  // Token usage reported by this run; null when the CLI reports none
+  // (Copilot CLI and Codex report nothing in the current invocations).
+  protected extractTokenUsage(_stdout: string): AgentSessionTokens | null {
+    return null;
+  }
 
   // Label of the usage metric in logs and in the task footer.
   protected abstract usageLabel(): string;
@@ -187,18 +200,41 @@ export abstract class BaseCliAgent implements CliAgentClient {
       // The task timeout is configurable (per-action timeout, then the
       // actions default.timeout, then the global TASK_TIMEOUT, in seconds)
       // so long-running tasks are not cut off by a hardcoded limit.
-      const result = await this.runAgentCli(
-        args,
-        {
-          timeout:
-            (options?.timeoutSeconds ?? this.config.TASK_TIMEOUT) * 1000,
-          windowsHide: true,
-          cwd: workingDir,
-          maxBuffer: MAX_BUFFER_BYTES,
-          killProcessGroup: true,
-        },
-        "task execution",
-      );
+      // The session metrics time the CLI process itself and are recorded
+      // for failures (timeout, CLI error) as well.
+      const sessionModel = model?.model ?? "auto";
+      const sessionStartedAt = Date.now();
+      let result: { stdout: string; stderr: string };
+      try {
+        result = await this.runAgentCli(
+          args,
+          {
+            timeout:
+              (options?.timeoutSeconds ?? this.config.TASK_TIMEOUT) * 1000,
+            windowsHide: true,
+            cwd: workingDir,
+            maxBuffer: MAX_BUFFER_BYTES,
+            killProcessGroup: true,
+          },
+          "task execution",
+        );
+      } catch (error) {
+        this.sessionMetrics.record({
+          agent: this.name,
+          model: sessionModel,
+          durationMs: Date.now() - sessionStartedAt,
+          status: "error",
+          tokens: null,
+        });
+        throw error;
+      }
+      this.sessionMetrics.record({
+        agent: this.name,
+        model: sessionModel,
+        durationMs: Date.now() - sessionStartedAt,
+        status: "success",
+        tokens: this.extractTokenUsage(result.stdout),
+      });
       const usageAfter = this.extractUsage(result.stdout);
       if (usageAfter !== null) {
         await this.writeUsage(usageAfter);
