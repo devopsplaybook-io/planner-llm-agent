@@ -148,6 +148,18 @@ Promise.resolve().then(async () => {
     process.exit(1);
   }
 
+  // CLI-specific startup preparation, before the authentication checks.
+  // Best-effort: a failure must not stop the agent.
+  for (const cliAgent of cliAgents.values()) {
+    try {
+      await cliAgent.prepare?.();
+    } catch (error) {
+      logger.warn(
+        `${cliAgent.displayName} startup preparation failed: ${(error as Error).message}`,
+      );
+    }
+  }
+
   // Check authentication for every CLI agent used by the actions.
   if (config.AGENT_AUTH_CHECK === "true" || config.AGENT_AUTH_CHECK === "1") {
     for (const cliAgent of cliAgents.values()) {

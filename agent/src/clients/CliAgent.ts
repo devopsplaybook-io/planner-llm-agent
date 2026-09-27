@@ -36,6 +36,9 @@ export interface CliAgentClient {
   readonly displayName: string;
   // Guidance displayed when the startup authentication check fails.
   readonly authHint: string;
+  // Optional startup preparation (e.g. registering the synced skills
+  // directory with the CLI), run before the authentication checks.
+  prepare?(): Promise<void>;
   checkAuthentication(): Promise<void>;
   performTask(
     task: PlannerTask,

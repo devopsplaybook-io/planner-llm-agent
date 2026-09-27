@@ -97,11 +97,12 @@ describe("CopilotCliClient", () => {
       "-p",
       "Reply with exactly: OK",
       "--output-format",
-      "json",
+      "text",
+      "--silent",
     ]);
   });
 
-  it("should run the task with the Copilot autonomy flags", async () => {
+  it("should run the task with the Copilot autonomy flags and a silent text output", async () => {
     mockExecFile.mockImplementation(
       (
         _command: string,
@@ -118,36 +119,24 @@ describe("CopilotCliClient", () => {
 
     expect(summary).toBe("Done\n\n---\nModel: claude-sonnet-4.5");
     const args = promptArgs();
-    expect(args.slice(-5)).toEqual([
+    expect(args.slice(-6)).toEqual([
       "--model",
       "claude-sonnet-4.5",
       "--output-format",
-      "json",
+      "text",
+      "--silent",
       "--yolo",
     ]);
   });
 
-  it("should extract the reply from the final JSONL event", async () => {
+  it("should extract the reply from the plain stdout", async () => {
     mockExecFile.mockImplementation(
       (
         _command: string,
         _args: string[],
         _options: unknown,
         callback: (error: Error | null, stdout: string, stderr: string) => void,
-      ) =>
-        callback(
-          null,
-          [
-            JSON.stringify({ type: "user", content: "Do the task" }),
-            JSON.stringify({ type: "assistant.partial", content: "Working" }),
-            JSON.stringify({
-              type: "assistant",
-              content: "Implemented the feature",
-            }),
-            "",
-          ].join("\n"),
-          "",
-        ),
+      ) => callback(null, "\n  Implemented the feature  \n", ""),
     );
 
     const summary = await client.performTask(
@@ -158,14 +147,14 @@ describe("CopilotCliClient", () => {
     expect(summary).toBe("Implemented the feature");
   });
 
-  it("should fall back to the raw stdout when the output is not JSONL", async () => {
+  it("should report no output when the CLI prints nothing", async () => {
     mockExecFile.mockImplementation(
       (
         _command: string,
         _args: string[],
         _options: unknown,
         callback: (error: Error | null, stdout: string, stderr: string) => void,
-      ) => callback(null, "  Implemented the feature  \n", ""),
+      ) => callback(null, "  \n", ""),
     );
 
     const summary = await client.performTask(
@@ -173,7 +162,7 @@ describe("CopilotCliClient", () => {
       path.join(os.tmpdir(), "copilot-cli-spec", "task-1-Agent.md"),
     );
 
-    expect(summary).toBe("Implemented the feature");
+    expect(summary).toBe("Task executed (no output returned by Copilot)");
   });
 
   it("should append no usage to the footer (not reported by the CLI)", async () => {
@@ -216,5 +205,65 @@ describe("CopilotCliClient", () => {
     await expect(client.checkAuthentication()).rejects.toThrow(
       "Copilot CLI 'copilot' not found in PATH",
     );
+  });
+
+  describe("prepare", () => {
+    it("should register the synced skills directory with the CLI", async () => {
+      config.AGENT_CONFIG_REPOSITORY =
+        "https://github.com/acme/agent-config.git";
+      mockExecFile.mockImplementation(
+        (
+          _command: string,
+          _args: string[],
+          _options: unknown,
+          callback: (error: Error | null, stdout: string, stderr: string) => void,
+        ) => callback(null, "Added custom skill directory", ""),
+      );
+
+      await expect(client.prepare()).resolves.toBeUndefined();
+
+      expect(mockExecFile).toHaveBeenCalledTimes(1);
+      const [command, args] = mockExecFile.mock.calls[0];
+      expect(command).toBe("copilot");
+      expect(args).toEqual([
+        "skill",
+        "add",
+        path.join(config.DATA_DIR, "agent-config", "skills"),
+      ]);
+      expect(mockLogger.info).toHaveBeenCalledWith(
+        expect.stringContaining("Copilot skills directory registered"),
+      );
+    });
+
+    it("should do nothing when no agent config repository is configured", async () => {
+      await expect(client.prepare()).resolves.toBeUndefined();
+
+      expect(mockExecFile).not.toHaveBeenCalled();
+    });
+
+    it("should stay non-fatal when the registration fails", async () => {
+      config.AGENT_CONFIG_REPOSITORY =
+        "https://github.com/acme/agent-config.git";
+      mockExecFile.mockImplementation(
+        (
+          _command: string,
+          _args: string[],
+          _options: unknown,
+          callback: (error: Error | null, stdout: string, stderr: string) => void,
+        ) =>
+          callback(
+            Object.assign(new Error("spawn copilot ENOENT"), {
+              code: "ENOENT",
+            }),
+            "",
+            "",
+          ),
+      );
+
+      await expect(client.prepare()).resolves.toBeUndefined();
+      expect(mockLogger.warn).toHaveBeenCalledWith(
+        expect.stringContaining("Copilot skills directory registration failed"),
+      );
+    });
   });
 });

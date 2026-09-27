@@ -56,6 +56,8 @@ The command of each CLI is configurable, and the container ships every supported
 
 Only Qoder supports a model listing; for the other CLIs the model validation is skipped. Some CLIs do not report a usage metric (credits or cost): the task report footer then only displays the model, without warning.
 
+The Copilot CLI runs with `--output-format text --silent` (only the final reply is captured) and, when the agent config repository is configured, the agent registers its skills directory at startup (`copilot skill add <AGENT_CONFIG_CONTENT_PATH>/skills`): Copilot does not discover the synced repository on its own, so without this registration the model would not see the synced skills. The registration is idempotent and best-effort — a failure is logged and the tasks keep running with the skills listed in the task prompt.
+
 ### Model selection
 
 The model used for a task is resolved with the following priority:
@@ -246,7 +248,7 @@ actions:
     status_start: To Do
     status_end: In Review
     agent: copilot-cli
-    model: GPT-6 Luna
+    model: gpt-6-luna
     instruction: Follow the repository coding guidelines and open a PR when the task is done.
     timeout: 1800
     weight: 0.75
@@ -262,7 +264,7 @@ For every poll, the agent checks if an assigned task matches the project pattern
 - `status_start` and `status_end` are required; `project`, `agent`, `model`, `instruction`, `timeout` and `weight` are optional. `project` matches any project when missing, null or empty; otherwise it is a case-sensitive glob pattern where `*` matches any sequence of characters (e.g. `Project*` matches `Projects` and `Projects - Planner`). Overlapping patterns are allowed: the first matching action in the list processes the task, and a task whose project cannot be resolved never matches a project-bound action.
 - `default.agent` selects the CLI agent used by default; when omitted, `AGENT_CLI` is used (Qoder by default). An action-level `agent` overrides it. Supported values are `qoder`, `claude-code`, `copilot-cli`, `codex` and `gemini-cli`. Every distinct configured agent is validated and its authentication is checked at startup when `AGENT_AUTH_CHECK` is enabled. `default.model` applies to the default agent; set `model` on an action that uses another agent when it needs a specific model.
 - `weight` is the scheduling weight of the tasks handled by the action (a number greater than 0 and at most 1, e.g. `0.5` for a batch of small routine tasks); an `agent-weight:` line in the task description still takes precedence (see [Parallel scheduling](#parallel-scheduling)).
-- `default.model` is the fallback model for actions without their own model, and `default.timeout` is the fallback timeout for actions without their own timeout.
+- `default.model` is the fallback model for actions without their own model, and `default.timeout` is the fallback timeout for actions without their own timeout. A model id must be accepted by the selected CLI (`gpt-6-luna` and not the display name `GPT-6 Luna`, for example): a bad id fails the task immediately with the CLI error.
 - The task timeout is resolved per task with the following priority: the `timeout` of the matching action, then `default.timeout`, then the global `TASK_TIMEOUT` configuration (default `3600` = 1 hour). It must be a positive integer in seconds.
 - When the task timeout expires, the whole CLI process group is killed (SIGTERM, then SIGKILL after a 10 seconds grace period), so processes spawned by the coding-agent CLI (shells, `git`, `npm test`, dev servers) cannot survive the timeout. The task then fails and is moved to the end status with an explanation.
 - When the agent starts working on a task, it posts a one-line comment on the task (`Agent '<AGENT_NAME>' started working on this task.`) to notify the user. This notification is best-effort: a failure to post it does not fail the task.
@@ -292,6 +294,7 @@ Skills, configuration files and other resources the agent should use are defined
 - The working tree is forced to match the remote branch on every refresh, so the local copy is always a faithful mirror of the repository.
 - Authentication uses the Git and GitHub settings above (GitHub token or SSH key); public repositories need no authentication.
 - Every task prompt tells the agent where the configuration is synced, so skills and resources are directly usable during task execution.
+- Every task prompt also lists the available skills (the `skills/<name>/SKILL.md` entries of the repository, with a one-line description each), so the LLM knows which skill to read before starting. The Copilot CLI does not discover the synced repository on its own: at startup the agent additionally registers the skills directory with `copilot skill add`, which makes the CLI expose the skills to the model in every run (best-effort, see [CLI agent](#cli-agent)).
 
 Example:
 

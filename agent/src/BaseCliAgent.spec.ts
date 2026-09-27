@@ -1,3 +1,4 @@
+import * as fse from "fs-extra";
 import * as os from "os";
 import * as path from "path";
 import type { AgentActionsConfig } from "./AgentActions";
@@ -204,6 +205,47 @@ describe("BaseCliAgent", () => {
 
       const { options } = lastCall();
       expect(options.cwd).toBe(path.dirname(notesFile));
+    });
+
+    it("lists the synced skills in the task prompt", async () => {
+      const config = new Config();
+      config.DATA_DIR = dataDir;
+      config.AGENT_CONFIG_REPOSITORY =
+        "https://github.com/acme/agent-config.git";
+      agent = new TestCliAgent(config, agentActions);
+      fse.outputFileSync(
+        path.join(dataDir, "agent-config", "skills", "my-skill", "SKILL.md"),
+        [
+          "---",
+          "name: my-skill",
+          'description: "Use when testing the prompt."',
+          "---",
+          "",
+          "# My skill",
+        ].join("\n"),
+      );
+
+      const notesFile = path.join(dataDir, "tasks", "task-1-Agent.md");
+      await agent.performTask(buildTask(), notesFile);
+
+      const { args } = lastCall();
+      expect(args[3]).toContain(
+        "Available skills (read the SKILL.md of the relevant one before starting): 'my-skill — Use when testing the prompt.'",
+      );
+    });
+
+    it("omits the skills list when no skill is synced", async () => {
+      const config = new Config();
+      config.DATA_DIR = dataDir;
+      config.AGENT_CONFIG_REPOSITORY =
+        "https://github.com/acme/agent-config.git";
+      agent = new TestCliAgent(config, agentActions);
+
+      const notesFile = path.join(dataDir, "tasks", "task-1-Agent.md");
+      await agent.performTask(buildTask(), notesFile);
+
+      const { args } = lastCall();
+      expect(args[3]).not.toContain("Available skills");
     });
   });
 
