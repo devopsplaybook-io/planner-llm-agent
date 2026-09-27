@@ -8,7 +8,7 @@ import { GitEnvironment } from "./GitEnvironment";
 import { OTelInit, OTelLogger, OTelTracer } from "./OTelContext";
 import { PlannerClient } from "./PlannerClient";
 import { createCliAgent } from "./clients/CliAgentRegistry";
-import type { CliAgentClient } from "./clients/CliAgent";
+import { prepareCliAgent, type CliAgentClient } from "./clients/CliAgent";
 
 const logger = OTelLogger().createModuleLogger("app");
 
@@ -146,6 +146,12 @@ Promise.resolve().then(async () => {
   } catch (error) {
     logger.error((error as Error).message, error as Error);
     process.exit(1);
+  }
+
+  // CLI-specific startup preparation, before the authentication checks.
+  // Best-effort: a failure must not stop the agent.
+  for (const cliAgent of cliAgents.values()) {
+    await prepareCliAgent(cliAgent);
   }
 
   // Check authentication for every CLI agent used by the actions.

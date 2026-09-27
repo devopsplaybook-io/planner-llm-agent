@@ -1,7 +1,7 @@
 import * as fse from "fs-extra";
 import * as path from "path";
 import type { AgentActionsConfig } from "../AgentActions";
-import { getAgentConfigContentPath } from "../AgentConfigRepository";
+import { getAgentConfigContentPath, listAgentSkills } from "../AgentConfigRepository";
 import { Config, githubTokenEnvName } from "../Config";
 import { ExecFileError, extractErrorDetail, runCli, RunCliOptions } from "../CliUtils";
 import { OTelLogger, OTelTracer } from "../OTelContext";
@@ -169,7 +169,7 @@ export abstract class BaseCliAgent implements CliAgentClient {
       } catch {
         // Non-fatal: the CLI overwrites the file anyway.
       }
-      const prompt = this.buildTaskPrompt(notesFile, workingDir, options);
+      const prompt = await this.buildTaskPrompt(notesFile, workingDir, options);
       // The model of the matching action or the actions default model; the
       // task description still takes priority over both.
       const model = resolveModel(task, options?.model?.trim() ?? "");
@@ -411,11 +411,11 @@ export abstract class BaseCliAgent implements CliAgentClient {
     return `${this.usageLabel()}: ${formatUsageValue(usageBefore)} -> ${formatUsageValue(usageAfter)}`;
   }
 
-  private buildTaskPrompt(
+  private async buildTaskPrompt(
     notesFile: string,
     workingDir: string,
     options?: TaskOptions,
-  ): string {
+  ): Promise<string> {
     const summaryFile = getSummaryFile(notesFile);
     const promptLines = [
       "You are an autonomous agent working on an assigned task.",
@@ -451,6 +451,16 @@ export abstract class BaseCliAgent implements CliAgentClient {
     if (this.config.AGENT_CONFIG_REPOSITORY.trim().length > 0) {
       promptLines.push(
         `Agent configuration (skills, configuration files and other resources) is synced locally at: ${getAgentConfigContentPath(this.config)}. Use it whenever it is relevant to the task.`,
+      );
+    }
+    // Listing the skills makes them visible to every CLI, including the
+    // ones that do not discover the synced repository on their own.
+    const skills = await listAgentSkills(this.config);
+    if (skills.length > 0) {
+      promptLines.push(
+        `Available skills (read the SKILL.md of the relevant one before starting): ${skills
+          .map((skill) => `'${skill.name} — ${skill.description}'`)
+          .join("; ")}.`,
       );
     }
     promptLines.push(

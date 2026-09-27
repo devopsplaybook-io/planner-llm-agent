@@ -1,5 +1,5 @@
 import { execFile } from "child_process";
-import type { ExecFileOptionsWithStringEncoding } from "child_process";
+import type { ExecException, ExecFileOptionsWithStringEncoding } from "child_process";
 
 export interface ExecFileError extends Error {
   code?: string | number;
@@ -46,12 +46,30 @@ export function runCli(
   return new Promise((resolve, reject) => {
     execFile(command, args, execOptions, (error, stdout, stderr) => {
       if (error) {
-        reject(error);
+        reject(attachCliOutput(error, stdout, stderr));
       } else {
         resolve({ stdout: stdout, stderr: stderr });
       }
     });
   });
+}
+
+// Node's execFile does not attach the captured output to the error handed
+// to the callback (verified on Node 26): without them the error detail can
+// only fall back to the 'Command failed: <full argv>' message, which embeds
+// the whole prompt. Attach them when the error does not carry them already.
+function attachCliOutput<T extends ExecException>(
+  error: T,
+  stdout: string,
+  stderr: string,
+): T {
+  if (error.stdout === undefined) {
+    error.stdout = stdout;
+  }
+  if (error.stderr === undefined) {
+    error.stderr = stderr;
+  }
+  return error;
 }
 
 /**
@@ -104,7 +122,7 @@ function runCliWithProcessGroupKill(
           timeoutError.killed = true;
           reject(timeoutError);
         } else if (error) {
-          reject(error);
+          reject(attachCliOutput(error, stdout, stderr));
         } else {
           resolve({ stdout: stdout, stderr: stderr });
         }
@@ -137,14 +155,29 @@ function signalProcessGroup(pid: number, signal: NodeJS.Signals): void {
   }
 }
 
+// Maximum size of the error detail posted on a task: it must survive the
+// failure-comment truncation (see Agent.buildFailureComment) so the real
+// error line is never cut off.
+const ERROR_DETAIL_MAX_LINES = 5;
+const ERROR_DETAIL_MAX_LINE_LENGTH = 300;
+const ERROR_DETAIL_MAX_LENGTH = 800;
+
 /**
  * Extract the most relevant lines from a failed CLI execution for logging.
+ * The captured stderr then stdout output is preferred; without output the
+ * error message is used, minus its 'Command failed: <full argv>' header
+ * (which embeds the whole prompt and is never an error detail).
  */
 export function extractErrorDetail(error: ExecFileError): string {
+  if (error.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER") {
+    return error.message;
+  }
   const output = [error.stderr, error.stdout]
     .filter((value) => value && value.trim().length > 0)
     .join("\n");
-  const lines = output
+  const source =
+    output.length > 0 ? output : stripCommandFailedHeader(error.message);
+  const lines = source
     .split("\n")
     .map((line) => line.trim())
     .filter(
@@ -154,6 +187,28 @@ export function extractErrorDetail(error: ExecFileError): string {
         !line.startsWith("DeprecationWarning") &&
         !line.includes("--trace-deprecation"),
     )
-    .slice(0, 5);
-  return lines.length > 0 ? lines.join("\n") : error.message;
+    .slice(0, ERROR_DETAIL_MAX_LINES)
+    .map((line) =>
+      line.length > ERROR_DETAIL_MAX_LINE_LENGTH
+        ? `${line.slice(0, ERROR_DETAIL_MAX_LINE_LENGTH)}...`
+        : line,
+    );
+  const detail = lines.join("\n");
+  if (detail.length > ERROR_DETAIL_MAX_LENGTH) {
+    return `${detail.slice(0, ERROR_DETAIL_MAX_LENGTH)}...`;
+  }
+  return detail.length > 0
+    ? detail
+    : `the CLI exited with code ${error.code === undefined ? "unknown" : String(error.code)} and produced no error output`;
+}
+
+// Node's execFile builds the message as 'Command failed: <full argv>'
+// followed by the captured stderr; only the text after the header line is
+// an error detail.
+function stripCommandFailedHeader(message: string): string {
+  const lines = message.split("\n");
+  if (lines[0]?.startsWith("Command failed:")) {
+    return lines.slice(1).join("\n");
+  }
+  return message;
 }

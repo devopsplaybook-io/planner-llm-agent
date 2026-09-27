@@ -2,7 +2,7 @@ import { execFile } from "child_process";
 import * as fse from "fs-extra";
 import * as os from "os";
 import * as path from "path";
-import { AgentConfigRepository } from "./AgentConfigRepository";
+import { AgentConfigRepository, listAgentSkills } from "./AgentConfigRepository";
 import { Config } from "./Config";
 
 jest.mock("./OTelContext", () => ({
@@ -199,6 +199,108 @@ describe("AgentConfigRepository", () => {
     await expect(repository.sync()).rejects.toThrow(
       /Agent config repository sync failed/,
     );
+  });
+
+  describe("listAgentSkills", () => {
+    const writeSkill = async (
+      folder: string,
+      content: string,
+    ): Promise<void> => {
+      await fse.outputFile(
+        path.join(dataDir, "agent-config", "skills", folder, "SKILL.md"),
+        content,
+      );
+    };
+
+    it("returns nothing when no repository is configured", async () => {
+      await expect(listAgentSkills(config)).resolves.toEqual([]);
+      expect(mockExecFile).not.toHaveBeenCalled();
+    });
+
+    it("parses the name and description of every skill", async () => {
+      config.AGENT_CONFIG_REPOSITORY = REPOSITORY;
+      await writeSkill(
+        "beta",
+        [
+          "---",
+          "name: beta-skill",
+          'description: "Use when handling beta cases."',
+          "---",
+          "",
+          "# Beta",
+        ].join("\n"),
+      );
+      await writeSkill(
+        "alpha",
+        [
+          "---",
+          "name: alpha-skill",
+          "description: Use when handling alpha cases.",
+          "---",
+        ].join("\n"),
+      );
+
+      await expect(listAgentSkills(config)).resolves.toEqual([
+        { name: "alpha-skill", description: "Use when handling alpha cases." },
+        { name: "beta-skill", description: "Use when handling beta cases." },
+      ]);
+    });
+
+    it("skips malformed skills", async () => {
+      config.AGENT_CONFIG_REPOSITORY = REPOSITORY;
+      await fse.outputFile(
+        path.join(dataDir, "agent-config", "skills", "not-a-skill", "README.md"),
+        "no SKILL.md here",
+      );
+      await writeSkill("no-front-matter", "# Just a document");
+      await writeSkill(
+        "no-description",
+        ["---", "name: lonely", "---"].join("\n"),
+      );
+      await writeSkill(
+        "valid",
+        ["---", "name: valid", "description: Kept.", "---"].join("\n"),
+      );
+
+      await expect(listAgentSkills(config)).resolves.toEqual([
+        { name: "valid", description: "Kept." },
+      ]);
+    });
+
+    it("caps the description of a long skill", async () => {
+      config.AGENT_CONFIG_REPOSITORY = REPOSITORY;
+      const longDescription = `Use when ${"very ".repeat(40)}long.`;
+      await writeSkill(
+        "long",
+        [
+          "---",
+          "name: long-skill",
+          `description: "${longDescription}"`,
+          "---",
+        ].join("\n"),
+      );
+
+      const skills = await listAgentSkills(config);
+      expect(skills).toHaveLength(1);
+      expect(skills[0].description.length).toBeLessThanOrEqual(123);
+      expect(skills[0].description.endsWith("...")).toBe(true);
+      expect(skills[0].description.startsWith("Use when very")).toBe(true);
+    });
+
+    it("reads the skills when the configured folder is the skills folder", async () => {
+      config.AGENT_CONFIG_REPOSITORY = REPOSITORY;
+      config.AGENT_CONFIG_FOLDER = "skills";
+      await writeSkill(
+        "direct",
+        ["---", "name: direct", "description: Kept directly.", "---"].join(
+          "\n",
+        ),
+      );
+
+      await expect(listAgentSkills(config)).resolves.toEqual([
+        { name: "direct", description: "Kept directly." },
+      ]);
+    });
   });
 
   it("skips the sync while another sync is already running", async () => {

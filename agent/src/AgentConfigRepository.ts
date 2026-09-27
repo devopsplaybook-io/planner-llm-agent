@@ -31,6 +31,116 @@ function normalizeFolderPath(value: string): string {
 }
 
 /**
+ * Returns the local directory holding the skills of the config repository
+ * (one directory per skill, each with its SKILL.md file).
+ */
+export function getAgentSkillsPath(config: Config): string {
+  const contentPath = getAgentConfigContentPath(config);
+  // AGENT_CONFIG_FOLDER may point at the skills folder itself (e.g. a
+  // sparse checkout of the repository's 'skills' folder): the synced
+  // content path then already is the skills directory.
+  return path.basename(contentPath) === "skills"
+    ? contentPath
+    : path.join(contentPath, "skills");
+}
+
+// A skill of the config repository, with its name and a short description
+// taken from the SKILL.md front matter.
+export interface AgentSkill {
+  name: string;
+  description: string;
+}
+
+const SKILL_DESCRIPTION_MAX_LENGTH = 120;
+
+/**
+ * Lists the skills synced from the config repository, so the task prompt
+ * can tell the CLI which skills exist and when to use them. Malformed
+ * skills are skipped; the list is empty when no repository is configured
+ * or no skills are found.
+ */
+export async function listAgentSkills(config: Config): Promise<AgentSkill[]> {
+  if (config.AGENT_CONFIG_REPOSITORY.trim().length === 0) {
+    return [];
+  }
+  const skillsDir = getAgentSkillsPath(config);
+  let entries: string[];
+  try {
+    entries = await fse.readdir(skillsDir);
+  } catch {
+    return [];
+  }
+  const skills: AgentSkill[] = [];
+  for (const entry of entries.sort()) {
+    const skill = await readAgentSkill(path.join(skillsDir, entry, "SKILL.md"));
+    if (skill !== null) {
+      skills.push(skill);
+    }
+  }
+  return skills;
+}
+
+async function readAgentSkill(skillFile: string): Promise<AgentSkill | null> {
+  let content: string;
+  try {
+    content = await fse.readFile(skillFile, "utf8");
+  } catch {
+    return null;
+  }
+  const frontMatter = parseFrontMatter(content);
+  const name = (frontMatter.name ?? "").trim();
+  const description = summarizeSkillDescription(frontMatter.description ?? "");
+  if (name.length === 0 || description.length === 0) {
+    return null;
+  }
+  return { name, description };
+}
+
+// Minimal parser for the SKILL.md front matter: the scalar keys of the
+// first YAML block, without nested structures or multi-line values.
+function parseFrontMatter(content: string): Record<string, string> {
+  const lines = content.split("\n");
+  if (lines[0]?.trim() !== "---") {
+    return {};
+  }
+  const fields: Record<string, string> = {};
+  for (let i = 1; i < lines.length; i++) {
+    if (lines[i].trim() === "---") {
+      break;
+    }
+    const match = lines[i].match(/^([A-Za-z0-9_-]+):\s*(.*)$/);
+    if (!match) {
+      continue;
+    }
+    let value = match[2].trim();
+    if (
+      value.length >= 2 &&
+      ((value.startsWith('"') && value.endsWith('"')) ||
+        (value.startsWith("'") && value.endsWith("'")))
+    ) {
+      value = value.slice(1, -1);
+    }
+    fields[match[1].toLowerCase()] = value;
+  }
+  return fields;
+}
+
+// Compact form of a skill description for the task prompt: the first
+// sentence when it fits, otherwise a word-boundary truncation.
+function summarizeSkillDescription(description: string): string {
+  const text = description.trim();
+  const firstSentence =
+    text.match(/^[\s\S]*?\.(?=\s+[A-Z]|$)/)?.[0]?.trim() ?? text;
+  if (firstSentence.length <= SKILL_DESCRIPTION_MAX_LENGTH) {
+    return firstSentence;
+  }
+  const cut = text.slice(0, SKILL_DESCRIPTION_MAX_LENGTH);
+  const lastSpace = cut.lastIndexOf(" ");
+  const summary = lastSpace > 0 ? cut.slice(0, lastSpace) : cut;
+  return `${summary.trimEnd()}...`;
+}
+
+/**
  * Keeps the agent configuration (skills, configuration files and other
  * resources) in sync with a dedicated Git repository configured through
  * AGENT_CONFIG_REPOSITORY.
