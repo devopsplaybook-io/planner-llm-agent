@@ -16,6 +16,9 @@ jest.mock("./OTelContext", () => {
     string,
     { debug: jest.Mock; info: jest.Mock; warn: jest.Mock; error: jest.Mock }
   > = {};
+  // Session metric instruments, recreated on every instrument creation so
+  // a fresh client always gets fresh mocks.
+  const histograms: Record<string, { record: jest.Mock }> = {};
   return {
     OTelTracer: jest.fn(() => ({
       startSpan: jest.fn(() => ({
@@ -37,7 +40,14 @@ jest.mock("./OTelContext", () => {
         return moduleLoggers[module];
       }),
     })),
+    OTelMeter: jest.fn(() => ({
+      createHistogram: jest.fn((key: string) => {
+        histograms[key] = { record: jest.fn() };
+        return histograms[key];
+      }),
+    })),
     __moduleLoggers: moduleLoggers,
+    __histograms: histograms,
   };
 });
 
@@ -50,11 +60,11 @@ const MockedRunCli = runCli as unknown as jest.Mock;
 
 // BaseCliAgent logs through the 'cli-agent' module logger: grab its info
 // mock to assert the logged lines.
-const moduleLoggers = (
-  jest.requireMock("./OTelContext") as {
-    __moduleLoggers: Record<string, { info: jest.Mock }>;
-  }
-).__moduleLoggers;
+const otelMock = jest.requireMock("./OTelContext") as {
+  __moduleLoggers: Record<string, { info: jest.Mock }>;
+  __histograms: Record<string, { record: jest.Mock }>;
+};
+const moduleLoggers = otelMock.__moduleLoggers;
 const baseCliAgentLogInfo = moduleLoggers["cli-agent"].info;
 
 // Concrete adapter exposing the abstract methods with recorded calls.
@@ -246,6 +256,57 @@ describe("BaseCliAgent", () => {
 
       const { args } = lastCall();
       expect(args[3]).not.toContain("Available skills");
+    });
+  });
+
+  describe("session metrics", () => {
+    const notesFile = (): string =>
+      path.join(dataDir, "tasks", "task-1-Agent.md");
+
+    it("records the duration of a successful task", async () => {
+      await agent.performTask(buildTask(), notesFile(), {
+        model: "task-model",
+      });
+
+      const durations = otelMock.__histograms["session.duration"].record;
+      expect(durations).toHaveBeenCalledTimes(1);
+      expect(durations.mock.calls[0][0]).toBeGreaterThanOrEqual(0);
+      expect(durations.mock.calls[0][0]).toBeLessThan(10);
+      expect(durations.mock.calls[0][1]).toEqual({
+        agent: "test",
+        model: "task-model",
+        status: "success",
+      });
+    });
+
+    it("labels the session with the auto model when none is configured", async () => {
+      await agent.performTask(buildTask(), notesFile());
+
+      expect(
+        otelMock.__histograms["session.duration"].record,
+      ).toHaveBeenCalledWith(expect.any(Number), {
+        agent: "test",
+        model: "auto",
+        status: "success",
+      });
+    });
+
+    it("records an error session and rethrows the failure", async () => {
+      MockedRunCli.mockRejectedValueOnce(
+        Object.assign(new Error("boom"), { code: 1, killed: false }),
+      );
+
+      await expect(agent.performTask(buildTask(), notesFile())).rejects.toThrow(
+        "Test CLI task execution failed",
+      );
+
+      expect(
+        otelMock.__histograms["session.duration"].record,
+      ).toHaveBeenCalledWith(expect.any(Number), {
+        agent: "test",
+        model: "auto",
+        status: "error",
+      });
     });
   });
 

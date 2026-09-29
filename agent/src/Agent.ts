@@ -54,19 +54,9 @@ export class Agent {
   // utility-model evaluations or processing start), the next tick is
   // skipped, so tasks can never be registered twice (double-pick race).
   private polling = false;
-  // Scheduling metrics (disabled when OpenTelemetry is not initialized).
-  private schedulerMetrics: {
-    runningWeight: ReturnType<
-      ReturnType<typeof OTelMeter>["createObservableGauge"]
-    >;
-    queueDepth: ReturnType<
-      ReturnType<typeof OTelMeter>["createObservableGauge"]
-    >;
-    picked: ReturnType<ReturnType<typeof OTelMeter>["createCounter"]>;
-    deferred: ReturnType<ReturnType<typeof OTelMeter>["createCounter"]>;
-  } | null = null;
-  private lastRunningWeight = 0;
-  private lastQueueDepth = 0;
+  // Ready tasks waiting to be admitted by the scheduler: refreshed on every
+  // completed poll and reported by the queue gauge (see initQueueMetrics).
+  private queuedTasks = 0;
   // Invalid hot-reloaded values are reported once per value.
   private warnedBudgetValue: string | null = null;
   private warnedConflictModeValue: string | null = null;
@@ -90,7 +80,7 @@ export class Agent {
     }
     this.cliAgent = this.cliAgents.get(this.defaultAgent)!;
     this.taskEvaluator = new TaskEvaluator(config, this.cliAgent);
-    this.initSchedulerMetrics();
+    this.initQueueMetrics();
   }
 
   public start(): void {
@@ -131,6 +121,7 @@ export class Agent {
       this.logRunningTasks();
       const actions = this.getActions();
       if (actions.length === 0 || tasks.length === 0) {
+        this.queuedTasks = 0;
         return;
       }
       // The projects are loaded lazily, once per poll: the project-bound
@@ -167,6 +158,7 @@ export class Agent {
         }
       }
       if (candidates.length === 0) {
+        this.queuedTasks = 0;
         return;
       }
       // Queue order: higher priorities first; within the same priority the
@@ -228,12 +220,11 @@ export class Agent {
       evaluations,
     });
     this.logSchedulingRound(selection);
+    this.queuedTasks = candidates.length - selection.picks.length;
     if (selection.picks.length === 0) {
-      this.recordSchedulerMetrics(selection, candidates.length);
       return;
     }
     this.registerPicks(selection.picks);
-    this.recordSchedulerMetrics(selection, candidates.length - selection.picks.length);
     // Each task manages its own error handling and in-flight cleanup. The
     // processing is detached from the poll: the single-flight guard only
     // protects the selection (through the synchronous registration), so
@@ -253,6 +244,7 @@ export class Agent {
       this.config.TASK_MAX_PARALLEL,
       this.processingTasks.size,
     );
+    this.queuedTasks = candidates.length - tasksToProcess.length;
     if (tasksToProcess.length === 0) {
       return;
     }
@@ -412,51 +404,28 @@ export class Agent {
     logger.info(`Scheduling round: ${parts.join("; ")}`);
   }
 
-  private initSchedulerMetrics(): void {
+  // One gauge consolidating the scheduling queue: one data point per
+  // value, selected by the 'type' attribute. The gauge is exported as-is
+  // (observable gauges are not prefixed by the shared meter wrapper).
+  private initQueueMetrics(): void {
     try {
       const meter = OTelMeter();
-      this.schedulerMetrics = {
-        runningWeight: meter.createObservableGauge(
-          "scheduler.running-weight",
-          (result) => result.observe(this.lastRunningWeight),
-          "Total scheduling weight of the tasks currently running",
-        ),
-        queueDepth: meter.createObservableGauge(
-          "scheduler.queue-depth",
-          (result) => result.observe(this.lastQueueDepth),
-          "Ready tasks waiting to be admitted by the scheduler",
-        ),
-        picked: meter.createCounter("scheduler.tasks.picked"),
-        deferred: meter.createCounter("scheduler.tasks.deferred"),
-      };
+      meter.createObservableGauge(
+        "queue",
+        (result) => {
+          result.observe(this.queuedTasks, { type: "tasks_queued" });
+          result.observe(this.processingTasks.size, {
+            type: "tasks_in_progress",
+          });
+          result.observe(runningWeight(this.processingTasks), {
+            type: "weight_in_progress",
+          });
+        },
+        "Tasks waiting to be admitted by the scheduler, tasks in progress and their total scheduling weight",
+      );
     } catch {
       // OpenTelemetry not initialized (e.g. in tests): the metrics stay
       // disabled and the scheduling keeps working.
-      this.schedulerMetrics = null;
-    }
-  }
-
-  private recordSchedulerMetrics(
-    selection: SchedulerSelection,
-    queueDepth: number,
-  ): void {
-    this.lastRunningWeight = runningWeight(this.processingTasks);
-    this.lastQueueDepth = queueDepth;
-    if (this.schedulerMetrics === null) {
-      return;
-    }
-    if (selection.picks.length > 0) {
-      this.schedulerMetrics.picked.add(selection.picks.length);
-    }
-    const deferredByReason = new Map<string, number>();
-    for (const deferral of selection.deferrals) {
-      const reason = deferral.reason.startsWith("conflict:")
-        ? "conflict"
-        : deferral.reason;
-      deferredByReason.set(reason, (deferredByReason.get(reason) ?? 0) + 1);
-    }
-    for (const [reason, count] of deferredByReason) {
-      this.schedulerMetrics.deferred.add(count, { reason });
     }
   }
 
