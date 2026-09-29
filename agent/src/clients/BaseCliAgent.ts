@@ -2,10 +2,7 @@ import * as fse from "fs-extra";
 import * as path from "path";
 import type { AgentActionsConfig } from "../AgentActions";
 import { getAgentConfigContentPath, listAgentSkills } from "../AgentConfigRepository";
-import {
-  AgentSessionMetrics,
-  AgentSessionTokens,
-} from "../AgentSessionMetrics";
+import { AgentSessionMetrics } from "../AgentSessionMetrics";
 import { Config, githubTokenEnvName } from "../Config";
 import { ExecFileError, extractErrorDetail, runCli, RunCliOptions } from "../CliUtils";
 import { OTelLogger, OTelTracer } from "../OTelContext";
@@ -71,12 +68,6 @@ export abstract class BaseCliAgent implements CliAgentClient {
   // Usage metric reported by this run (credits balance, cost, ...); null
   // when the CLI does not report one.
   protected abstract extractUsage(stdout: string): number | null;
-
-  // Token usage reported by this run; null when the CLI reports none
-  // (Copilot CLI and Codex report nothing in the current invocations).
-  protected extractTokenUsage(_stdout: string): AgentSessionTokens | null {
-    return null;
-  }
 
   // Label of the usage metric in logs and in the task footer.
   protected abstract usageLabel(): string;
@@ -224,7 +215,6 @@ export abstract class BaseCliAgent implements CliAgentClient {
           model: sessionModel,
           durationMs: Date.now() - sessionStartedAt,
           status: "error",
-          tokens: null,
         });
         throw error;
       }
@@ -233,7 +223,6 @@ export abstract class BaseCliAgent implements CliAgentClient {
         model: sessionModel,
         durationMs: Date.now() - sessionStartedAt,
         status: "success",
-        tokens: this.extractTokenUsage(result.stdout),
       });
       const usageAfter = this.extractUsage(result.stdout);
       if (usageAfter !== null) {

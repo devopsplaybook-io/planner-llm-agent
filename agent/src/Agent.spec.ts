@@ -16,8 +16,35 @@ jest.mock("./clients/CliAgentRegistry", () => ({
   createCliAgent: jest.fn(),
 }));
 
+// The agent never initializes OpenTelemetry itself, so the observable gauge
+// callbacks are captured by name and can be invoked like an export cycle.
+jest.mock("./OTelContext", () => {
+  const actual = jest.requireActual("./OTelContext");
+  const observableGauges: Record<string, (result: unknown) => void> = {};
+  return {
+    ...actual,
+    OTelMeter: jest.fn(() => ({
+      createObservableGauge: jest.fn(
+        (key: string, callback: (result: unknown) => void) => {
+          observableGauges[key] = callback;
+          return { addCallback: jest.fn() };
+        },
+      ),
+    })),
+    __observableGauges: observableGauges,
+  };
+});
+
 const MockedPlannerClient = PlannerClient as unknown as jest.Mock;
 const MockedCreateCliAgent = createCliAgent as unknown as jest.Mock;
+const observableGauges = (
+  jest.requireMock("./OTelContext") as {
+    __observableGauges: Record<
+      string,
+      (result: { observe: jest.Mock }) => void
+    >;
+  }
+).__observableGauges;
 const mockPlanner = {
   getCurrentUser: jest.fn(),
   listAssignedTasks: jest.fn(),
@@ -652,6 +679,67 @@ describe("Agent", () => {
     await waitFor(() => mockQoder.performTask.mock.calls.length === 2);
     await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length === 2);
     expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith("task-2", "Done");
+    agent.stop();
+  });
+
+  it("should report an empty queue when nothing is waiting or running", () => {
+    createAgent();
+
+    const result = { observe: jest.fn() };
+    observableGauges["queue"](result);
+
+    expect(result.observe.mock.calls).toEqual([
+      [0, { type: "tasks_queued" }],
+      [0, { type: "tasks_in_progress" }],
+      [0, { type: "weight_in_progress" }],
+    ]);
+  });
+
+  it("should export the queue gauge with the waiting and running tasks", async () => {
+    config.TASK_POLLING_INTERVAL = 1;
+    let resolveFirst: (value: string) => void = () => undefined;
+    mockPlannerTasks([
+      {
+        id: "task-1",
+        title: "First task",
+        status: "To Do",
+        description: "",
+        comments: [],
+        attachments: [],
+      },
+      {
+        id: "task-2",
+        title: "Waiting task",
+        status: "To Do",
+        description: "",
+        comments: [],
+        attachments: [],
+      },
+    ]);
+    mockQoder.performTask.mockImplementation(
+      () =>
+        new Promise<string>((resolve) => {
+          resolveFirst = resolve;
+        }),
+    );
+
+    const agent = createAgent();
+    agent.start();
+    await waitFor(() => mockQoder.performTask.mock.calls.length === 1);
+
+    // One task is being processed (default weight 1) and the second one is
+    // waiting to be admitted by the scheduler.
+    const result = { observe: jest.fn() };
+    observableGauges["queue"](result);
+
+    expect(result.observe.mock.calls).toEqual([
+      [1, { type: "tasks_queued" }],
+      [1, { type: "tasks_in_progress" }],
+      [1, { type: "weight_in_progress" }],
+    ]);
+
+    resolveFirst("First task done");
+    await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
     agent.stop();
   });
 

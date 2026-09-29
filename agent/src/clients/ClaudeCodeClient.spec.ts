@@ -10,14 +10,8 @@ import { Config } from "../Config";
 // declaration of this file has run; it is retrieved with requireMock below.
 jest.mock("../OTelContext", () => {
   const logger = { info: jest.fn(), warn: jest.fn(), error: jest.fn() };
-  // Session metric instruments, recreated on every instrument creation so
-  // a fresh client always gets fresh mocks.
-  const counters: Record<string, { add: jest.Mock }> = {};
-  const histograms: Record<string, { record: jest.Mock }> = {};
   return {
     __logger: logger,
-    __counters: counters,
-    __histograms: histograms,
     OTelTracer: jest.fn(() => ({
       startSpan: jest.fn(() => ({
         end: jest.fn(),
@@ -28,16 +22,6 @@ jest.mock("../OTelContext", () => {
     OTelLogger: jest.fn(() => ({
       createModuleLogger: jest.fn(() => logger),
     })),
-    OTelMeter: jest.fn(() => ({
-      createCounter: jest.fn((key: string) => {
-        counters[key] = { add: jest.fn() };
-        return counters[key];
-      }),
-      createHistogram: jest.fn((key: string) => {
-        histograms[key] = { record: jest.fn() };
-        return histograms[key];
-      }),
-    })),
   };
 });
 
@@ -46,12 +30,6 @@ const mockLogger = (
     __logger: { info: jest.Mock; warn: jest.Mock; error: jest.Mock };
   }
 ).__logger;
-
-const mockCounters = (
-  jest.requireMock("../OTelContext") as {
-    __counters: Record<string, { add: jest.Mock }>;
-  }
-).__counters;
 
 jest.mock("child_process", () => ({
   execFile: jest.fn(),
@@ -266,60 +244,6 @@ describe("ClaudeCodeClient", () => {
     );
 
     expect(summary).toBe("Done\n\n---\nModel: auto · Claude cost: $0.42");
-  });
-
-  it("should report the tokens of the run as session metrics", async () => {
-    mockExecFile.mockImplementation(
-      (
-        _command: string,
-        _args: string[],
-        _options: unknown,
-        callback: (error: Error | null, stdout: string, stderr: string) => void,
-      ) =>
-        callback(
-          null,
-          JSON.stringify({
-            result: "Done",
-            usage: {
-              input_tokens: 120,
-              output_tokens: 45,
-              cache_creation_input_tokens: 30,
-              cache_read_input_tokens: 600,
-            },
-          }),
-          "",
-        ),
-    );
-
-    await client.performTask(
-      task(),
-      path.join(os.tmpdir(), "claude-code-spec", "task-1-Agent.md"),
-    );
-
-    expect(mockCounters["agent.session.tokens"].add.mock.calls).toEqual([
-      [120, { agent: "claude-code", model: "auto", type: "input" }],
-      [45, { agent: "claude-code", model: "auto", type: "output" }],
-      [600, { agent: "claude-code", model: "auto", type: "cache_read" }],
-      [30, { agent: "claude-code", model: "auto", type: "cache_write" }],
-    ]);
-  });
-
-  it("should report no token metrics when the envelope has no usage object", async () => {
-    mockExecFile.mockImplementation(
-      (
-        _command: string,
-        _args: string[],
-        _options: unknown,
-        callback: (error: Error | null, stdout: string, stderr: string) => void,
-      ) => callback(null, JSON.stringify({ result: "Done" }), ""),
-    );
-
-    await client.performTask(
-      task(),
-      path.join(os.tmpdir(), "claude-code-spec", "task-1-Agent.md"),
-    );
-
-    expect(mockCounters["agent.session.tokens"].add).not.toHaveBeenCalled();
   });
 
   it("should fall back to the json result field when no summary file is written", async () => {

@@ -1,9 +1,7 @@
 import * as fse from "fs-extra";
 import * as path from "path";
 import { Config } from "../Config";
-import type { AgentSessionTokens } from "../AgentSessionMetrics";
 import {
-  extractClaudeStyleTokenUsage,
   extractEnvelopeNumber,
   extractEnvelopeString,
 } from "./CliOutput";
@@ -73,11 +71,6 @@ export class QoderClient extends BaseCliAgent {
 
   protected extractUsage(stdout: string): number | null {
     return extractCredits(stdout);
-  }
-
-  // The envelope is Claude Code-compatible and reports a 'usage' object.
-  protected extractTokenUsage(stdout: string): AgentSessionTokens | null {
-    return extractClaudeStyleTokenUsage(stdout);
   }
 
   protected usageLabel(): string {

@@ -230,13 +230,9 @@ Each task runs in its own working directory `DATA_DIR/tasks/<taskId>/` (stated i
 
 ### Observability and kill switch
 
-Every poll with picks or deferrals logs one `Scheduling round:` line (`picked:` with the weights, `deferred:` with the reasons) and the running tasks are reported on every poll while tasks run (title, project, weight, elapsed time, model). The following OpenTelemetry metrics are exported when instrumentation is enabled: the gauges `scheduler.running-weight` and `scheduler.queue-depth` and the counters `scheduler.tasks.picked` and `scheduler.tasks.deferred` (grouped by reason).
+Every poll with picks or deferrals logs one `Scheduling round:` line (`picked:` with the weights, `deferred:` with the reasons) and the running tasks are reported on every poll while tasks run (title, project, weight, elapsed time, model). When instrumentation is enabled, the scheduling queue is exported as the single `queue` gauge (observable gauges are exported as-is, without the service-name prefix): one data point per value, distinguished by the `type` attribute — `tasks_queued` (tasks ready and waiting to be admitted), `tasks_in_progress` (tasks currently being processed) and `weight_in_progress` (total scheduling weight of the tasks being processed).
 
-Every task execution (an agent session) additionally records the following metrics, labeled with `agent` (CLI name, e.g. `qoder`) and `model` (the resolved model, `auto` when the CLI default is used):
-
-- `agent.session.count` (counter): one increment per execution, with `status` `success` or `error` (timeouts and CLI errors are counted too).
-- `agent.session.duration` (histogram, seconds): wall-clock time of the CLI process, with the same `status`.
-- `agent.session.tokens` (counter): tokens spent by the execution, with `type` `input`, `output`, `cache_read` or `cache_write`. Only the CLIs that report token usage feed it: Claude Code and Qoder (the `usage` object of the JSON envelope) and Gemini CLI (the per-model `stats.models.*.tokens` of the run stats, `thoughts` counted as output); Copilot CLI and Codex report no token data, so their sessions only contribute `count` and `duration`.
+Every task execution (an agent session) records the `session.duration` histogram (exported as `planner-llm-agent.session.duration`, in seconds), labeled with `agent` (CLI name, e.g. `qoder`), `model` (the resolved model, `auto` when the CLI default is used) and `status` (`success`, or `error` for the failed executions: timeouts and CLI errors are recorded too).
 
 Setting `TASK_SMART_SCHEDULING=false` restores the historical behavior exactly: `TASK_MAX_PARALLEL` is a plain task count, weights, conflict keys and the utility model are ignored (no LLM call).
 

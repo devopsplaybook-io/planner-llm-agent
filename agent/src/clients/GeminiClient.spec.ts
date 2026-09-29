@@ -7,14 +7,8 @@ import { Config } from "../Config";
 
 jest.mock("../OTelContext", () => {
   const logger = { info: jest.fn(), warn: jest.fn(), error: jest.fn() };
-  // Session metric instruments, recreated on every instrument creation so
-  // a fresh client always gets fresh mocks.
-  const counters: Record<string, { add: jest.Mock }> = {};
-  const histograms: Record<string, { record: jest.Mock }> = {};
   return {
     __logger: logger,
-    __counters: counters,
-    __histograms: histograms,
     OTelTracer: jest.fn(() => ({
       startSpan: jest.fn(() => ({
         end: jest.fn(),
@@ -25,16 +19,6 @@ jest.mock("../OTelContext", () => {
     OTelLogger: jest.fn(() => ({
       createModuleLogger: jest.fn(() => logger),
     })),
-    OTelMeter: jest.fn(() => ({
-      createCounter: jest.fn((key: string) => {
-        counters[key] = { add: jest.fn() };
-        return counters[key];
-      }),
-      createHistogram: jest.fn((key: string) => {
-        histograms[key] = { record: jest.fn() };
-        return histograms[key];
-      }),
-    })),
   };
 });
 
@@ -43,12 +27,6 @@ const mockLogger = (
     __logger: { info: jest.Mock; warn: jest.Mock; error: jest.Mock };
   }
 ).__logger;
-
-const mockCounters = (
-  jest.requireMock("../OTelContext") as {
-    __counters: Record<string, { add: jest.Mock }>;
-  }
-).__counters;
 
 jest.mock("child_process", () => ({
   execFile: jest.fn(),
@@ -191,77 +169,6 @@ describe("GeminiClient", () => {
     expect(summary).toBe("Done");
     expect(await client.listModels()).toBeNull();
     expect(mockLogger.warn).not.toHaveBeenCalled();
-  });
-
-  it("should report the aggregated model tokens of the run as session metrics", async () => {
-    mockExecFile.mockImplementation(
-      (
-        _command: string,
-        _args: string[],
-        _options: unknown,
-        callback: (error: Error | null, stdout: string, stderr: string) => void,
-      ) =>
-        callback(
-          null,
-          JSON.stringify({
-            response: "Done",
-            stats: {
-              models: {
-                "gemini-2.5-pro": {
-                  tokens: {
-                    input: 100,
-                    prompt: 700,
-                    candidates: 50,
-                    cached: 600,
-                    thoughts: 20,
-                    total: 770,
-                  },
-                },
-                // Older CLI versions report no 'input': the total 'prompt'
-                // count is used instead.
-                "gemini-2.5-flash": {
-                  tokens: { prompt: 300, candidates: 10, thoughts: 5 },
-                },
-              },
-            },
-          }),
-          "",
-        ),
-    );
-
-    await client.performTask(
-      task(),
-      path.join(os.tmpdir(), "gemini-spec", "task-1-Agent.md"),
-    );
-
-    expect(mockCounters["agent.session.tokens"].add.mock.calls).toEqual([
-      [400, { agent: "gemini-cli", model: "auto", type: "input" }],
-      [85, { agent: "gemini-cli", model: "auto", type: "output" }],
-      [600, { agent: "gemini-cli", model: "auto", type: "cache_read" }],
-    ]);
-  });
-
-  it("should report no token metrics when the run stats have no token data", async () => {
-    mockExecFile.mockImplementation(
-      (
-        _command: string,
-        _args: string[],
-        _options: unknown,
-        callback: (error: Error | null, stdout: string, stderr: string) => void,
-      ) =>
-        callback(
-          null,
-          JSON.stringify({ response: "Done", stats: { total: 1 } }),
-          "",
-        ),
-    );
-
-    await client.performTask(
-      task(),
-      path.join(os.tmpdir(), "gemini-spec", "task-1-Agent.md"),
-    );
-
-    expect(mockCounters["agent.session.tokens"].add).not.toHaveBeenCalled();
   });
 
   it("should report a clear error when the CLI is not installed", async () => {
