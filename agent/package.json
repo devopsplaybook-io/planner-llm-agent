@@ -1,6 +1,6 @@
 {
   "name": "agent",
-  "version": "0.18.0",
+  "version": "0.18.1",
   "description": "LLM agent that connects to a Planner instance and executes assigned tasks",
   "author": "",
   "license": "MIT",
@@ -14,7 +14,7 @@
   },
   "dependencies": {
     "@devopsplaybook.io/otel-utils": "^1.1.3",
-    "fs-extra": "^11.4.0"
+    "fs-extra": "^11.4.1"
   },
   "devDependencies": {
     "@swc/core": "^1.16.2",
