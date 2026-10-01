@@ -1,6 +1,6 @@
 {
   "name": "agent",
-  "version": "0.18.0",
+  "version": "0.18.1",
   "description": "LLM agent that connects to a Planner instance and executes assigned tasks",
   "author": "",
   "license": "MIT",
@@ -21,7 +21,7 @@
     "@swc/jest": "^0.2.39",
     "@types/fs-extra": "^11.0.4",
     "@types/jest": "^30.0.0",
-    "@types/node": "^26.2.0",
+    "@types/node": "^26.6.3",
     "jest": "^30.4.2",
     "oxlint": "^1.83.0",
     "tsx": "^4.23.15",
