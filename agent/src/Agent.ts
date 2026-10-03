@@ -64,6 +64,7 @@ export class Agent {
   private cliAgents: Map<string, CliAgentClient>;
   private defaultAgent: string;
   private taskEvaluator: TaskEvaluator;
+  private running = false;
   private pollingTimer?: NodeJS.Timeout;
   // Tasks currently being processed with their scheduling metadata: they
   // are never picked again by a subsequent poll while their processing is
@@ -78,6 +79,10 @@ export class Agent {
   // utility-model evaluations or processing start), the next tick is
   // skipped, so tasks can never be registered twice (double-pick race).
   private polling = false;
+  // Adaptive polling: number of consecutive polls that found nothing to
+  // do. The polling delay doubles after every idle poll, capped at
+  // TASK_POLLING_MAX_INTERVAL; any activity resets it to the base interval.
+  private idlePolls = 0;
   // Ready tasks waiting to be admitted by the scheduler: refreshed on every
   // completed poll and reported by the queue gauge (see initQueueMetrics).
   private queuedTasks = 0;
@@ -110,21 +115,47 @@ export class Agent {
   }
 
   public start(): void {
+    if (this.running) {
+      return;
+    }
+    this.running = true;
     logger.info(
-      `Agent '${this.config.AGENT_NAME}' started (polling every ${this.config.TASK_POLLING_INTERVAL} seconds)`,
+      `Agent '${this.config.AGENT_NAME}' started (polling every ${this.config.TASK_POLLING_INTERVAL} seconds, backing off to at most ${this.maxPollingIntervalSeconds()} seconds between polls when idle)`,
     );
-    void this.pollForTasks();
-    this.pollingTimer = setInterval(() => {
-      void this.pollForTasks();
-    }, this.config.TASK_POLLING_INTERVAL * 1000);
+    void this.pollForTasks()
+      .finally(() => this.scheduleNextPoll())
+      .catch((error: Error) =>
+        logger.error(`Failed to run the polling loop: ${error.message}`),
+      );
   }
 
   public stop(): void {
-    if (this.pollingTimer) {
-      clearInterval(this.pollingTimer);
-      this.pollingTimer = undefined;
-      logger.info(`Agent '${this.config.AGENT_NAME}' stopped`);
+    if (!this.running) {
+      return;
     }
+    this.running = false;
+    if (this.pollingTimer) {
+      clearTimeout(this.pollingTimer);
+      this.pollingTimer = undefined;
+    }
+    logger.info(`Agent '${this.config.AGENT_NAME}' stopped`);
+  }
+
+  // The polling loop is self-rescheduling instead of a fixed interval: the
+  // next poll is scheduled once the current one completed, with a delay
+  // that doubles after every consecutive idle poll (adaptive backoff).
+  private scheduleNextPoll(): void {
+    if (!this.running) {
+      return;
+    }
+    this.pollingTimer = setTimeout(() => {
+      this.pollingTimer = undefined;
+      void this.pollForTasks()
+        .finally(() => this.scheduleNextPoll())
+        .catch((error: Error) =>
+          logger.error(`Failed to run the polling loop: ${error.message}`),
+        );
+    }, this.nextPollDelaySeconds() * 1000);
   }
 
   private async pollForTasks(): Promise<void> {
@@ -133,26 +164,62 @@ export class Agent {
     }
     this.polling = true;
     try {
-      await this.pollOnce();
+      const outcome = await this.pollOnce();
+      this.updatePollCadence(outcome);
     } finally {
       this.polling = false;
     }
   }
 
-  private async pollOnce(): Promise<void> {
+  // The delay before the next poll: the base TASK_POLLING_INTERVAL doubled
+  // after every consecutive idle poll (the first idle poll keeps the base
+  // interval), capped at the effective maximum.
+  private nextPollDelaySeconds(): number {
+    const base = this.pollingIntervalSeconds();
+    const factor = 2 ** Math.max(this.idlePolls - 1, 0);
+    return Math.min(base * factor, this.maxPollingIntervalSeconds());
+  }
+
+  // The effective polling ceiling: the largest of TASK_POLLING_MAX_INTERVAL
+  // and the base interval, so a misconfigured maximum can never make the
+  // agent poll faster than the base interval.
+  private maxPollingIntervalSeconds(): number {
+    return Math.max(
+      this.pollingIntervalSeconds(),
+      this.configuredMaxPollingIntervalSeconds(),
+    );
+  }
+
+  private pollingIntervalSeconds(): number {
+    const value = this.config.TASK_POLLING_INTERVAL;
+    return Number.isFinite(value) && value > 0 ? value : 60;
+  }
+
+  private configuredMaxPollingIntervalSeconds(): number {
+    const value = this.config.TASK_POLLING_MAX_INTERVAL;
+    return Number.isFinite(value) && value > 0 ? value : 300;
+  }
+
+  private updatePollCadence(outcome: PollOutcome): void {
+    if (outcome === "error") {
+      // An error says nothing about idleness: keep the current cadence.
+      return;
+    }
+    // Anything to do keeps the base cadence: picked or queued candidates,
+    // tasks still running and pending Planner finalizations are all work
+    // the next poll must reach without waiting out a backoff.
+    const active =
+      outcome === "actionable" ||
+      this.processingTasks.size > 0 ||
+      this.finalizationStore.size > 0;
+    this.idlePolls = active ? 0 : this.idlePolls + 1;
+  }
+
+  private async pollOnce(): Promise<PollOutcome> {
+    let outcome: PollOutcome = "idle";
     try {
       const user = await this.planner.getCurrentUser();
-      const tasks = await this.planner.listAssignedTasks(user);
-      await this.cleanupCompletedTasks(tasks);
-      // Records of the tasks that are no longer assigned can never be
-      // finalized: drop them.
-      this.finalizationStore.prune(new Set(tasks.map((task) => task.id)));
-      this.logRunningTasks();
       const actions = this.getActions();
-      if (actions.length === 0 || tasks.length === 0) {
-        this.queuedTasks = 0;
-        return;
-      }
       // The projects are loaded lazily, once per poll: the project-bound
       // actions match on the project names, and the task brief includes the
       // project name and description.
@@ -165,6 +232,29 @@ export class Agent {
           }
           return projects;
         };
+      // Cut the poll payload: when every action is bound to a project
+      // pattern, the task list is fetched per project instead of across
+      // all projects.
+      const projectScope = await this.taskScopeProjectIds(
+        actions,
+        loadProjects,
+      );
+      const tasks = await this.planner.listAssignedTasks(
+        user,
+        projectScope ?? undefined,
+      );
+      await this.cleanupCompletedTasks(tasks);
+      // Records of the tasks that are no longer assigned can never be
+      // finalized: drop them.
+      this.finalizationStore.prune(new Set(tasks.map((task) => task.id)));
+      this.logRunningTasks();
+      if (actions.length === 0 || tasks.length === 0) {
+        this.queuedTasks = 0;
+        return outcome;
+      }
+      // The project-bound actions match on the project names: the projects
+      // are loaded when any action needs them (the scoped fetch above
+      // already loaded them when every action is project-bound).
       if (actions.some((action) => action.project.length > 0)) {
         await loadProjects();
       }
@@ -191,7 +281,7 @@ export class Agent {
       }
       if (candidates.length === 0) {
         this.queuedTasks = 0;
-        return;
+        return outcome;
       }
       // Queue order: higher priorities first; within the same priority the
       // task whose last update is the oldest is picked first. The sort is
@@ -203,14 +293,17 @@ export class Agent {
             dateUpdatedValue(b.task.dateUpdated),
       );
       if (this.isSmartSchedulingEnabled()) {
+        outcome = "actionable";
         await this.selectTasksWithScheduler(candidates, loadProjects);
       } else {
+        outcome = "actionable";
         await this.selectTasksWithKillSwitch(candidates, loadProjects);
       }
     } catch (error) {
       logger.error(
         `Failed to poll tasks from Planner: ${(error as Error).message}`,
       );
+      outcome = "error";
     } finally {
       // The finalization retries run after the selection of this poll: a
       // record deleted by a successful retry can then no longer influence
@@ -218,6 +311,36 @@ export class Agent {
       // on retry is never re-picked by that poll.
       await this.retryDueFinalizations();
     }
+    return outcome;
+  }
+
+  // The project ids the task fetch is scoped to, or null for the unscoped
+  // fetch: the scoping only applies when every action is bound to a
+  // project pattern, and it falls back to the unscoped list when no
+  // project matches the patterns (the client-side matching then rejects
+  // every task, exactly like the unscoped fetch does).
+  private async taskScopeProjectIds(
+    actions: AgentAction[],
+    loadProjects: () => Promise<Map<string, PlannerProject>>,
+  ): Promise<string[] | null> {
+    if (
+      actions.length === 0 ||
+      actions.some((action) => action.project.length === 0)
+    ) {
+      return null;
+    }
+    const projects = await loadProjects();
+    const ids: string[] = [];
+    for (const project of projects.values()) {
+      if (
+        actions.some((action) =>
+          matchProjectPattern(action.project, project.name),
+        )
+      ) {
+        ids.push(project.id);
+      }
+    }
+    return ids.length > 0 ? ids : null;
   }
 
   // Smart scheduling (default): weighted capacity budget, conflict-aware
@@ -857,6 +980,11 @@ function extractTaskId(entry: string): string | undefined {
   );
   return match ? match[1].toLowerCase() : undefined;
 }
+
+// What a poll found: actionable work (scheduler candidates), nothing to
+// do, or a failure to reach Planner (the polling cadence is only adapted
+// on the first two outcomes).
+type PollOutcome = "actionable" | "idle" | "error";
 
 // A ready (task, action) pair, before the scheduler resolves the project
 // name and the scheduling metadata.

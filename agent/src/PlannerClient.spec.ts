@@ -151,6 +151,24 @@ describe("PlannerClient", () => {
     );
   });
 
+  it("should scope the task fetch to the given project ids", async () => {
+    fetchMock.mockResolvedValue(new Response(JSON.stringify([]), { status: 200 }));
+
+    const client = new PlannerClient(config);
+    await client.listAssignedTasks({ id: "user-1", name: "Didier" }, [
+      "p1",
+      "p2",
+    ]);
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://planner.test:8080/api/tasks?projectIds=p1%2Cp2",
+      expect.objectContaining({
+        method: "GET",
+        headers: expect.objectContaining({ "x-api-key": "test-api-key" }),
+      }),
+    );
+  });
+
   it("should map the task priority and last update date", async () => {
     fetchMock.mockResolvedValue(
       new Response(

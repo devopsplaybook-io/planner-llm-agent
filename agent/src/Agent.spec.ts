@@ -157,6 +157,10 @@ describe("Agent", () => {
     delete process.env.TASK_POLLING_INTERVAL;
     config = new Config();
     config.TASK_POLLING_INTERVAL = 5;
+    // The backoff ceiling equals the base interval: the polling cadence of
+    // the tests below stays at the configured interval unless a test
+    // overrides the ceiling to exercise the backoff.
+    config.TASK_POLLING_MAX_INTERVAL = 5;
     dataDir = path.join(os.tmpdir(), `agent-spec-${Date.now()}`);
     config.DATA_DIR = dataDir;
 
@@ -338,6 +342,147 @@ describe("Agent", () => {
     await flushPoll();
     expect(mockPlanner.getCurrentUser).toHaveBeenCalledTimes(4); // initial + 3 polls
     agent.stop();
+  });
+
+  it("should back off the polling while idle and resume the base cadence on activity", async () => {
+    jest.useFakeTimers();
+    config.TASK_POLLING_INTERVAL = 1;
+    config.TASK_POLLING_MAX_INTERVAL = 8;
+    const realSetTimeout = jest.requireActual("timers").setTimeout;
+    const flushPoll = async (): Promise<void> => {
+      await new Promise((resolve) => realSetTimeout(resolve, 5));
+    };
+    // waitFor() cannot be used under fake timers (it sleeps with the
+    // mocked setTimeout), so the milestones are awaited with real timers.
+    const waitForReal = async (condition: () => boolean): Promise<void> => {
+      for (let i = 0; i < 200 && !condition(); i++) {
+        await new Promise((resolve) => realSetTimeout(resolve, 10));
+      }
+      expect(condition()).toBe(true);
+    };
+    const agent = createAgent();
+    agent.start();
+    await flushPoll(); // poll 1: idle
+    expect(mockPlanner.getCurrentUser).toHaveBeenCalledTimes(1);
+
+    // The first idle poll keeps the base interval.
+    await jest.advanceTimersByTimeAsync(1000);
+    await flushPoll();
+    expect(mockPlanner.getCurrentUser).toHaveBeenCalledTimes(2);
+
+    // The next idle poll doubles the interval: 1 second is not enough.
+    await jest.advanceTimersByTimeAsync(1000);
+    await flushPoll();
+    expect(mockPlanner.getCurrentUser).toHaveBeenCalledTimes(2);
+    await jest.advanceTimersByTimeAsync(1000);
+    await flushPoll();
+    expect(mockPlanner.getCurrentUser).toHaveBeenCalledTimes(3);
+
+    // A task being picked resets the cadence: the next poll runs at the
+    // base interval again.
+    mockPlannerTasks([
+      {
+        id: "task-1",
+        title: "New task",
+        status: "To Do",
+        description: "Work to do",
+        comments: [],
+        attachments: [],
+      },
+    ]);
+    mockQoder.performTask.mockResolvedValue("done");
+    await jest.advanceTimersByTimeAsync(4000); // 4s backoff: poll 4 picks the task
+    await waitForReal(() => mockQoder.performTask.mock.calls.length === 1);
+    expect(mockPlanner.getCurrentUser).toHaveBeenCalledTimes(4);
+
+    await jest.advanceTimersByTimeAsync(1000);
+    await flushPoll();
+    expect(mockPlanner.getCurrentUser).toHaveBeenCalledTimes(5);
+    agent.stop();
+  });
+
+  it("should scope the task fetch to the configured projects when every action is project-bound", async () => {
+    mockPlanner.listProjects.mockResolvedValue([
+      { id: "proj-web", name: "Web", description: "" },
+      { id: "proj-docs", name: "Docs", description: "" },
+      { id: "proj-other", name: "Other", description: "" },
+    ]);
+    mockPlannerTasks([]);
+    const agent = createAgent({
+      defaultModel: "",
+      defaultTimeout: null,
+      actions: [
+        {
+          project: "Web",
+          statusStart: "To Do",
+          statusEnd: "Done",
+          model: "",
+          instruction: "",
+          timeout: null,
+          weight: null,
+        },
+        {
+          project: "Docs*",
+          statusStart: "To Do",
+          statusEnd: "Done",
+          model: "",
+          instruction: "",
+          timeout: null,
+          weight: null,
+        },
+      ],
+    });
+    agent.start();
+    await waitFor(() => mockPlanner.listAssignedTasks.mock.calls.length === 1);
+    agent.stop();
+
+    expect(mockPlanner.listAssignedTasks).toHaveBeenCalledWith(
+      { id: "user-1", name: "Test User" },
+      ["proj-web", "proj-docs"],
+    );
+  });
+
+  it("should fetch the tasks unscoped when an action matches every project", async () => {
+    mockPlannerTasks([]);
+    const agent = createAgent();
+    agent.start();
+    await waitFor(() => mockPlanner.listAssignedTasks.mock.calls.length === 1);
+    agent.stop();
+
+    expect(mockPlanner.listAssignedTasks).toHaveBeenCalledWith(
+      { id: "user-1", name: "Test User" },
+      undefined,
+    );
+  });
+
+  it("should fetch the tasks unscoped when no project matches the patterns", async () => {
+    mockPlanner.listProjects.mockResolvedValue([
+      { id: "proj-other", name: "Other", description: "" },
+    ]);
+    mockPlannerTasks([]);
+    const agent = createAgent({
+      defaultModel: "",
+      defaultTimeout: null,
+      actions: [
+        {
+          project: "Web",
+          statusStart: "To Do",
+          statusEnd: "Done",
+          model: "",
+          instruction: "",
+          timeout: null,
+          weight: null,
+        },
+      ],
+    });
+    agent.start();
+    await waitFor(() => mockPlanner.listAssignedTasks.mock.calls.length === 1);
+    agent.stop();
+
+    expect(mockPlanner.listAssignedTasks).toHaveBeenCalledWith(
+      { id: "user-1", name: "Test User" },
+      undefined,
+    );
   });
 
   it("should not log when assigned tasks are not ready to be processed", async () => {

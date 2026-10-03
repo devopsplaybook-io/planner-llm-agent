@@ -25,12 +25,14 @@ export class Config {
   public PLANNER_URL: string;
   public PLANNER_API_KEY: string;
   public TASK_POLLING_INTERVAL: number;
+  public TASK_POLLING_MAX_INTERVAL: number;
   public TASK_STATUS_CLEANUP: string;
   public TASK_MAX_PARALLEL: number;
   public TASK_TIMEOUT: number;
   public TASK_SMART_SCHEDULING: boolean;
   public TASK_CONFLICT_MODE: string;
   public AGENT_UTILITY_MODEL: string;
+  public AGENT_EVALUATION_TIMEOUT: number;
   public AGENT_NOTE_PROJECT: string;
   public AGENT_NOTE_INTERVAL: number;
 
@@ -92,12 +94,17 @@ export class Config {
     this.PLANNER_URL = "http://localhost:8080";
     this.PLANNER_API_KEY = "";
     this.TASK_POLLING_INTERVAL = 60;
+    // Adaptive polling ceiling: the polling interval doubles after every
+    // consecutive idle poll, up to this many seconds.
+    this.TASK_POLLING_MAX_INTERVAL = 300;
     this.TASK_STATUS_CLEANUP = "Done";
     this.TASK_MAX_PARALLEL = 1;
     this.TASK_TIMEOUT = 3600;
     this.TASK_SMART_SCHEDULING = true;
     this.TASK_CONFLICT_MODE = "repo";
     this.AGENT_UTILITY_MODEL = "";
+    // Bound of one scheduling round's utility-model evaluations (seconds).
+    this.AGENT_EVALUATION_TIMEOUT = 30;
     this.AGENT_NOTE_PROJECT = "";
     this.AGENT_NOTE_INTERVAL = 86400;
 
@@ -157,6 +164,10 @@ export class Config {
     if (config.TASK_POLLING_INTERVAL) {
       this.TASK_POLLING_INTERVAL = config.TASK_POLLING_INTERVAL as number;
     }
+    if (config.TASK_POLLING_MAX_INTERVAL) {
+      this.TASK_POLLING_MAX_INTERVAL =
+        config.TASK_POLLING_MAX_INTERVAL as number;
+    }
     if (config.TASK_STATUS_CLEANUP) {
       this.TASK_STATUS_CLEANUP = config.TASK_STATUS_CLEANUP as string;
     }
@@ -174,6 +185,10 @@ export class Config {
     }
     if (config.AGENT_UTILITY_MODEL !== undefined) {
       this.AGENT_UTILITY_MODEL = (config.AGENT_UTILITY_MODEL ?? "") as string;
+    }
+    if (config.AGENT_EVALUATION_TIMEOUT) {
+      this.AGENT_EVALUATION_TIMEOUT =
+        config.AGENT_EVALUATION_TIMEOUT as number;
     }
     if (config.AGENT_NOTE_PROJECT) {
       this.AGENT_NOTE_PROJECT = config.AGENT_NOTE_PROJECT as string;
@@ -285,6 +300,11 @@ export class Config {
     if (process.env.TASK_POLLING_INTERVAL) {
       this.TASK_POLLING_INTERVAL = parseInt(process.env.TASK_POLLING_INTERVAL);
     }
+    if (process.env.TASK_POLLING_MAX_INTERVAL) {
+      this.TASK_POLLING_MAX_INTERVAL = parseInt(
+        process.env.TASK_POLLING_MAX_INTERVAL,
+      );
+    }
     if (process.env.TASK_STATUS_CLEANUP) {
       this.TASK_STATUS_CLEANUP = process.env.TASK_STATUS_CLEANUP;
     }
@@ -305,6 +325,11 @@ export class Config {
     }
     if (process.env.AGENT_UTILITY_MODEL !== undefined) {
       this.AGENT_UTILITY_MODEL = process.env.AGENT_UTILITY_MODEL ?? "";
+    }
+    if (process.env.AGENT_EVALUATION_TIMEOUT) {
+      this.AGENT_EVALUATION_TIMEOUT = parseInt(
+        process.env.AGENT_EVALUATION_TIMEOUT,
+      );
     }
     if (process.env.AGENT_NOTE_PROJECT) {
       this.AGENT_NOTE_PROJECT = process.env.AGENT_NOTE_PROJECT;
@@ -429,6 +454,15 @@ export class Config {
     }
 
     if (
+      !Number.isInteger(this.TASK_POLLING_MAX_INTERVAL) ||
+      this.TASK_POLLING_MAX_INTERVAL <= 0
+    ) {
+      errors.push(
+        `TASK_POLLING_MAX_INTERVAL must be a positive integer (current value: '${this.TASK_POLLING_MAX_INTERVAL}')`,
+      );
+    }
+
+    if (
       !Number.isFinite(this.TASK_MAX_PARALLEL) ||
       this.TASK_MAX_PARALLEL <= 0
     ) {
@@ -440,6 +474,15 @@ export class Config {
     if (!Number.isInteger(this.TASK_TIMEOUT) || this.TASK_TIMEOUT <= 0) {
       errors.push(
         `TASK_TIMEOUT must be a positive integer (current value: '${this.TASK_TIMEOUT}')`,
+      );
+    }
+
+    if (
+      !Number.isInteger(this.AGENT_EVALUATION_TIMEOUT) ||
+      this.AGENT_EVALUATION_TIMEOUT <= 0
+    ) {
+      errors.push(
+        `AGENT_EVALUATION_TIMEOUT must be a positive integer (current value: '${this.AGENT_EVALUATION_TIMEOUT}')`,
       );
     }
 

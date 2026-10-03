@@ -8,6 +8,32 @@ import {
   parseEvaluation,
 } from "./TaskEvaluator";
 
+// The OpenTelemetry meter is mocked so the evaluation counter is observable;
+// the logger still reaches console.log for the logSpy assertions.
+jest.mock("./OTelContext", () => {
+  const counters: Record<string, { add: jest.Mock }> = {};
+  const logger = {
+    info: (...args: unknown[]) => console.log(...args),
+    warn: (...args: unknown[]) => console.log(...args),
+    error: (...args: unknown[]) => console.log(...args),
+  };
+  return {
+    __counters: counters,
+    OTelLogger: () => ({ createModuleLogger: () => logger }),
+    OTelMeter: () => ({
+      createCounter: (key: string) => {
+        counters[key] ??= { add: jest.fn() };
+        return counters[key];
+      },
+    }),
+  };
+});
+
+const evaluationCounters = (): Record<string, { add: jest.Mock }> =>
+  (jest.requireMock("./OTelContext") as {
+    __counters: Record<string, { add: jest.Mock }>;
+  }).__counters;
+
 const buildTask = (overrides: Partial<PlannerTask> & { id: string }): PlannerTask => ({
   projectId: "p1",
   title: `Task ${overrides.id}`,
@@ -44,13 +70,21 @@ const buildMockCli = (): MockCli =>
 
 const buildEvaluator = (
   mockCli: CliAgentClient,
-  options: { model?: string; timeoutMs?: number; concurrency?: number } = {},
+  options: {
+    model?: string;
+    timeoutMs?: number;
+    concurrency?: number;
+    cacheCapacity?: number;
+    cacheTtlMs?: number;
+  } = {},
 ): TaskEvaluator => {
   const config = new Config();
   config.AGENT_UTILITY_MODEL = options.model ?? "qwen3-flash";
   return new TaskEvaluator(config, mockCli, {
     timeoutMs: options.timeoutMs,
     concurrency: options.concurrency,
+    cacheCapacity: options.cacheCapacity,
+    cacheTtlMs: options.cacheTtlMs,
   });
 };
 
@@ -160,7 +194,7 @@ describe("TaskEvaluator", () => {
       expect(prompt).toContain("Implement the feature");
       expect(options).toEqual({
         model: "qwen3-flash",
-        timeoutMs: 60000,
+        timeoutMs: 30000,
         purpose: "utility-model evaluation 'Task t1'",
       });
     });
@@ -308,6 +342,164 @@ describe("TaskEvaluator", () => {
       expect(evaluations.size).toBe(4);
       expect(mockCli.runPrompt).toHaveBeenCalledTimes(4);
       expect(maxObserved).toBe(1);
+    });
+  });
+
+  describe("bounded round, circuit breaker and cache bounds", () => {
+    const realSleep = (ms: number): Promise<void> =>
+      new Promise((resolve) => setTimeout(resolve, ms));
+
+    it("bounds the round and lets a queued evaluation land in the cache in the background", async () => {
+      const mockCli = buildMockCli();
+      // The first evaluation hangs forever; the second resolves quickly.
+      mockCli.runPrompt.mockImplementation(() => {
+        if (mockCli.runPrompt.mock.calls.length === 1) {
+          return new Promise<string>(() => undefined);
+        }
+        return new Promise<string>((resolve) => {
+          const timer = setTimeout(
+            () => resolve('{"weight": 0.5, "conflicts": [], "kind": "code-light"}'),
+            30,
+          );
+          timer.unref?.();
+        });
+      });
+      const evaluator = buildEvaluator(mockCli, {
+        timeoutMs: 50,
+        concurrency: 1,
+      });
+      const t1 = buildTask({ id: "t1" });
+      const t2 = buildTask({ id: "t2" });
+
+      const evaluations = await evaluator.evaluateAll([
+        { task: t1, projectName: "Web" },
+        { task: t2, projectName: "Web" },
+      ]);
+      // The round returned at the bound: both tasks carry the fallback for
+      // this round (the first call timed out, the second had not run yet).
+      expect(evaluations.get("t1")).toEqual(fallbackEvaluation());
+      expect(evaluations.get("t2")).toEqual(fallbackEvaluation());
+
+      // The evaluation queued behind the timed-out one keeps running and
+      // its result lands in the cache for the next round.
+      await realSleep(300);
+      expect(mockCli.runPrompt).toHaveBeenCalledTimes(2);
+      await expect(evaluator.evaluateTask(t2, "Web")).resolves.toEqual({
+        weight: 0.5,
+        conflicts: [],
+        kind: "code-light",
+      });
+      expect(mockCli.runPrompt).toHaveBeenCalledTimes(2);
+    });
+
+    it("opens the circuit breaker after consecutive timeouts and skips the utility model during the cooldown", async () => {
+      const mockCli = buildMockCli();
+      mockCli.runPrompt.mockImplementation(
+        () => new Promise<string>(() => undefined),
+      );
+      const evaluator = buildEvaluator(mockCli, {
+        timeoutMs: 10,
+        concurrency: 3,
+      });
+
+      // Three consecutive timeouts open the circuit.
+      const inputs = ["t1", "t2", "t3"].map((id) => ({
+        task: buildTask({ id }),
+        projectName: "Web",
+      }));
+      const evaluations = await evaluator.evaluateAll(inputs);
+      expect(mockCli.runPrompt).toHaveBeenCalledTimes(3);
+      expect(evaluations.get("t1")).toEqual(fallbackEvaluation());
+      // The per-call timeout catches settle in the macrotasks after the
+      // round returned: let them run before the next round.
+      await realSleep(30);
+
+      // While the circuit is open the utility model is not called at all:
+      // the cached evaluations still apply, the others fall back.
+      mockCli.runPrompt.mockClear();
+      const duringOpen = await evaluator.evaluateAll([
+        { task: buildTask({ id: "t1" }), projectName: "Web" },
+        { task: buildTask({ id: "t4" }), projectName: "Web" },
+      ]);
+      expect(mockCli.runPrompt).not.toHaveBeenCalled();
+      expect(duringOpen.get("t1")).toEqual(fallbackEvaluation());
+      expect(duringOpen.get("t4")).toEqual(fallbackEvaluation());
+
+      // After the cooldown the calls resume.
+      const nowSpy = jest
+        .spyOn(Date, "now")
+        .mockReturnValue(Date.now() + 6 * 60 * 1000);
+      mockCli.runPrompt.mockResolvedValue(
+        '{"weight": 0.75, "conflicts": [], "kind": "code-heavy"}',
+      );
+      const after = await evaluator.evaluateAll([
+        { task: buildTask({ id: "t4" }), projectName: "Web" },
+      ]);
+      expect(mockCli.runPrompt).toHaveBeenCalledTimes(1);
+      expect(after.get("t4")?.weight).toBe(0.75);
+      nowSpy.mockRestore();
+    });
+
+    it("counts the evaluations by outcome", async () => {
+      const mockCli = buildMockCli();
+      mockCli.runPrompt
+        .mockResolvedValueOnce(
+          '{"weight": 0.5, "conflicts": [], "kind": "code-light"}',
+        )
+        .mockRejectedValueOnce(new Error("CLI is down"))
+        .mockImplementation(() => new Promise<string>(() => undefined));
+      const evaluator = buildEvaluator(mockCli, {
+        timeoutMs: 10,
+        concurrency: 3,
+      });
+
+      await evaluator.evaluateTask(buildTask({ id: "t1" }), "Web");
+      await evaluator.evaluateTask(buildTask({ id: "t2" }), "Web");
+      await evaluator.evaluateTask(buildTask({ id: "t3" }), "Web");
+
+      const add = evaluationCounters()["evaluations"].add;
+      expect(add).toHaveBeenCalledWith(1, { result: "success" });
+      expect(add).toHaveBeenCalledWith(1, { result: "failure" });
+      expect(add).toHaveBeenCalledWith(1, { result: "timeout" });
+    });
+
+    it("evicts the least recently used evaluations beyond the cache capacity", async () => {
+      const mockCli = buildMockCli();
+      mockCli.runPrompt.mockResolvedValue(
+        '{"weight": 0.5, "conflicts": [], "kind": "code-light"}',
+      );
+      const evaluator = buildEvaluator(mockCli, { cacheCapacity: 2 });
+
+      await evaluator.evaluateTask(buildTask({ id: "t1" }), "Web");
+      await evaluator.evaluateTask(buildTask({ id: "t2" }), "Web");
+      await evaluator.evaluateTask(buildTask({ id: "t3" }), "Web"); // evicts t1
+      expect(mockCli.runPrompt).toHaveBeenCalledTimes(3);
+
+      await evaluator.evaluateTask(buildTask({ id: "t1" }), "Web"); // re-evaluated
+      expect(mockCli.runPrompt).toHaveBeenCalledTimes(4);
+
+      await evaluator.evaluateTask(buildTask({ id: "t3" }), "Web"); // still cached
+      expect(mockCli.runPrompt).toHaveBeenCalledTimes(4);
+    });
+
+    it("drops the cached evaluations past the TTL", async () => {
+      const mockCli = buildMockCli();
+      mockCli.runPrompt.mockResolvedValue(
+        '{"weight": 0.5, "conflicts": [], "kind": "code-light"}',
+      );
+      const evaluator = buildEvaluator(mockCli, { cacheTtlMs: 50 });
+      const task = buildTask({ id: "t1" });
+
+      await evaluator.evaluateTask(task, "Web");
+      await evaluator.evaluateTask(task, "Web");
+      expect(mockCli.runPrompt).toHaveBeenCalledTimes(1);
+
+      const nowSpy = jest
+        .spyOn(Date, "now")
+        .mockReturnValue(Date.now() + 60 * 1000);
+      await evaluator.evaluateTask(task, "Web");
+      expect(mockCli.runPrompt).toHaveBeenCalledTimes(2);
+      nowSpy.mockRestore();
     });
   });
 });

@@ -78,10 +78,21 @@ export class PlannerClient {
     }
   }
 
-  public async listAssignedTasks(user: PlannerUser): Promise<PlannerTask[]> {
+  // When project ids are given, the fetch is scoped to them through the
+  // endpoint's comma-separated 'projectIds' filter: the poll payload then
+  // only carries the tasks of the projects the agent's actions cover
+  // instead of every project's full list.
+  public async listAssignedTasks(
+    user: PlannerUser,
+    projectIds?: string[],
+  ): Promise<PlannerTask[]> {
     const span = OTelTracer().startSpan("planner-client.list-assigned-tasks");
     try {
-      const body = await this.request("/api/tasks", "GET", span);
+      const path =
+        projectIds && projectIds.length > 0
+          ? `/api/tasks?projectIds=${encodeURIComponent(projectIds.join(","))}`
+          : "/api/tasks";
+      const body = await this.request(path, "GET", span);
       if (!Array.isArray(body)) {
         throw new Error("Planner tasks response is not a list");
       }
