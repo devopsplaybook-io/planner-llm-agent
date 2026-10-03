@@ -6,7 +6,7 @@ The agent polls the Planner API for tasks assigned to its user and executes the 
 
 Polling stays quiet: log entries are only emitted when a task is ready to be processed and during its processing (plus errors), not on every poll cycle.
 
-Tasks are processed with a bounded parallelism driven by a weighted capacity budget (`TASK_MAX_PARALLEL`, default `1`): every task consumes a scheduling weight between 0.25 and 1, and tasks are admitted while their total weight fits the budget, so several small tasks can share what a single large task would consume. Tasks that would exceed the budget or work on a resource already claimed by a running task are deferred to a later poll (with the reason logged) instead of blocking the queue, and a task already being processed is never picked again by a subsequent poll. Ready tasks are picked by priority first (high, then medium, then low; an unknown or missing priority ranks as medium) and, within the same priority, the task whose last update is the oldest is picked first, so the tasks waiting the longest without any update go first. A task that fails to process is not retried forever: it is moved to the end status with a comment explaining the error (kept concise in the comment; see the agent logs for full details), so it does not block the queue. The whole scheduling model is described in [Parallel scheduling](#parallel-scheduling) and can be reverted to the historical count-based behavior with `TASK_SMART_SCHEDULING=false`.
+Tasks are processed with a bounded parallelism driven by a weighted capacity budget (`TASK_MAX_PARALLEL`, default `1`): every task consumes a scheduling weight between 0.25 and 1, and tasks are admitted while their total weight fits the budget, so several small tasks can share what a single large task would consume. Tasks that would exceed the budget or work on a resource already claimed by a running task are deferred to a later poll (with the reason logged) instead of blocking the queue, and a task already being processed is never picked again by a subsequent poll. Ready tasks are picked by priority first (high, then medium, then low; an unknown or missing priority ranks as medium) and, within the same priority, the task whose last update is the oldest is picked first, so the tasks waiting the longest without any update go first. A task that fails to process is not retried forever: it is moved to the end status with a comment explaining the error (kept concise in the comment; see the agent logs for full details), so it does not block the queue. Once a task's CLI work is done, its result is recorded in a finalization ledger: the result comment and the status move are retried with an exponential backoff on the following polls until the Planner accepts them — the CLI work itself is never re-executed. The whole scheduling model is described in [Parallel scheduling](#parallel-scheduling) and can be reverted to the historical count-based behavior with `TASK_SMART_SCHEDULING=false`.
 
 The container ships all the toolchains needed to perform the tasks (Node.js, Python, Go, Rust, Java, shellcheck, jq, yq, kubectl, helm), every supported coding-agent CLI (see [CLI agent](#cli-agent)) as well as a complete Git and GitHub tooling set (`git`, `gh`, `gnupg`, `openssh-client`).
 
@@ -26,12 +26,14 @@ Configuration values are resolved with the following priority:
 | `AGENT_ACTIONS_FILE`    | `/etc/planner/llm-agent.yaml` | Path of the agent actions YAML file, watched for changes at runtime (see [Agent actions](#agent-actions)) |
 | `PLANNER_URL`           | `http://localhost:8080`       | Planner instance base URL                                                 |
 | `PLANNER_API_KEY`       | (empty)                       | Planner API key (required)                                                |
-| `TASK_POLLING_INTERVAL` | `60`                          | Seconds between polls of assigned tasks                                   |
+| `TASK_POLLING_INTERVAL` | `60`                          | Seconds between polls of assigned tasks; the base of the adaptive idle polling |
+| `TASK_POLLING_MAX_INTERVAL` | `300`                     | Upper bound of the adaptive idle polling (seconds): consecutive polls without anything actionable double the interval up to this value (see [Polling](#polling)) |
 | `TASK_STATUS_CLEANUP`   | `Done`                        | Local task folder is deleted when a task reaches this status              |
 | `TASK_MAX_PARALLEL`     | `1`                           | Weighted capacity budget of the parallel scheduling (decimals allowed, e.g. `1.9`; at most ceil(budget) CLI processes run concurrently; see [Parallel scheduling](#parallel-scheduling)) |
 | `TASK_SMART_SCHEDULING` | `true`                        | Weighted, conflict-aware scheduling when `true`; `false` restores the historical count-based parallelism |
 | `TASK_CONFLICT_MODE`    | `repo`                        | Automatic conflict keys derived from the task content: `repo`, `project` or `none` (see [Parallel scheduling](#parallel-scheduling)) |
 | `AGENT_UTILITY_MODEL`   | (empty)                       | Fast/cheap model (on the configured CLI) pre-evaluating the weight and repositories of hint-less tasks; empty disables it (zero LLM calls) |
+| `AGENT_EVALUATION_TIMEOUT` | `20`                       | Timeout of one utility-model evaluation in seconds                        |
 | `TASK_TIMEOUT`          | `3600`                        | Maximum duration of a task execution in seconds (fallback when the actions configuration defines no timeout) |
 | `DATA_DIR`              | `/data`                       | Persistent data directory (task documentation files)                      |
 | `TMP_DIR`               | `/tmp`                        | Temporary directory                                                       |
@@ -221,8 +223,15 @@ When `AGENT_UTILITY_MODEL` is set to a model available on the configured CLI, th
 
 - The prompt contains the task title, project and description (plus the latest comments) and expects a single JSON reply: `{"weight": <number>, "conflicts": ["repo:owner/name", ...], "kind": "<code-heavy|code-light|non-code>"}`.
 - The evaluated weight fills the same slot as an action weight (the description directive still wins) and the repository keys returned by the model are merged into the conflict keys. Only keys with the `repo:` shape are accepted, so a model answer cannot inject arbitrary locks; everything else fails open (fallback weight `1`, no extra conflicts).
-- Evaluations are cached per task content version (a task is evaluated once per update, not per poll), only the tasks that could still be admitted this round are evaluated, at most 3 evaluations run concurrently and never more than the process cap of the scheduler (every evaluation is one CLI process), and each is bounded by a 60 seconds timeout. A failing or slow utility model never blocks the scheduling: the task falls back to the default weight and the deterministic conflict keys, and the failure is logged once per content version.
+- The evaluations never block the scheduling: a round selects the tasks from the evaluations cached by previous rounds (tasks without a fresh cached evaluation start with the default weight) while the missing ones are evaluated in the background for the next rounds. Evaluations are cached per task content version (a task is evaluated once per update, not per poll; the cache is bounded in size and entries expire after 30 minutes), only the tasks that could still be admitted this round are evaluated, at most 3 evaluations run concurrently and never more than the process cap of the scheduler (every evaluation is one CLI process), and each is bounded by `AGENT_EVALUATION_TIMEOUT` (default 20 seconds).
+- A failing or slow utility model never blocks the scheduling: the task falls back to the default weight and the deterministic conflict keys, and the failure is logged once per content version. A model that times out is reported by the `evaluation.timeouts` counter; after 3 consecutive timeouts the circuit breaker opens and the utility model is skipped entirely for a jittered cooldown (5 minutes, doubling per recurrence up to 30 minutes) so a hung model cannot consume evaluation slots on every poll. The breaker closes again on the first successful evaluation.
 - When `AGENT_UTILITY_MODEL` is empty (the default) the evaluator makes zero LLM calls.
+
+### Polling
+
+The agent polls Planner every `TASK_POLLING_INTERVAL` seconds. When several consecutive polls find nothing actionable (no task matches the actions, or nothing can be admitted), the interval doubles per idle poll up to `TASK_POLLING_MAX_INTERVAL` (default 300 seconds), so an idle agent costs far fewer Planner requests while the pickup latency stays bounded by the maximum interval. Any actionable poll, any poll error or any pending task finalization retry restores the base interval immediately.
+
+Two mechanisms cut the per-poll cost on the Planner side: the session user is cached (refetched at most once per hour), and when every action is bound to a project pattern the task list is requested per project (`projectIds` filter) instead of fetching all tasks of all projects — when no project matches the actions at all, no task request is made for that poll.
 
 ### Working directory and instances
 
@@ -232,7 +241,7 @@ Each task runs in its own working directory `DATA_DIR/tasks/<taskId>/` (stated i
 
 Every poll with picks or deferrals logs one `Scheduling round:` line (`picked:` with the weights, `deferred:` with the reasons) and the running tasks are reported on every poll while tasks run (title, project, weight, elapsed time, model). When instrumentation is enabled, the scheduling queue is exported as the single `queue` gauge (observable gauges are exported as-is, without the service-name prefix): one data point per value, distinguished by the `type` attribute — `tasks_queued` (tasks ready and waiting to be admitted), `tasks_in_progress` (tasks currently being processed) and `weight_in_progress` (total scheduling weight of the tasks being processed).
 
-Every task execution (an agent session) records the `session.duration` histogram (exported as `planner-llm-agent.session.duration`, in seconds), labeled with `agent` (CLI name, e.g. `qoder`), `model` (the resolved model, `auto` when the CLI default is used) and `status` (`success`, or `error` for the failed executions: timeouts and CLI errors are recorded too).
+Every task execution (an agent session) records the `session.duration` histogram (exported as `planner-llm-agent.session.duration`, in seconds), labeled with `agent` (CLI name, e.g. `qoder`), `model` (the resolved model, `auto` when the CLI default is used) and `status` (`success`, or `error` for the failed executions: timeouts and CLI errors are recorded too). The utility-model timeouts are counted by the `evaluation.timeouts` counter (exported as `planner-llm-agent.evaluation.timeouts`), the input of the evaluation circuit breaker.
 
 Setting `TASK_SMART_SCHEDULING=false` restores the historical behavior exactly: `TASK_MAX_PARALLEL` is a plain task count, weights, conflict keys and the utility model are ignored (no LLM call).
 
@@ -341,3 +350,20 @@ npm run lint    # oxlint
 npm test        # jest
 npm run dev     # run locally against a Planner instance
 ```
+
+## Kubernetes health probes
+
+The example manifests under `docs/deployments/kubernetes/` define liveness and
+readiness probes on the heartbeat file `<DATA_DIR>/agent-heartbeat`, which the
+agent refreshes every 15 seconds (`agent/src/Heartbeat.ts`): a probe fails when
+the file is older than its freshness threshold (40 s for readiness, 120 s for
+liveness), so a hung event loop marks the pod not ready and then gets it
+restarted. The container also runs as a non-root user and shuts down
+gracefully: on SIGTERM it refuses new CLI runs and kills the still-running CLI
+process groups (SIGTERM, then SIGKILL after 10 s) within the
+`terminationGracePeriodSeconds` of the manifests (30 s).
+
+## License
+
+[MIT](./LICENSE)
+

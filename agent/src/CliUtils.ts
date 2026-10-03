@@ -1,5 +1,5 @@
 import { execFile } from "child_process";
-import type { ExecException, ExecFileOptionsWithStringEncoding } from "child_process";
+import type { ChildProcess, ExecException, ExecFileOptionsWithStringEncoding } from "child_process";
 
 export interface ExecFileError extends Error {
   code?: string | number;
@@ -15,11 +15,65 @@ export interface RunCliOptions extends ExecFileOptionsWithStringEncoding {
   // SIGKILL after a grace period) so spawned children do not survive the
   // timeout. Requires 'timeout' to be set.
   killProcessGroup?: boolean;
+  // Content written to the command's standard input: secret values (like a
+  // GPG passphrase) can be piped to a CLI without a shell and without
+  // appearing in the process list or the environment.
+  input?: string;
 }
 
 // Grace period between the SIGTERM and the SIGKILL sent to a timed-out
 // process group, so a SIGTERM-trapping CLI can still shut down cleanly.
 export const PROCESS_GROUP_KILL_GRACE_MS = 10000;
+
+// Grace period given to the live CLI process groups at shutdown, between
+// the SIGTERM and the SIGKILL sweep (aligned with the Kubernetes
+// terminationGracePeriodSeconds, which must stay above it).
+export const SHUTDOWN_KILL_GRACE_MS = 10000;
+
+// How often the shutdown sweep re-checks whether the process groups have
+// all settled, so an idle agent shuts down without waiting the full grace.
+const SHUTDOWN_POLL_MS = 500;
+
+// Live detached process groups spawned by runCli: registered when the
+// command is spawned, removed when it settles. Detached process groups are
+// not killed when the agent process exits, so a shutdown must signal them
+// explicitly or in-flight CLI runs keep working on repositories and
+// Planner state as orphans.
+const liveProcessGroups = new Set<number>();
+
+// Set during shutdown: a CLI run must not start while the process is dying.
+let spawnsAccepted = true;
+
+export function stopAcceptingNewSpawns(): void {
+  spawnsAccepted = false;
+}
+
+/**
+ * Kills every live detached process group (SIGTERM, then SIGKILL after the
+ * grace period) and resolves once the sweep is done, immediately when every
+ * group settles during the grace. The wait timers are not unref'd: the
+ * shutdown flow awaits this function before exiting.
+ */
+export async function killLiveProcessGroups(
+  graceMs: number = SHUTDOWN_KILL_GRACE_MS,
+): Promise<void> {
+  const pgids = [...liveProcessGroups];
+  if (pgids.length === 0) {
+    return;
+  }
+  for (const pgid of pgids) {
+    signalProcessGroup(pgid, "SIGTERM");
+  }
+  const deadline = Date.now() + graceMs;
+  while (liveProcessGroups.size > 0 && Date.now() < deadline) {
+    await new Promise<void>((resolve) =>
+      setTimeout(resolve, SHUTDOWN_POLL_MS),
+    );
+  }
+  for (const pgid of liveProcessGroups) {
+    signalProcessGroup(pgid, "SIGKILL");
+  }
+}
 
 /**
  * Run an external CLI command and capture its output.
@@ -33,6 +87,11 @@ export function runCli(
   args: string[],
   options: RunCliOptions,
 ): Promise<{ stdout: string; stderr: string }> {
+  if (!spawnsAccepted) {
+    return Promise.reject(
+      new Error("The agent is shutting down: no new CLI process can be started"),
+    );
+  }
   if (
     options.killProcessGroup === true &&
     process.platform !== "win32" &&
@@ -43,15 +102,34 @@ export function runCli(
   }
   const execOptions = { ...options };
   delete execOptions.killProcessGroup;
+  delete execOptions.input;
   return new Promise((resolve, reject) => {
-    execFile(command, args, execOptions, (error, stdout, stderr) => {
+    const child = execFile(command, args, execOptions, (error, stdout, stderr) => {
       if (error) {
         reject(attachCliOutput(error, stdout, stderr));
       } else {
         resolve({ stdout: stdout, stderr: stderr });
       }
     });
+    writeCliStdin(child, options.input);
   });
+}
+
+// Writes the stdin content of a spawned command. The child may exit before
+// consuming the input (EPIPE): the error is swallowed here, the execFile
+// callback remains the single error surface.
+function writeCliStdin(child: ChildProcess | undefined, input: string | undefined): void {
+  if (input === undefined) {
+    return;
+  }
+  const stdin = child?.stdin;
+  if (!stdin) {
+    return;
+  }
+  stdin.on("error", () => {
+    // The exit status reported by the execFile callback is authoritative.
+  });
+  stdin.end(input);
 }
 
 // Node's execFile does not attach the captured output to the error handed
@@ -101,17 +179,22 @@ function runCliWithProcessGroupKill(
 
     const execOptions = { ...options };
     delete execOptions.killProcessGroup;
+    delete execOptions.input;
     // The timeout is implemented above with the process-group kill, so it
     // must not be handed to execFile as well.
     delete execOptions.timeout;
     // 'detached' is accepted by execFile at runtime (the options are
     // forwarded to spawn) but is missing from its TypeScript overloads.
+    let pid: number | undefined;
     const child = execFile(
       command,
       args,
       { ...execOptions, detached: true } as ExecFileOptionsWithStringEncoding,
       (error, stdout, stderr) => {
         clearTimers();
+        if (typeof pid === "number") {
+          liveProcessGroups.delete(pid);
+        }
         if (timedOut) {
           // Preserve the killed-by-timeout semantics of execFile's built-in
           // timeout so callers keep reporting a timeout error.
@@ -128,9 +211,11 @@ function runCliWithProcessGroupKill(
         }
       },
     );
+    writeCliStdin(child, options.input);
 
-    const pid = child.pid;
+    pid = child.pid;
     if (typeof pid === "number") {
+      liveProcessGroups.add(pid);
       terminateTimer = setTimeout(() => {
         timedOut = true;
         signalProcessGroup(pid, "SIGTERM");

@@ -12,7 +12,7 @@
     "strict": false,
     "noImplicitAny": false,
     "strictPropertyInitialization": false,
-    "strictNullChecks": false,
+    "strictNullChecks": true,
     "types": ["jest", "node"]
   },
   "include": ["src/**/*"],

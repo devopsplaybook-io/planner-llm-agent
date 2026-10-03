@@ -2,8 +2,11 @@ import { execFile } from "child_process";
 import {
   ExecFileError,
   extractErrorDetail,
+  killLiveProcessGroups,
   PROCESS_GROUP_KILL_GRACE_MS,
   runCli,
+  SHUTDOWN_KILL_GRACE_MS,
+  stopAcceptingNewSpawns,
 } from "./CliUtils";
 
 jest.mock("child_process", () => ({
@@ -66,6 +69,52 @@ describe("CliUtils", () => {
     execCallback(null, "out", "");
     await expect(promise).resolves.toEqual({ stdout: "out", stderr: "" });
     expect(killSpy).not.toHaveBeenCalled();
+  });
+
+  it("should write the stdin input and strip it from the spawn options", async () => {
+    const stdin = { on: jest.fn(), end: jest.fn() };
+    mockExecFile.mockImplementation(
+      (_command: string, _args: string[], _options: unknown, callback: ExecCallback) => {
+        execCallback = callback;
+        return { pid: FAKE_PID, stdin };
+      },
+    );
+    const promise = runCli("cli", ["arg"], {
+      encoding: "utf8",
+      input: "secret-input",
+    });
+
+    const [, , spawnOptions] = mockExecFile.mock.calls[0];
+    expect(spawnOptions).toEqual({ encoding: "utf8" });
+    expect(stdin.on).toHaveBeenCalledWith("error", expect.any(Function));
+    expect(stdin.end).toHaveBeenCalledWith("secret-input");
+
+    execCallback(null, "out", "");
+    await expect(promise).resolves.toEqual({ stdout: "out", stderr: "" });
+  });
+
+  it("should write the stdin input with the process-group kill", async () => {
+    const stdin = { on: jest.fn(), end: jest.fn() };
+    mockExecFile.mockImplementation(
+      (_command: string, _args: string[], _options: unknown, callback: ExecCallback) => {
+        execCallback = callback;
+        return { pid: FAKE_PID, stdin };
+      },
+    );
+    const promise = runCli("cli", ["arg"], {
+      timeout: 5000,
+      encoding: "utf8",
+      killProcessGroup: true,
+      input: "secret-input",
+    });
+
+    const [, , spawnOptions] = mockExecFile.mock.calls[0];
+    expect(spawnOptions).toMatchObject({ detached: true, encoding: "utf8" });
+    expect(spawnOptions).not.toHaveProperty("input");
+    expect(stdin.end).toHaveBeenCalledWith("secret-input");
+
+    execCallback(null, "out", "");
+    await expect(promise).resolves.toEqual({ stdout: "out", stderr: "" });
   });
 
   it("should strip the kill option and reject on failure without the process-group kill", async () => {
@@ -203,6 +252,54 @@ describe("CliUtils", () => {
     });
   });
 
+  describe("shutdown process-group sweep", () => {
+    // Matches the internal re-check cadence of killLiveProcessGroups.
+    const SHUTDOWN_POLL_MS = 500;
+
+    const startLiveRun = (): Promise<{ stdout: string; stderr: string }> =>
+      runCli("cli", ["arg"], {
+        timeout: 60000,
+        encoding: "utf8",
+        killProcessGroup: true,
+      });
+
+    it("should resolve immediately when no CLI process is running", async () => {
+      await expect(
+        killLiveProcessGroups(SHUTDOWN_KILL_GRACE_MS),
+      ).resolves.toBeUndefined();
+      expect(killSpy).not.toHaveBeenCalled();
+    });
+
+    it("should SIGTERM the live process groups and SIGKILL the survivors after the grace", async () => {
+      const promise = startLiveRun();
+      const sweep = killLiveProcessGroups(SHUTDOWN_KILL_GRACE_MS);
+
+      await jest.advanceTimersByTimeAsync(SHUTDOWN_KILL_GRACE_MS);
+      await expect(sweep).resolves.toBeUndefined();
+      expect(killSpy).toHaveBeenNthCalledWith(1, -FAKE_PID, "SIGTERM");
+      expect(killSpy).toHaveBeenLastCalledWith(-FAKE_PID, "SIGKILL");
+
+      execCallback(null, "out", "");
+      await expect(promise).resolves.toEqual({ stdout: "out", stderr: "" });
+    });
+
+    it("should return as soon as every CLI run settles during the grace", async () => {
+      const promise = startLiveRun();
+      const sweep = killLiveProcessGroups(SHUTDOWN_KILL_GRACE_MS);
+
+      await jest.advanceTimersByTimeAsync(SHUTDOWN_POLL_MS * 2);
+      execCallback(null, "out", "");
+      await expect(promise).resolves.toEqual({ stdout: "out", stderr: "" });
+      await jest.advanceTimersByTimeAsync(SHUTDOWN_POLL_MS);
+      await expect(sweep).resolves.toBeUndefined();
+
+      // Only the shutdown SIGTERM was sent: the SIGKILL sweep found no
+      // survivor.
+      expect(killSpy).toHaveBeenCalledTimes(1);
+      expect(killSpy).toHaveBeenLastCalledWith(-FAKE_PID, "SIGTERM");
+    });
+  });
+
   describe("extractErrorDetail", () => {
     const failure = (
       message: string,
@@ -299,5 +396,16 @@ describe("CliUtils", () => {
         "the CLI exited with code 1 and produced no error output",
       );
     });
+  });
+
+  // Kept last: stopAcceptingNewSpawns is a one-way module flag and would
+  // reject every later runCli call in this file.
+  it("should reject a new CLI run once the shutdown started", async () => {
+    stopAcceptingNewSpawns();
+
+    await expect(
+      runCli("cli", ["arg"], { encoding: "utf8" }),
+    ).rejects.toThrow(/shutting down/);
+    expect(mockExecFile).not.toHaveBeenCalled();
   });
 });

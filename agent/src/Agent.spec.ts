@@ -88,10 +88,12 @@ const WILDCARD_ACTIONS: AgentActionsConfig = {
 };
 
 // Wait for the asynchronous processing chain (which performs real file I/O)
-// to reach a visible milestone before asserting.
+// to reach a visible milestone before asserting. The default budget is
+// generous: on a CPU-throttled environment the polling timers are scheduled
+// late and the milestones can take seconds of wall clock to be reached.
 async function waitFor(
   condition: () => boolean,
-  timeoutMs = 2000,
+  timeoutMs = 10000,
 ): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (!condition()) {
@@ -310,7 +312,7 @@ describe("Agent", () => {
     agent.stop();
   });
 
-  it("should poll for tasks immediately and at the configured interval", async () => {
+  it("should poll for tasks immediately and back off when the polls stay idle", async () => {
     jest.useFakeTimers();
     // A poll that is still running makes the next tick skip (single-flight
     // guard): let the real I/O of each poll complete before advancing to
@@ -321,20 +323,177 @@ describe("Agent", () => {
     };
     const agent = createAgent();
     agent.start();
-    expect(mockPlanner.getCurrentUser).toHaveBeenCalledTimes(1); // initial poll
+    // The poll starts with the pending-finalization retry pass (one
+    // microtask) before reaching the Planner.
     await flushPoll();
+    expect(mockPlanner.getCurrentUser).toHaveBeenCalledTimes(1); // initial poll
+
+    // Idle polls double the interval (base 5s): the next polls come after
+    // 10s, then 20s.
+    await jest.advanceTimersByTimeAsync(5000);
+    await flushPoll();
+    expect(mockPlanner.getCurrentUser).toHaveBeenCalledTimes(1);
 
     await jest.advanceTimersByTimeAsync(5000);
+    await flushPoll();
+    expect(mockPlanner.getCurrentUser).toHaveBeenCalledTimes(2); // t=10s
+
+    await jest.advanceTimersByTimeAsync(10000);
     await flushPoll();
     expect(mockPlanner.getCurrentUser).toHaveBeenCalledTimes(2);
 
-    await jest.advanceTimersByTimeAsync(5000);
+    await jest.advanceTimersByTimeAsync(10000);
     await flushPoll();
-    expect(mockPlanner.getCurrentUser).toHaveBeenCalledTimes(3);
+    expect(mockPlanner.getCurrentUser).toHaveBeenCalledTimes(3); // t=30s
+    agent.stop();
+  });
+
+  it("should restore the base polling interval when a poll finds an actionable task", async () => {
+    jest.useFakeTimers();
+    const realSetTimeout = jest.requireActual("timers").setTimeout;
+    const flushPoll = async (): Promise<void> => {
+      await new Promise((resolve) => realSetTimeout(resolve, 5));
+    };
+    const agent = createAgent();
+    agent.start();
+    await flushPoll();
+    expect(mockPlanner.getCurrentUser).toHaveBeenCalledTimes(1); // idle: next poll in 10s
+
+    // Just before the backed-off poll, the Planner exposes an actionable
+    // task: the poll runs and the interval is restored to the 5s base.
+    mockPlannerTasks([
+      {
+        id: "task-1",
+        title: "Project task",
+        status: "To Do",
+        description: "Implement the project change",
+        comments: [],
+        attachments: [],
+      },
+    ]);
+    mockQoder.performTask.mockResolvedValue("Summary");
+    await jest.advanceTimersByTimeAsync(10000);
+    await flushPoll();
+    expect(mockPlanner.getCurrentUser).toHaveBeenCalledTimes(2); // t=10s
 
     await jest.advanceTimersByTimeAsync(5000);
     await flushPoll();
-    expect(mockPlanner.getCurrentUser).toHaveBeenCalledTimes(4); // initial + 3 polls
+    expect(mockPlanner.getCurrentUser).toHaveBeenCalledTimes(3); // t=15s, not 30s
+    agent.stop();
+  });
+
+  it("should fetch only the projects covered by project-bound actions", async () => {
+    mockPlanner.listProjects.mockResolvedValue([
+      { id: "p1", name: "Web", description: "" },
+      { id: "p2", name: "Docs", description: "" },
+    ]);
+    mockPlannerTasks([
+      {
+        id: "task-1",
+        projectId: "p1",
+        title: "Project task",
+        status: "To Do",
+        description: "Implement the project change",
+        comments: [],
+        attachments: [],
+      },
+    ]);
+    mockQoder.performTask.mockResolvedValue("Summary");
+    const actions: AgentActionsConfig = {
+      defaultModel: "",
+      defaultTimeout: null,
+      actions: [
+        {
+          project: "Web",
+          statusStart: "To Do",
+          statusEnd: "Done",
+          model: "",
+          instruction: "",
+          timeout: null,
+          weight: null,
+        },
+      ],
+    };
+
+    const agent = createAgent(actions);
+    agent.start();
+    await waitFor(() =>
+      mockPlanner.listAssignedTasks.mock.calls.length > 0,
+    );
+
+    expect(mockPlanner.listAssignedTasks).toHaveBeenCalledWith(
+      { id: "user-1", name: "Test User" },
+      ["p1"],
+    );
+    agent.stop();
+  });
+
+  it("should fetch all tasks when an action is not project-bound", async () => {
+    mockPlanner.listProjects.mockResolvedValue([
+      { id: "p1", name: "Web", description: "" },
+    ]);
+    mockPlannerTasks([]);
+    const actions: AgentActionsConfig = {
+      defaultModel: "",
+      defaultTimeout: null,
+      actions: [
+        {
+          project: "Web",
+          statusStart: "To Do",
+          statusEnd: "Done",
+          model: "",
+          instruction: "",
+          timeout: null,
+          weight: null,
+        },
+        {
+          project: "",
+          statusStart: "In Progress",
+          statusEnd: "Done",
+          model: "",
+          instruction: "",
+          timeout: null,
+          weight: null,
+        },
+      ],
+    };
+
+    const agent = createAgent(actions);
+    agent.start();
+    await waitFor(() =>
+      mockPlanner.listAssignedTasks.mock.calls.length > 0,
+    );
+
+    expect(mockPlanner.listAssignedTasks.mock.calls[0][1]).toBeUndefined();
+    agent.stop();
+  });
+
+  it("should skip the task fetch when no project matches the actions", async () => {
+    mockPlanner.listProjects.mockResolvedValue([
+      { id: "p2", name: "Docs", description: "" },
+    ]);
+    const actions: AgentActionsConfig = {
+      defaultModel: "",
+      defaultTimeout: null,
+      actions: [
+        {
+          project: "Web",
+          statusStart: "To Do",
+          statusEnd: "Done",
+          model: "",
+          instruction: "",
+          timeout: null,
+          weight: null,
+        },
+      ],
+    };
+
+    const agent = createAgent(actions);
+    agent.start();
+    await waitFor(() => mockPlanner.listProjects.mock.calls.length > 0);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    expect(mockPlanner.listAssignedTasks).not.toHaveBeenCalled();
     agent.stop();
   });
 
@@ -599,6 +758,47 @@ describe("Agent", () => {
     agent.stop();
   });
 
+  it("retries only the finalization when posting the result comment fails", async () => {
+    config.TASK_POLLING_INTERVAL = 1;
+    mockPlannerTasks([
+      {
+        id: "task-1",
+        title: "Finalize task",
+        status: "To Do",
+        description: "Implement the project change",
+        comments: [],
+        attachments: [],
+      },
+    ]);
+    mockQoder.performTask.mockResolvedValue("Task summary");
+    // The start comment succeeds; the result comment fails twice, then the
+    // Planner recovers.
+    let resultCommentCalls = 0;
+    mockPlanner.addTaskComment.mockImplementation(
+      async (_taskId: string, text: string) => {
+        if (text === "Task summary") {
+          resultCommentCalls += 1;
+          if (resultCommentCalls <= 2) {
+            throw new Error("Planner is down");
+          }
+        }
+      },
+    );
+
+    const agent = createAgent();
+    agent.start();
+    await waitFor(
+      () => mockPlanner.updateTaskStatus.mock.calls.length > 0,
+      20000,
+    );
+
+    // The CLI ran exactly once despite the two failed finalizations.
+    expect(mockQoder.performTask).toHaveBeenCalledTimes(1);
+    expect(resultCommentCalls).toBeGreaterThanOrEqual(3);
+    expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith("task-1", "Done");
+    agent.stop();
+  }, 30000);
+
   it("should not pick a task again while it is still being processed", async () => {
     config.TASK_POLLING_INTERVAL = 1;
     let resolveTask: (value: string) => void = () => undefined;
@@ -621,16 +821,25 @@ describe("Agent", () => {
 
     const agent = createAgent();
     agent.start();
-    await waitFor(() => mockQoder.performTask.mock.calls.length === 1);
+    // Generous timeouts: when the test suite runs on a CPU-throttled
+    // environment (container cgroup limits shared with running CLI
+    // processes), the 1s polling timers are scheduled very late and the
+    // first pick can take tens of seconds of wall clock. The waits resolve
+    // as soon as the milestone is reached; the extra room only applies to
+    // the starved runs.
+    await waitFor(() => mockQoder.performTask.mock.calls.length === 1, 45000);
 
     // Several polling cycles pass while the task is still processing.
     await new Promise((resolve) => setTimeout(resolve, 2200));
     expect(mockQoder.performTask).toHaveBeenCalledTimes(1);
 
     resolveTask("Finally done");
-    await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
+    await waitFor(
+      () => mockPlanner.updateTaskStatus.mock.calls.length > 0,
+      10000,
+    );
     agent.stop();
-  });
+  }, 60000);
 
   it("should process only one task at a time by default", async () => {
     config.TASK_POLLING_INTERVAL = 1;
@@ -887,6 +1096,86 @@ describe("Agent", () => {
     agent.stop();
   });
 
+  it("should skip attachments with unsafe file names without failing the task", async () => {
+    config.TASK_STATUS_CLEANUP = "Archived";
+    mockPlannerTasks([
+      {
+        id: "task-1",
+        title: "Implement feature",
+        status: "To Do",
+        description: "Add a feature",
+        comments: [],
+        attachments: [
+          {
+            id: "attachment-1",
+            fileName: "../../escaped-file.txt",
+            filePath: "/uploads/escaped-file.txt",
+            dateCreated: "2026-09-02T00:00:00.000Z",
+          },
+          {
+            id: "attachment-2",
+            fileName: "/etc/passwd",
+            filePath: "/etc/passwd",
+            dateCreated: "2026-09-02T00:00:00.000Z",
+          },
+          {
+            id: "attachment-3",
+            fileName: "sub\\dir\\evil.txt",
+            filePath: "/uploads/evil.txt",
+            dateCreated: "2026-09-02T00:00:00.000Z",
+          },
+          {
+            id: "attachment-4",
+            fileName: "..",
+            filePath: "/uploads/..",
+            dateCreated: "2026-09-02T00:00:00.000Z",
+          },
+          {
+            id: "attachment-5",
+            fileName: "",
+            filePath: "/uploads/empty",
+            dateCreated: "2026-09-02T00:00:00.000Z",
+          },
+          {
+            id: "attachment-6",
+            fileName: "report.pdf",
+            filePath: "/uploads/report.pdf",
+            dateCreated: "2026-09-02T00:00:00.000Z",
+          },
+        ],
+      },
+    ]);
+    mockPlanner.downloadTaskAttachment.mockResolvedValue(Buffer.from("image"));
+    mockQoder.performTask.mockResolvedValue("Feature implemented");
+
+    const agent = createAgent();
+    agent.start();
+    await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
+
+    // Only the safe attachment is downloaded: the unsafe names must never
+    // reach the filesystem (path traversal as root).
+    expect(mockPlanner.downloadTaskAttachment).toHaveBeenCalledTimes(1);
+    expect(mockPlanner.downloadTaskAttachment).toHaveBeenCalledWith(
+      "task-1",
+      "attachment-6",
+    );
+    const attachmentsDir = path.join(dataDir, "tasks", "task-1", "attachments");
+    expect(await fse.readdir(attachmentsDir)).toEqual(["report.pdf"]);
+    expect(await fse.readFile(path.join(attachmentsDir, "report.pdf"))).toEqual(
+      Buffer.from("image"),
+    );
+    expect(
+      await fse.pathExists(path.join(dataDir, "escaped-file.txt")),
+    ).toBe(false);
+
+    // The skipped attachments stay visible in the notes file.
+    const notesFile = path.join(dataDir, "tasks", "task-1-Agent.md");
+    const content = await fse.readFile(notesFile, "utf8");
+    expect(content).toContain("report.pdf");
+    expect(content).toContain("(not downloaded)");
+    agent.stop();
+  });
+
   it("should clean up the task folder immediately when the task reaches the cleanup status", async () => {
     const taskId = "48c603af-4725-47f5-ac4e-628e027291e8";
     mockPlanner.listAssignedTasks.mockResolvedValue([
@@ -905,9 +1194,13 @@ describe("Agent", () => {
     agent.start();
     await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
 
-    expect(
-      await fse.pathExists(path.join(dataDir, "tasks", `${taskId}-Agent.md`)),
-    ).toBe(false);
+    // The folder cleanup runs after the status move: wait for it instead of
+    // racing it (it deletes the notes file, so its disappearance proves it).
+    await waitFor(
+      () =>
+        fse.pathExistsSync(path.join(dataDir, "tasks", `${taskId}-Agent.md`)) ===
+        false,
+    );
     expect(await fse.pathExists(path.join(dataDir, "tasks", taskId))).toBe(
       false,
     );
@@ -1951,23 +2244,28 @@ describe("Agent", () => {
 
     const agent = createAgent();
     agent.start();
-    // 6 x 0.25 = 1.5 fits the weight budget, but every task is one full CLI
-    // process: at most ceil(1.9) = 2 run concurrently, the rest is deferred
-    // with a capacity reason and retried on the following polls. Running
-    // all of them at once OOM-kills the container (the CLI heap is sized
-    // from the container memory limit).
-    await waitFor(() => mockQoder.performTask.mock.calls.length === 2);
-    await new Promise((resolve) => setTimeout(resolve, 1200));
-    expect(mockQoder.performTask).toHaveBeenCalledTimes(2);
-    // Only the tasks that can still be admitted this round are evaluated.
-    expect(mockQoder.runPrompt).toHaveBeenCalledTimes(2);
+    // Round 1 starts from the default weight (the evaluations run in the
+    // background): one task fits the process cap ceil(1.9) = 2 together
+    // with the next round's pick. Running more CLI processes than the cap
+    // at once OOM-kills the container (the CLI heap is sized from the
+    // container memory limit).
+    await waitFor(() => mockQoder.performTask.mock.calls.length === 1);
     expect(
       logSpy.mock.calls.some((call) =>
-        String(call[0]).includes(
-          "picked: 'Small task 1' (weight 0.25), 'Small task 2' (weight 0.25)",
-        ),
+        String(call[0]).includes("picked: 'Small task 1' (weight 1.00)"),
       ),
     ).toBe(true);
+
+    // Round 2 uses the cached evaluations (0.25): the next task is picked.
+    await waitFor(() => mockQoder.runPrompt.mock.calls.length >= 2);
+    await waitFor(() => mockQoder.performTask.mock.calls.length === 2, 5000);
+    expect(
+      logSpy.mock.calls.some((call) =>
+        String(call[0]).includes("picked: 'Small task 2' (weight 0.25)"),
+      ),
+    ).toBe(true);
+    await new Promise((resolve) => setTimeout(resolve, 1200));
+    expect(mockQoder.performTask).toHaveBeenCalledTimes(2);
     expect(
       logSpy.mock.calls.some((call) =>
         String(call[0]).includes("deferred: 'Small task 3' (capacity)"),
@@ -1975,7 +2273,7 @@ describe("Agent", () => {
     ).toBe(true);
     resolvers.forEach((resolve) => resolve("done"));
     agent.stop();
-  });
+  }, 15000);
 
   it("should defer a task conflicting with a running task and keep picking unrelated tasks", async () => {
     config.TASK_POLLING_INTERVAL = 1;
@@ -2079,39 +2377,42 @@ describe("Agent", () => {
     agent.stop();
   });
 
-  it("should evaluate hint-less tasks with the utility model and serialize them by repository", async () => {
+  it("should not block the scheduling round on the utility-model evaluations", async () => {
     config.TASK_POLLING_INTERVAL = 1;
     config.TASK_MAX_PARALLEL = 2;
     config.AGENT_UTILITY_MODEL = "utility-model";
     mockPlannerTasks([
       {
         id: "task-1",
-        title: "Refactor the service",
+        title: "Small task 1",
         status: "To Do",
-        description: "Refactor the billing service",
+        description: "Hint-less work",
         comments: [],
         attachments: [],
       },
       {
         id: "task-2",
-        title: "Update the billing docs",
+        title: "Small task 2",
         status: "To Do",
-        description: "Update the documentation of the billing service",
+        description: "Hint-less work",
         comments: [],
         attachments: [],
       },
     ]);
-    // Both evaluations return the same repository: the second task must not
-    // run in parallel with the first one.
-    mockQoder.runPrompt.mockImplementation(() =>
-      Promise.resolve(
-        JSON.stringify({
-          weight: 0.5,
-          conflicts: ["repo:ACME/Billing"],
-          kind: "code-light",
-        }),
-      ),
-    );
+    // Both evaluations hang until the gate opens: the scheduling round must
+    // pick the tasks with the default weight without waiting for them.
+    let openEvaluationGate: () => void = () => undefined;
+    const evaluationGate = new Promise<void>((resolve) => {
+      openEvaluationGate = resolve;
+    });
+    mockQoder.runPrompt.mockImplementation(async () => {
+      await evaluationGate;
+      return JSON.stringify({
+        weight: 0.25,
+        conflicts: ["repo:ACME/Billing"],
+        kind: "code-light",
+      });
+    });
     let resolveFirst: (value: string) => void = () => undefined;
     mockQoder.performTask
       .mockImplementationOnce(
@@ -2124,27 +2425,24 @@ describe("Agent", () => {
 
     const agent = createAgent();
     agent.start();
-    await waitFor(() => mockQoder.performTask.mock.calls.length === 1);
+    // Round 1: both tasks are picked with the default weight while the
+    // evaluations are still in flight.
+    await waitFor(() => mockQoder.performTask.mock.calls.length === 2);
     expect(mockQoder.runPrompt).toHaveBeenCalledTimes(2);
     expect(mockQoder.runPrompt).toHaveBeenCalledWith(
-      expect.stringContaining("Task title: Refactor the service"),
+      expect.stringContaining("Task title: Small task 1"),
       expect.objectContaining({ model: "utility-model" }),
     );
-    // The evaluated weight (0.5, normalized conflicts) shows in the log.
-    expect(logSpy.mock.calls.some((call) =>
-      String(call[0]).includes("picked: 'Refactor the service' (weight 0.50)"),
-    )).toBe(true);
-
-    await new Promise((resolve) => setTimeout(resolve, 1200));
-    expect(mockQoder.performTask).toHaveBeenCalledTimes(1);
     expect(logSpy.mock.calls.some((call) =>
       String(call[0]).includes(
-        "deferred: 'Update the billing docs' (conflict:repo:acme/billing)",
+        "picked: 'Small task 1' (weight 1.00), 'Small task 2' (weight 1.00)",
       ),
     )).toBe(true);
-    // The evaluations are cached per task content version: the next poll
-    // makes no new utility-model call.
-    await new Promise((resolve) => setTimeout(resolve, 1100));
+
+    // The evaluations land in the cache once the gate opens: the next
+    // rounds use them without new utility-model calls.
+    openEvaluationGate();
+    await new Promise((resolve) => setTimeout(resolve, 50));
     expect(mockQoder.runPrompt).toHaveBeenCalledTimes(2);
 
     resolveFirst("Refactor done");

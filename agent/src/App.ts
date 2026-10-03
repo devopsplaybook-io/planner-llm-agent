@@ -3,8 +3,10 @@ import { Agent } from "./Agent";
 import { AgentActionsManager } from "./AgentActionsManager";
 import { AgentConfigRepository } from "./AgentConfigRepository";
 import { AgentNote } from "./AgentNote";
-import { Config } from "./Config";
+import { Config, parseBooleanFlag } from "./Config";
+import { killLiveProcessGroups, stopAcceptingNewSpawns } from "./CliUtils";
 import { GitEnvironment } from "./GitEnvironment";
+import { Heartbeat } from "./Heartbeat";
 import { OTelInit, OTelLogger, OTelTracer } from "./OTelContext";
 import { PlannerClient } from "./PlannerClient";
 import { createCliAgent } from "./clients/CliAgentRegistry";
@@ -36,6 +38,13 @@ Promise.resolve().then(async () => {
     }
     process.exit(1);
   }
+
+  // Kubernetes liveness/readiness heartbeat: refreshed on a timer so the
+  // exec probes of the deployment manifest detect a hung event loop. The
+  // event loop stays responsive during async startup and shutdown, so the
+  // heartbeat only goes stale when the process is truly stuck.
+  const heartbeat = new Heartbeat(config.DATA_DIR);
+  heartbeat.start();
 
   watchFile(config.CONFIG_FILE, () => {
     logger.info(`Config updated: ${config.CONFIG_FILE}`);
@@ -155,7 +164,7 @@ Promise.resolve().then(async () => {
   }
 
   // Check authentication for every CLI agent used by the actions.
-  if (config.AGENT_AUTH_CHECK === "true" || config.AGENT_AUTH_CHECK === "1") {
+  if (parseBooleanFlag(config.AGENT_AUTH_CHECK, true)) {
     for (const cliAgent of cliAgents.values()) {
       try {
         await cliAgent.checkAuthentication();
@@ -212,11 +221,28 @@ Promise.resolve().then(async () => {
     logger.info("Agent note not configured");
   }
 
-  const shutdown = () => {
-    logger.info("Shutting down");
+  // Graceful shutdown: stop polling, refuse new CLI runs, then kill the
+  // still-running CLI process groups (SIGTERM, grace, SIGKILL) so no CLI
+  // child survives the agent exit as an orphan. A second signal skips the
+  // drain and exits immediately.
+  let shuttingDown = false;
+  const shutdown = (signal: string) => {
+    if (shuttingDown) {
+      logger.warn(`${signal} received again: exiting immediately`);
+      process.exit(0);
+    }
+    shuttingDown = true;
+    logger.info(`${signal} received: shutting down`);
     agent.stop();
-    process.exit(0);
+    stopAcceptingNewSpawns();
+    killLiveProcessGroups()
+      .catch((error: Error) => {
+        logger.error("Failed to kill the running CLI processes", error);
+      })
+      .finally(() => {
+        process.exit(0);
+      });
   };
-  process.on("SIGTERM", shutdown);
-  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
+  process.on("SIGINT", () => shutdown("SIGINT"));
 });

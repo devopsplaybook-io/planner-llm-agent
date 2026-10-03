@@ -1,5 +1,6 @@
 import * as fse from "fs-extra";
 import * as path from "path";
+import { randomUUID } from "crypto";
 import type { AgentActionsConfig } from "../AgentActions";
 import { getAgentConfigContentPath, listAgentSkills } from "../AgentConfigRepository";
 import { AgentSessionMetrics } from "../AgentSessionMetrics";
@@ -16,6 +17,19 @@ const PROMPT_TIMEOUT_MS = 600000;
 export const PROBE_PROMPT = "Reply with exactly: OK";
 
 const MAX_BUFFER_BYTES = 10 * 1024 * 1024;
+
+/**
+ * Per-invocation state shared between the argument builder and the reply
+ * parser: one context per CLI run. The adapters must never keep invocation
+ * state on the client instance itself — parallel tasks share one client, so
+ * instance state would race (e.g. two Codex runs reading each other's
+ * last-message file).
+ */
+export interface PromptInvocationContext {
+  // File receiving the final reply of this run, when the adapter captures
+  // one; removed by the base class once the run settles.
+  lastMessageFile?: string;
+}
 
 /**
  * CLI-agnostic implementation of a coding-agent client: task prompt
@@ -49,21 +63,28 @@ export abstract class BaseCliAgent implements CliAgentClient {
 
   // Arguments of the startup authentication probe (the probe prompt is
   // provided by the caller so every adapter checks the same thing).
-  protected abstract buildAuthCheckArgs(probePrompt: string): string[];
+  protected abstract buildAuthCheckArgs(
+    probePrompt: string,
+    context: PromptInvocationContext,
+  ): string[];
 
   // Arguments of a headless prompt with the resolved model (null runs the
   // CLI with its own default model).
   protected abstract buildPromptArgs(
     prompt: string,
     model: string | null,
+    context: PromptInvocationContext,
   ): string[];
 
   // Reply extraction from the CLI output; null when no reply can be parsed
   // (the caller falls back to the raw stdout).
-  protected abstract parseReply(result: {
-    stdout: string;
-    stderr: string;
-  }): string | null;
+  protected abstract parseReply(
+    result: {
+      stdout: string;
+      stderr: string;
+    },
+    context: PromptInvocationContext,
+  ): string | null;
 
   // Usage metric reported by this run (credits balance, cost, ...); null
   // when the CLI does not report one.
@@ -96,12 +117,46 @@ export abstract class BaseCliAgent implements CliAgentClient {
     }
   }
 
-  protected async writeUsage(usage: number): Promise<void> {
+  // Usage updates are serialized through one chain per client instance and
+  // written atomically (temp file + rename): parallel tasks share the
+  // client, and unsynchronized read-modify-write would lose updates or
+  // expose a partially written file.
+  private usageWriteChain: Promise<void> = Promise.resolve();
+
+  protected async persistUsage(
+    file: string,
+    content: Record<string, unknown>,
+  ): Promise<void> {
+    const write = this.usageWriteChain.then(() =>
+      this.writeUsageFile(file, content),
+    );
+    this.usageWriteChain = write.then(
+      () => undefined,
+      () => undefined,
+    );
+    await write;
+  }
+
+  private async writeUsageFile(
+    file: string,
+    content: Record<string, unknown>,
+  ): Promise<void> {
+    const tempFile = `${file}.${process.pid}-${randomUUID()}.tmp`;
     try {
-      await fse.outputJson(this.usageFilePath(), { usage });
+      await fse.outputJson(tempFile, content);
+      await fse.rename(tempFile, file);
     } catch {
       // Non-fatal: the usage display is best-effort.
+      try {
+        await fse.remove(tempFile);
+      } catch {
+        // Nothing more to do.
+      }
     }
+  }
+
+  protected async writeUsage(usage: number): Promise<void> {
+    await this.persistUsage(this.usageFilePath(), { usage });
   }
 
   public async usageSummary(): Promise<string> {
@@ -125,7 +180,8 @@ export abstract class BaseCliAgent implements CliAgentClient {
     const span = OTelTracer().startSpan(`${this.name}-client.check-authentication`);
     // Apply the default model to the probe too, so a misconfigured model
     // fails fast at startup instead of on the first task.
-    const args = this.buildAuthCheckArgs(PROBE_PROMPT);
+    const context: PromptInvocationContext = {};
+    const args = this.buildAuthCheckArgs(PROBE_PROMPT, context);
     try {
       const result = await this.runAgentCli(args, {
         timeout: AUTH_CHECK_TIMEOUT_MS,
@@ -134,8 +190,12 @@ export abstract class BaseCliAgent implements CliAgentClient {
       }, "authentication check");
       // A zero exit code is not enough: verify that the probe actually
       // produced a reply so an empty-output CLI fails visibly at startup.
-      const reply = this.parseReply(result) ?? result.stdout;
-      if (!reply.includes("OK")) {
+      // The expected reply is matched on the first line only: a reply
+      // containing 'OK' inside a longer text (or a footer) is not a
+      // successful probe.
+      const reply = this.parseReply(result, context) ?? result.stdout;
+      const firstReplyLine = reply.trim().split("\n")[0]?.trim() ?? "";
+      if (firstReplyLine !== "OK") {
         throw new Error(
           `${this.displayName} authentication probe did not return the expected reply. CLI output:\n${formatCliOutput(result)}`,
         );
@@ -150,6 +210,7 @@ export abstract class BaseCliAgent implements CliAgentClient {
         );
       }
     } finally {
+      await this.cleanupReplyFile(context);
       span.end();
     }
   }
@@ -160,6 +221,7 @@ export abstract class BaseCliAgent implements CliAgentClient {
     options?: TaskOptions,
   ): Promise<string> {
     const span = OTelTracer().startSpan(`${this.name}-client.perform-task`);
+    const context: PromptInvocationContext = {};
     // Every task runs in its own working directory (provided by the caller)
     // so parallel tasks never share one and cannot collide on the
     // filesystem; the notes file directory is the fallback.
@@ -183,7 +245,7 @@ export abstract class BaseCliAgent implements CliAgentClient {
         );
         await this.warnIfModelInvalid(model.model);
       }
-      const args = this.buildPromptArgs(prompt, model?.model ?? null);
+      const args = this.buildPromptArgs(prompt, model?.model ?? null, context);
       const usageBefore = await this.readUsage();
       logger.info(
         `${this.usageLabel()} before task: ${formatUsageValue(usageBefore)}`,
@@ -245,7 +307,7 @@ export abstract class BaseCliAgent implements CliAgentClient {
         // Fall back to the CLI output when the file cannot be read.
       }
       if (summary.length === 0) {
-        const reply = this.parseReply(result);
+        const reply = this.parseReply(result, context);
         if (reply !== null && reply.length > 0) {
           summary = reply;
           source = "cli reply";
@@ -279,6 +341,7 @@ export abstract class BaseCliAgent implements CliAgentClient {
       const footer = this.buildFooter(model, usageBefore, usageAfter);
       return footer.length > 0 ? `${summary}\n\n${footer}` : summary;
     } finally {
+      await this.cleanupReplyFile(context);
       span.end();
     }
   }
@@ -292,10 +355,12 @@ export abstract class BaseCliAgent implements CliAgentClient {
     options?: PromptOptions,
   ): Promise<string> {
     const span = OTelTracer().startSpan(`${this.name}-client.run-prompt`);
+    const context: PromptInvocationContext = {};
     const model = options?.model?.trim() || this.defaultModel();
     const args = this.buildPromptArgs(
       prompt,
       model.length > 0 ? model : null,
+      context,
     );
     const timeoutMs = options?.timeoutMs ?? PROMPT_TIMEOUT_MS;
     // Concurrent prompts share one usage log: the purpose keeps the
@@ -321,13 +386,31 @@ export abstract class BaseCliAgent implements CliAgentClient {
       logger.info(
         `${this.usageLabel()} after prompt${purposeSuffix}: ${formatUsageValue(usageAfter)}`,
       );
-      const reply = this.parseReply(result);
+      const reply = this.parseReply(result, context);
       if (reply !== null && reply.length > 0) {
         return reply;
       }
       return result.stdout.trim();
     } finally {
+      await this.cleanupReplyFile(context);
       span.end();
+    }
+  }
+
+  // Removes the reply file of a settled invocation (best-effort): the
+  // adapters delete it after reading, this covers the paths that never
+  // reach parseReply so no per-run temp file is left behind.
+  private async cleanupReplyFile(
+    context: PromptInvocationContext,
+  ): Promise<void> {
+    if (context.lastMessageFile === undefined) {
+      return;
+    }
+    try {
+      await fse.remove(context.lastMessageFile);
+    } catch {
+      // Non-fatal: a leftover temp file in the OS temp directory is
+      // harmless and the next run uses a new unique path.
     }
   }
 

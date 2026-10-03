@@ -49,7 +49,7 @@ const VALID_ACTIONS = [
 // file stat at the interval configured in the test).
 async function waitFor(
   condition: () => boolean,
-  timeoutMs = 2000,
+  timeoutMs = 10000,
 ): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (!condition()) {

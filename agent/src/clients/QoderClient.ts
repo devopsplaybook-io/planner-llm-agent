@@ -100,11 +100,7 @@ export class QoderClient extends BaseCliAgent {
   }
 
   protected async writeUsage(credits: number): Promise<void> {
-    try {
-      await fse.outputJson(getCreditsFile(this.config), { credits });
-    } catch {
-      // Non-fatal: the credits display is best-effort.
-    }
+    await this.persistUsage(getCreditsFile(this.config), { credits });
   }
 
   // The CLI reports the credits consumed by the run itself, not a remaining
