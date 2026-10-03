@@ -819,16 +819,25 @@ describe("Agent", () => {
 
     const agent = createAgent();
     agent.start();
-    await waitFor(() => mockQoder.performTask.mock.calls.length === 1, 10000);
+    // Generous timeouts: when the test suite runs on a CPU-throttled
+    // environment (container cgroup limits shared with running CLI
+    // processes), the 1s polling timers are scheduled very late and the
+    // first pick can take tens of seconds of wall clock. The waits resolve
+    // as soon as the milestone is reached; the extra room only applies to
+    // the starved runs.
+    await waitFor(() => mockQoder.performTask.mock.calls.length === 1, 45000);
 
     // Several polling cycles pass while the task is still processing.
     await new Promise((resolve) => setTimeout(resolve, 2200));
     expect(mockQoder.performTask).toHaveBeenCalledTimes(1);
 
     resolveTask("Finally done");
-    await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
+    await waitFor(
+      () => mockPlanner.updateTaskStatus.mock.calls.length > 0,
+      10000,
+    );
     agent.stop();
-  }, 30000);
+  }, 60000);
 
   it("should process only one task at a time by default", async () => {
     config.TASK_POLLING_INTERVAL = 1;
@@ -1183,9 +1192,13 @@ describe("Agent", () => {
     agent.start();
     await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
 
-    expect(
-      await fse.pathExists(path.join(dataDir, "tasks", `${taskId}-Agent.md`)),
-    ).toBe(false);
+    // The folder cleanup runs after the status move: wait for it instead of
+    // racing it (it deletes the notes file, so its disappearance proves it).
+    await waitFor(
+      () =>
+        fse.pathExistsSync(path.join(dataDir, "tasks", `${taskId}-Agent.md`)) ===
+        false,
+    );
     expect(await fse.pathExists(path.join(dataDir, "tasks", taskId))).toBe(
       false,
     );
