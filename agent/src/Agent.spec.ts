@@ -321,8 +321,10 @@ describe("Agent", () => {
     };
     const agent = createAgent();
     agent.start();
-    expect(mockPlanner.getCurrentUser).toHaveBeenCalledTimes(1); // initial poll
+    // The poll starts with the pending-finalization retry pass (one
+    // microtask) before reaching the Planner.
     await flushPoll();
+    expect(mockPlanner.getCurrentUser).toHaveBeenCalledTimes(1); // initial poll
 
     await jest.advanceTimersByTimeAsync(5000);
     await flushPoll();
@@ -598,6 +600,47 @@ describe("Agent", () => {
     expect(mockPlanner.updateTaskStatus).not.toHaveBeenCalled();
     agent.stop();
   });
+
+  it("retries only the finalization when posting the result comment fails", async () => {
+    config.TASK_POLLING_INTERVAL = 1;
+    mockPlannerTasks([
+      {
+        id: "task-1",
+        title: "Finalize task",
+        status: "To Do",
+        description: "Implement the project change",
+        comments: [],
+        attachments: [],
+      },
+    ]);
+    mockQoder.performTask.mockResolvedValue("Task summary");
+    // The start comment succeeds; the result comment fails twice, then the
+    // Planner recovers.
+    let resultCommentCalls = 0;
+    mockPlanner.addTaskComment.mockImplementation(
+      async (_taskId: string, text: string) => {
+        if (text === "Task summary") {
+          resultCommentCalls += 1;
+          if (resultCommentCalls <= 2) {
+            throw new Error("Planner is down");
+          }
+        }
+      },
+    );
+
+    const agent = createAgent();
+    agent.start();
+    await waitFor(
+      () => mockPlanner.updateTaskStatus.mock.calls.length > 0,
+      20000,
+    );
+
+    // The CLI ran exactly once despite the two failed finalizations.
+    expect(mockQoder.performTask).toHaveBeenCalledTimes(1);
+    expect(resultCommentCalls).toBeGreaterThanOrEqual(3);
+    expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith("task-1", "Done");
+    agent.stop();
+  }, 30000);
 
   it("should not pick a task again while it is still being processed", async () => {
     config.TASK_POLLING_INTERVAL = 1;

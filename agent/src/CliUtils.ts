@@ -25,6 +25,56 @@ export interface RunCliOptions extends ExecFileOptionsWithStringEncoding {
 // process group, so a SIGTERM-trapping CLI can still shut down cleanly.
 export const PROCESS_GROUP_KILL_GRACE_MS = 10000;
 
+// Grace period given to the live CLI process groups at shutdown, between
+// the SIGTERM and the SIGKILL sweep (aligned with the Kubernetes
+// terminationGracePeriodSeconds, which must stay above it).
+export const SHUTDOWN_KILL_GRACE_MS = 10000;
+
+// How often the shutdown sweep re-checks whether the process groups have
+// all settled, so an idle agent shuts down without waiting the full grace.
+const SHUTDOWN_POLL_MS = 500;
+
+// Live detached process groups spawned by runCli: registered when the
+// command is spawned, removed when it settles. Detached process groups are
+// not killed when the agent process exits, so a shutdown must signal them
+// explicitly or in-flight CLI runs keep working on repositories and
+// Planner state as orphans.
+const liveProcessGroups = new Set<number>();
+
+// Set during shutdown: a CLI run must not start while the process is dying.
+let spawnsAccepted = true;
+
+export function stopAcceptingNewSpawns(): void {
+  spawnsAccepted = false;
+}
+
+/**
+ * Kills every live detached process group (SIGTERM, then SIGKILL after the
+ * grace period) and resolves once the sweep is done, immediately when every
+ * group settles during the grace. The wait timers are not unref'd: the
+ * shutdown flow awaits this function before exiting.
+ */
+export async function killLiveProcessGroups(
+  graceMs: number = SHUTDOWN_KILL_GRACE_MS,
+): Promise<void> {
+  const pgids = [...liveProcessGroups];
+  if (pgids.length === 0) {
+    return;
+  }
+  for (const pgid of pgids) {
+    signalProcessGroup(pgid, "SIGTERM");
+  }
+  const deadline = Date.now() + graceMs;
+  while (liveProcessGroups.size > 0 && Date.now() < deadline) {
+    await new Promise<void>((resolve) =>
+      setTimeout(resolve, SHUTDOWN_POLL_MS),
+    );
+  }
+  for (const pgid of liveProcessGroups) {
+    signalProcessGroup(pgid, "SIGKILL");
+  }
+}
+
 /**
  * Run an external CLI command and capture its output.
  *
@@ -37,6 +87,11 @@ export function runCli(
   args: string[],
   options: RunCliOptions,
 ): Promise<{ stdout: string; stderr: string }> {
+  if (!spawnsAccepted) {
+    return Promise.reject(
+      new Error("The agent is shutting down: no new CLI process can be started"),
+    );
+  }
   if (
     options.killProcessGroup === true &&
     process.platform !== "win32" &&
@@ -130,12 +185,16 @@ function runCliWithProcessGroupKill(
     delete execOptions.timeout;
     // 'detached' is accepted by execFile at runtime (the options are
     // forwarded to spawn) but is missing from its TypeScript overloads.
+    let pid: number | undefined;
     const child = execFile(
       command,
       args,
       { ...execOptions, detached: true } as ExecFileOptionsWithStringEncoding,
       (error, stdout, stderr) => {
         clearTimers();
+        if (typeof pid === "number") {
+          liveProcessGroups.delete(pid);
+        }
         if (timedOut) {
           // Preserve the killed-by-timeout semantics of execFile's built-in
           // timeout so callers keep reporting a timeout error.
@@ -154,8 +213,9 @@ function runCliWithProcessGroupKill(
     );
     writeCliStdin(child, options.input);
 
-    const pid = child.pid;
+    pid = child.pid;
     if (typeof pid === "number") {
+      liveProcessGroups.add(pid);
       terminateTimer = setTimeout(() => {
         timedOut = true;
         signalProcessGroup(pid, "SIGTERM");

@@ -1,7 +1,8 @@
 import * as fse from "fs-extra";
 import * as os from "os";
 import * as path from "path";
-import { BaseCliAgent } from "./BaseCliAgent";
+import { randomUUID } from "crypto";
+import { BaseCliAgent, PromptInvocationContext } from "./BaseCliAgent";
 
 // OpenAI Codex CLI (https://developers.openai.com/codex): 'codex exec' runs
 // a non-interactive execution with full access and no approvals, and
@@ -13,26 +14,30 @@ export class CodexClient extends BaseCliAgent {
   readonly authHint =
     "Ensure OPENAI_API_KEY is set or that the ChatGPT authentication is complete (codex login)";
 
-  // File receiving the final reply of the current run, set when the prompt
-  // arguments are built and read when the reply is parsed.
-  private lastMessageFile: string | null = null;
-
   protected cliCommand(): string {
     return this.config.CODEX_CLI;
   }
 
-  protected buildAuthCheckArgs(probePrompt: string): string[] {
-    return this.buildExecArgs(probePrompt, null, false);
+  protected buildAuthCheckArgs(
+    probePrompt: string,
+    context: PromptInvocationContext,
+  ): string[] {
+    return this.buildExecArgs(probePrompt, null, false, context);
   }
 
-  protected buildPromptArgs(prompt: string, model: string | null): string[] {
-    return this.buildExecArgs(prompt, model, true);
+  protected buildPromptArgs(
+    prompt: string,
+    model: string | null,
+    context: PromptInvocationContext,
+  ): string[] {
+    return this.buildExecArgs(prompt, model, true, context);
   }
 
   private buildExecArgs(
     prompt: string,
     model: string | null,
     captureLastMessage: boolean,
+    context: PromptInvocationContext,
   ): string[] {
     const args = ["exec"];
     if (model !== null) {
@@ -48,30 +53,43 @@ export class CodexClient extends BaseCliAgent {
       "--skip-git-repo-check",
     );
     if (captureLastMessage) {
-      this.lastMessageFile = path.join(
+      // Per-invocation file stored on the invocation context (never on the
+      // client instance): parallel tasks share one client and must not read
+      // each other's reply.
+      context.lastMessageFile = path.join(
         os.tmpdir(),
-        `codex-last-message-${process.pid}-${Date.now()}.txt`,
+        `codex-last-message-${process.pid}-${randomUUID()}.txt`,
       );
-      args.push("--output-last-message", this.lastMessageFile);
+      args.push("--output-last-message", context.lastMessageFile);
     }
     args.push(prompt);
     return args;
   }
 
-  protected parseReply(result: {
-    stdout: string;
-    stderr: string;
-  }): string | null {
-    if (this.lastMessageFile !== null) {
+  protected parseReply(
+    result: {
+      stdout: string;
+      stderr: string;
+    },
+    context: PromptInvocationContext,
+  ): string | null {
+    const lastMessageFile = context.lastMessageFile;
+    if (lastMessageFile !== undefined) {
       try {
-        const reply = fse
-          .readFileSync(this.lastMessageFile, "utf8")
-          .trim();
+        const reply = fse.readFileSync(lastMessageFile, "utf8").trim();
         if (reply.length > 0) {
           return reply;
         }
       } catch {
         // Fall back to the raw output when the file is missing.
+      } finally {
+        try {
+          // The file is read once per invocation: remove it immediately so
+          // no temp file survives the run.
+          fse.removeSync(lastMessageFile);
+        } catch {
+          // The base class removes it again once the run settles.
+        }
       }
     }
     const trimmed = result.stdout.trim();

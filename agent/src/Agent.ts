@@ -9,6 +9,7 @@ import { Config } from "./Config";
 import { createCliAgent } from "./clients/CliAgentRegistry";
 import { prepareCliAgent, type CliAgentClient } from "./clients/CliAgent";
 import { resolveModel } from "./clients/BaseCliAgent";
+import { FinalizationStore, FINALIZATION_MAX_ATTEMPTS } from "./FinalizationStore";
 import { OTelLogger, OTelMeter } from "./OTelContext";
 import { PlannerClient, PlannerProject, PlannerTask } from "./PlannerClient";
 import {
@@ -60,6 +61,10 @@ export class Agent {
   // Invalid hot-reloaded values are reported once per value.
   private warnedBudgetValue: string | null = null;
   private warnedConflictModeValue: string | null = null;
+  // Tasks whose CLI work is done and whose Planner finalization (result
+  // comment + status move) is pending or was surrendered: they are never
+  // picked again, so a Planner hiccup can never re-execute the CLI run.
+  private finalizations = new FinalizationStore();
 
   constructor(
     config: Config,
@@ -115,6 +120,10 @@ export class Agent {
 
   private async pollOnce(): Promise<void> {
     try {
+      // Tasks waiting for a retry of their finalization come first: their
+      // comment and status move are retried with a backoff, never the CLI
+      // run itself.
+      await this.finalizePendingTasks();
       const user = await this.planner.getCurrentUser();
       const tasks = await this.planner.listAssignedTasks(user);
       await this.cleanupCompletedTasks(tasks);
@@ -150,6 +159,9 @@ export class Agent {
           if (
             !this.matchesAction(task, action, projects) ||
             this.processingTasks.has(task.id) ||
+            // A task whose CLI work is done is never executed twice while
+            // its Planner finalization is retried.
+            this.finalizations.isProcessed(task.id) ||
             candidates.some((selected) => selected.task.id === task.id)
           ) {
             continue;
@@ -503,12 +515,23 @@ export class Agent {
           this.config.TASK_TIMEOUT,
         cwd: taskDir,
       });
-      await this.planner.addTaskComment(task.id, summary);
-      await this.planner.updateTaskStatus(task.id, action.statusEnd);
-      logger.info(
-        `Task '${task.title}' (${task.id}) completed and moved to status '${action.statusEnd}'`,
+      // From this point the task outcome is fixed: it is recorded in the
+      // finalization ledger so a failing comment or status move is retried
+      // by later polls (the CLI run itself is never re-executed).
+      this.finalizations.markProcessed(
+        task.id,
+        task.title,
+        summary,
+        action.statusEnd,
       );
-      await this.cleanupTaskFolderIfNeeded(task.id, action.statusEnd);
+      try {
+        await this.finalizeTask(task.id, task.title, summary, action.statusEnd);
+      } catch (error) {
+        this.finalizations.recordFailure(task.id, Date.now());
+        logger.error(
+          `Failed to finalize task '${task.title}' (${task.id}); the finalization will be retried: ${(error as Error).message}`,
+        );
+      }
     } catch (error) {
       const message = (error as Error).message;
       logger.error(
@@ -516,23 +539,77 @@ export class Agent {
       );
       // A failing task must not block the agent by staying in the start
       // status forever: it is moved to the end status with an explanation.
+      const failureComment = buildFailureComment(message, action.statusEnd);
+      this.finalizations.markProcessed(
+        task.id,
+        task.title,
+        failureComment,
+        action.statusEnd,
+      );
       try {
-        await this.planner.addTaskComment(
+        await this.finalizeTask(
           task.id,
-          buildFailureComment(message, action.statusEnd),
+          task.title,
+          failureComment,
+          action.statusEnd,
         );
-        await this.planner.updateTaskStatus(task.id, action.statusEnd);
-        logger.info(
-          `Task '${task.title}' (${task.id}) moved to status '${action.statusEnd}' after a processing failure`,
-        );
-        await this.cleanupTaskFolderIfNeeded(task.id, action.statusEnd);
       } catch (cleanupError) {
+        this.finalizations.recordFailure(task.id, Date.now());
         logger.error(
           `Failed to move task '${task.title}' (${task.id}) to status '${action.statusEnd}' after the processing failure: ${(cleanupError as Error).message}`,
         );
       }
     } finally {
       this.processingTasks.delete(task.id);
+    }
+  }
+
+  // Posts the task outcome and moves the task to its end status. Called
+  // once right after the CLI run, then retried by finalizePendingTasks on
+  // every poll until it succeeds; the ledger entry is only removed here, on
+  // success.
+  private async finalizeTask(
+    taskId: string,
+    title: string,
+    summary: string,
+    endStatus: string,
+  ): Promise<void> {
+    await this.planner.addTaskComment(taskId, summary);
+    await this.planner.updateTaskStatus(taskId, endStatus);
+    this.finalizations.markFinalized(taskId);
+    logger.info(
+      `Task '${title}' finalized: comment posted and status set to '${endStatus}'`,
+    );
+    await this.cleanupTaskFolderIfNeeded(taskId, endStatus);
+  }
+
+  // Retries the finalizations whose last attempt failed, with an
+  // exponential backoff (see FinalizationStore). Runs at the top of every
+  // poll, before the task selection.
+  private async finalizePendingTasks(): Promise<void> {
+    for (const pending of this.finalizations.ready()) {
+      try {
+        await this.finalizeTask(
+          pending.taskId,
+          pending.title,
+          pending.summary,
+          pending.endStatus,
+        );
+      } catch (error) {
+        const surrendered = this.finalizations.recordFailure(
+          pending.taskId,
+          Date.now(),
+        );
+        if (surrendered) {
+          logger.error(
+            `Gave up finalizing task '${pending.title}' (${pending.taskId}) after ${FINALIZATION_MAX_ATTEMPTS} attempts: the task keeps its start status and needs a human look`,
+          );
+        } else {
+          logger.warn(
+            `Finalization of task '${pending.title}' (${pending.taskId}) failed, next retry scheduled: ${(error as Error).message}`,
+          );
+        }
+      }
     }
   }
 

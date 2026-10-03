@@ -205,4 +205,46 @@ describe("CodexClient", () => {
       "Codex CLI 'codex' not found in PATH",
     );
   });
+
+  it("should use a distinct last-message file per concurrent run and clean it up", async () => {
+    const writtenFiles: string[] = [];
+    mockExecFile.mockImplementation(
+      (
+        _command: string,
+        args: string[],
+        _options: unknown,
+        callback: (error: Error | null, stdout: string, stderr: string) => void,
+      ) => {
+        // Both runs are spawned before either one settles, like two
+        // parallel tasks sharing the same client instance.
+        setImmediate(() => {
+          const lastIndex = args.indexOf("--output-last-message");
+          const file = args[lastIndex + 1] as string;
+          writtenFiles.push(file);
+          fse.writeFileSync(file, `Reply for ${writtenFiles.length}`);
+          callback(null, "event stream output", "");
+        });
+        return { pid: 7000 + writtenFiles.length + 1 };
+      },
+    );
+
+    const [first, second] = await Promise.all([
+      client.performTask(
+        task("First feature"),
+        path.join(os.tmpdir(), "codex-spec", "task-1-Agent.md"),
+      ),
+      client.performTask(
+        task("Second feature"),
+        path.join(os.tmpdir(), "codex-spec", "task-2-Agent.md"),
+      ),
+    ]);
+
+    expect(writtenFiles).toHaveLength(2);
+    expect(new Set(writtenFiles).size).toBe(2);
+    expect(first).toBe("Reply for 1");
+    expect(second).toBe("Reply for 2");
+    for (const file of writtenFiles) {
+      expect(fse.pathExistsSync(file)).toBe(false);
+    }
+  });
 });

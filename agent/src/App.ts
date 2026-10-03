@@ -4,6 +4,7 @@ import { AgentActionsManager } from "./AgentActionsManager";
 import { AgentConfigRepository } from "./AgentConfigRepository";
 import { AgentNote } from "./AgentNote";
 import { Config } from "./Config";
+import { killLiveProcessGroups, stopAcceptingNewSpawns } from "./CliUtils";
 import { GitEnvironment } from "./GitEnvironment";
 import { OTelInit, OTelLogger, OTelTracer } from "./OTelContext";
 import { PlannerClient } from "./PlannerClient";
@@ -212,11 +213,28 @@ Promise.resolve().then(async () => {
     logger.info("Agent note not configured");
   }
 
-  const shutdown = () => {
-    logger.info("Shutting down");
+  // Graceful shutdown: stop polling, refuse new CLI runs, then kill the
+  // still-running CLI process groups (SIGTERM, grace, SIGKILL) so no CLI
+  // child survives the agent exit as an orphan. A second signal skips the
+  // drain and exits immediately.
+  let shuttingDown = false;
+  const shutdown = (signal: string) => {
+    if (shuttingDown) {
+      logger.warn(`${signal} received again: exiting immediately`);
+      process.exit(0);
+    }
+    shuttingDown = true;
+    logger.info(`${signal} received: shutting down`);
     agent.stop();
-    process.exit(0);
+    stopAcceptingNewSpawns();
+    killLiveProcessGroups()
+      .catch((error: Error) => {
+        logger.error("Failed to kill the running CLI processes", error);
+      })
+      .finally(() => {
+        process.exit(0);
+      });
   };
-  process.on("SIGTERM", shutdown);
-  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
+  process.on("SIGINT", () => shutdown("SIGINT"));
 });
