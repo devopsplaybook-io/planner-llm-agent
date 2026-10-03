@@ -3,9 +3,10 @@ import { Agent } from "./Agent";
 import { AgentActionsManager } from "./AgentActionsManager";
 import { AgentConfigRepository } from "./AgentConfigRepository";
 import { AgentNote } from "./AgentNote";
-import { Config } from "./Config";
+import { Config, parseBooleanFlag } from "./Config";
 import { killLiveProcessGroups, stopAcceptingNewSpawns } from "./CliUtils";
 import { GitEnvironment } from "./GitEnvironment";
+import { Heartbeat } from "./Heartbeat";
 import { OTelInit, OTelLogger, OTelTracer } from "./OTelContext";
 import { PlannerClient } from "./PlannerClient";
 import { createCliAgent } from "./clients/CliAgentRegistry";
@@ -37,6 +38,13 @@ Promise.resolve().then(async () => {
     }
     process.exit(1);
   }
+
+  // Kubernetes liveness/readiness heartbeat: refreshed on a timer so the
+  // exec probes of the deployment manifest detect a hung event loop. The
+  // event loop stays responsive during async startup and shutdown, so the
+  // heartbeat only goes stale when the process is truly stuck.
+  const heartbeat = new Heartbeat(config.DATA_DIR);
+  heartbeat.start();
 
   watchFile(config.CONFIG_FILE, () => {
     logger.info(`Config updated: ${config.CONFIG_FILE}`);
@@ -156,7 +164,7 @@ Promise.resolve().then(async () => {
   }
 
   // Check authentication for every CLI agent used by the actions.
-  if (config.AGENT_AUTH_CHECK === "true" || config.AGENT_AUTH_CHECK === "1") {
+  if (parseBooleanFlag(config.AGENT_AUTH_CHECK, true)) {
     for (const cliAgent of cliAgents.values()) {
       try {
         await cliAgent.checkAuthentication();

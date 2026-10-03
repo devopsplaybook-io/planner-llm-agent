@@ -15,10 +15,56 @@ spec:
       labels:
         app: planner-llm-agent
     spec:
+      # Aligned with the agent graceful shutdown (SIGTERM to the CLI process
+      # groups, then SIGKILL after SHUTDOWN_KILL_GRACE_MS = 10s): the extra
+      # head-room also covers the agent exit and the pod cleanup.
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        # The image runs as the non-root user agent (uid/gid 10001); fsGroup
+        # gives that group the write access to the mounted /data volume.
+        fsGroup: 10001
+        fsGroupChangePolicy: OnRootMismatch
       containers:
         - image: planner-llm-agent
           name: planner-llm-agent
           imagePullPolicy: Always
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            seccompProfile:
+              type: RuntimeDefault
+          # Liveness/readiness on the heartbeat file the agent refreshes
+          # every 15 seconds (agent/src/Heartbeat.ts): an exec probe fails
+          # when the file is older than its freshness threshold, so a hung
+          # event loop marks the pod not ready (readiness) then restarts it
+          # (liveness). The root filesystem is not read-only on purpose: the
+          # coding-agent CLIs write caches and configuration under their
+          # HOME on the container filesystem.
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - test $(( $(date +%s) - $(stat -c %Y /data/agent-heartbeat 2>/dev/null || echo 0) )) -lt 120
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            failureThreshold: 3
+            timeoutSeconds: 5
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - test $(( $(date +%s) - $(stat -c %Y /data/agent-heartbeat 2>/dev/null || echo 0) )) -lt 40
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 2
+            timeoutSeconds: 5
           env:
             - name: AGENT_NAME
               value: "planner-llm-agent"

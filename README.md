@@ -350,3 +350,20 @@ npm run lint    # oxlint
 npm test        # jest
 npm run dev     # run locally against a Planner instance
 ```
+
+## Kubernetes health probes
+
+The example manifests under `docs/deployments/kubernetes/` define liveness and
+readiness probes on the heartbeat file `<DATA_DIR>/agent-heartbeat`, which the
+agent refreshes every 15 seconds (`agent/src/Heartbeat.ts`): a probe fails when
+the file is older than its freshness threshold (40 s for readiness, 120 s for
+liveness), so a hung event loop marks the pod not ready and then gets it
+restarted. The container also runs as a non-root user and shuts down
+gracefully: on SIGTERM it refuses new CLI runs and kills the still-running CLI
+process groups (SIGTERM, then SIGKILL after 10 s) within the
+`terminationGracePeriodSeconds` of the manifests (30 s).
+
+## License
+
+[MIT](./LICENSE)
+
