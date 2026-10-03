@@ -68,6 +68,52 @@ describe("CliUtils", () => {
     expect(killSpy).not.toHaveBeenCalled();
   });
 
+  it("should write the stdin input and strip it from the spawn options", async () => {
+    const stdin = { on: jest.fn(), end: jest.fn() };
+    mockExecFile.mockImplementation(
+      (_command: string, _args: string[], _options: unknown, callback: ExecCallback) => {
+        execCallback = callback;
+        return { pid: FAKE_PID, stdin };
+      },
+    );
+    const promise = runCli("cli", ["arg"], {
+      encoding: "utf8",
+      input: "secret-input",
+    });
+
+    const [, , spawnOptions] = mockExecFile.mock.calls[0];
+    expect(spawnOptions).toEqual({ encoding: "utf8" });
+    expect(stdin.on).toHaveBeenCalledWith("error", expect.any(Function));
+    expect(stdin.end).toHaveBeenCalledWith("secret-input");
+
+    execCallback(null, "out", "");
+    await expect(promise).resolves.toEqual({ stdout: "out", stderr: "" });
+  });
+
+  it("should write the stdin input with the process-group kill", async () => {
+    const stdin = { on: jest.fn(), end: jest.fn() };
+    mockExecFile.mockImplementation(
+      (_command: string, _args: string[], _options: unknown, callback: ExecCallback) => {
+        execCallback = callback;
+        return { pid: FAKE_PID, stdin };
+      },
+    );
+    const promise = runCli("cli", ["arg"], {
+      timeout: 5000,
+      encoding: "utf8",
+      killProcessGroup: true,
+      input: "secret-input",
+    });
+
+    const [, , spawnOptions] = mockExecFile.mock.calls[0];
+    expect(spawnOptions).toMatchObject({ detached: true, encoding: "utf8" });
+    expect(spawnOptions).not.toHaveProperty("input");
+    expect(stdin.end).toHaveBeenCalledWith("secret-input");
+
+    execCallback(null, "out", "");
+    await expect(promise).resolves.toEqual({ stdout: "out", stderr: "" });
+  });
+
   it("should strip the kill option and reject on failure without the process-group kill", async () => {
     const promise = runCli("cli", ["arg"], {
       encoding: "utf8",

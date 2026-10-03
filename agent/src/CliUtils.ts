@@ -1,5 +1,5 @@
 import { execFile } from "child_process";
-import type { ExecException, ExecFileOptionsWithStringEncoding } from "child_process";
+import type { ChildProcess, ExecException, ExecFileOptionsWithStringEncoding } from "child_process";
 
 export interface ExecFileError extends Error {
   code?: string | number;
@@ -15,6 +15,10 @@ export interface RunCliOptions extends ExecFileOptionsWithStringEncoding {
   // SIGKILL after a grace period) so spawned children do not survive the
   // timeout. Requires 'timeout' to be set.
   killProcessGroup?: boolean;
+  // Content written to the command's standard input: secret values (like a
+  // GPG passphrase) can be piped to a CLI without a shell and without
+  // appearing in the process list or the environment.
+  input?: string;
 }
 
 // Grace period between the SIGTERM and the SIGKILL sent to a timed-out
@@ -43,15 +47,34 @@ export function runCli(
   }
   const execOptions = { ...options };
   delete execOptions.killProcessGroup;
+  delete execOptions.input;
   return new Promise((resolve, reject) => {
-    execFile(command, args, execOptions, (error, stdout, stderr) => {
+    const child = execFile(command, args, execOptions, (error, stdout, stderr) => {
       if (error) {
         reject(attachCliOutput(error, stdout, stderr));
       } else {
         resolve({ stdout: stdout, stderr: stderr });
       }
     });
+    writeCliStdin(child, options.input);
   });
+}
+
+// Writes the stdin content of a spawned command. The child may exit before
+// consuming the input (EPIPE): the error is swallowed here, the execFile
+// callback remains the single error surface.
+function writeCliStdin(child: ChildProcess | undefined, input: string | undefined): void {
+  if (input === undefined) {
+    return;
+  }
+  const stdin = child?.stdin;
+  if (!stdin) {
+    return;
+  }
+  stdin.on("error", () => {
+    // The exit status reported by the execFile callback is authoritative.
+  });
+  stdin.end(input);
 }
 
 // Node's execFile does not attach the captured output to the error handed
@@ -101,6 +124,7 @@ function runCliWithProcessGroupKill(
 
     const execOptions = { ...options };
     delete execOptions.killProcessGroup;
+    delete execOptions.input;
     // The timeout is implemented above with the process-group kill, so it
     // must not be handed to execFile as well.
     delete execOptions.timeout;
@@ -128,6 +152,7 @@ function runCliWithProcessGroupKill(
         }
       },
     );
+    writeCliStdin(child, options.input);
 
     const pid = child.pid;
     if (typeof pid === "number") {

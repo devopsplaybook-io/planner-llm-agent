@@ -306,14 +306,14 @@ export class GitEnvironment {
     if (passphrase.length > 0) {
       await this.presetGpgPassphrase(passphrase);
     }
+    // The message is piped to the gpg standard input (no shell, the key id
+    // is passed as a single argument) so no operator-controlled value can
+    // break out of the command.
     try {
       await runCli(
-        "sh",
-        [
-          "-c",
-          `printf agent | gpg --batch --local-user '${keyId}' --clearsign > /dev/null`,
-        ],
-        { timeout: CLI_TIMEOUT_MS, windowsHide: true },
+        "gpg",
+        ["--batch", "--local-user", keyId, "--clearsign"],
+        { timeout: CLI_TIMEOUT_MS, windowsHide: true, input: "agent" },
       );
     } catch (error) {
       throw new Error(
@@ -362,17 +362,14 @@ export class GitEnvironment {
       throw new Error("Could not determine the GPG keygrip for passphrase caching");
     }
 
-    // Pass the passphrase through the environment instead of the command
-    // line so it does not show up in the process list.
-    await runCli(
-      "sh",
-      ["-c", `printf %s "$GPG_PASSPHRASE" | '${presetBinary}' --preset '${keygrip}'`],
-      {
-        timeout: CLI_TIMEOUT_MS,
-        windowsHide: true,
-        env: { ...process.env, GPG_PASSPHRASE: passphrase },
-      },
-    );
+    // Pass the passphrase through the standard input instead of the command
+    // line or the environment so it does not show up in the process list:
+    // the binary and the keygrip are passed as plain execFile arguments.
+    await runCli(presetBinary, ["--preset", keygrip], {
+      timeout: CLI_TIMEOUT_MS,
+      windowsHide: true,
+      input: passphrase,
+    });
   }
 
   /**

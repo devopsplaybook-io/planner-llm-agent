@@ -514,6 +514,26 @@ describe("AgentActions", () => {
       expect(matchProjectPattern("a.b", "a.b")).toBe(true);
       expect(matchProjectPattern("a.b", "axb")).toBe(false);
     });
+
+    it("should handle multiple wildcards and repeated literal segments", () => {
+      expect(matchProjectPattern("*a*a*", "aba")).toBe(true);
+      expect(matchProjectPattern("*a*a*", "aab")).toBe(true);
+      expect(matchProjectPattern("*a*a*", "abb")).toBe(false);
+      expect(matchProjectPattern("a*a*a", "aba")).toBe(false);
+      expect(matchProjectPattern("a*a*a", "aabaa")).toBe(true);
+      // A mismatch after a '*' must restart the scan after that '*', not
+      // fail the whole match.
+      expect(matchProjectPattern("*ab*ab", "aabab")).toBe(true);
+    });
+
+    it("should match a pathological wildcard pattern without backtracking", () => {
+      // A regex derived from this pattern exhibits catastrophic backtracking
+      // on the non-matching name; the linear matcher completes immediately.
+      const pattern = `${"a*".repeat(30)}b`;
+      const start = Date.now();
+      expect(matchProjectPattern(pattern, "a".repeat(2000))).toBe(false);
+      expect(Date.now() - start).toBeLessThan(1000);
+    });
   });
 
   describe("loadAgentActions", () => {

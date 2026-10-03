@@ -887,6 +887,86 @@ describe("Agent", () => {
     agent.stop();
   });
 
+  it("should skip attachments with unsafe file names without failing the task", async () => {
+    config.TASK_STATUS_CLEANUP = "Archived";
+    mockPlannerTasks([
+      {
+        id: "task-1",
+        title: "Implement feature",
+        status: "To Do",
+        description: "Add a feature",
+        comments: [],
+        attachments: [
+          {
+            id: "attachment-1",
+            fileName: "../../escaped-file.txt",
+            filePath: "/uploads/escaped-file.txt",
+            dateCreated: "2026-09-02T00:00:00.000Z",
+          },
+          {
+            id: "attachment-2",
+            fileName: "/etc/passwd",
+            filePath: "/etc/passwd",
+            dateCreated: "2026-09-02T00:00:00.000Z",
+          },
+          {
+            id: "attachment-3",
+            fileName: "sub\\dir\\evil.txt",
+            filePath: "/uploads/evil.txt",
+            dateCreated: "2026-09-02T00:00:00.000Z",
+          },
+          {
+            id: "attachment-4",
+            fileName: "..",
+            filePath: "/uploads/..",
+            dateCreated: "2026-09-02T00:00:00.000Z",
+          },
+          {
+            id: "attachment-5",
+            fileName: "",
+            filePath: "/uploads/empty",
+            dateCreated: "2026-09-02T00:00:00.000Z",
+          },
+          {
+            id: "attachment-6",
+            fileName: "report.pdf",
+            filePath: "/uploads/report.pdf",
+            dateCreated: "2026-09-02T00:00:00.000Z",
+          },
+        ],
+      },
+    ]);
+    mockPlanner.downloadTaskAttachment.mockResolvedValue(Buffer.from("image"));
+    mockQoder.performTask.mockResolvedValue("Feature implemented");
+
+    const agent = createAgent();
+    agent.start();
+    await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
+
+    // Only the safe attachment is downloaded: the unsafe names must never
+    // reach the filesystem (path traversal as root).
+    expect(mockPlanner.downloadTaskAttachment).toHaveBeenCalledTimes(1);
+    expect(mockPlanner.downloadTaskAttachment).toHaveBeenCalledWith(
+      "task-1",
+      "attachment-6",
+    );
+    const attachmentsDir = path.join(dataDir, "tasks", "task-1", "attachments");
+    expect(await fse.readdir(attachmentsDir)).toEqual(["report.pdf"]);
+    expect(await fse.readFile(path.join(attachmentsDir, "report.pdf"))).toEqual(
+      Buffer.from("image"),
+    );
+    expect(
+      await fse.pathExists(path.join(dataDir, "escaped-file.txt")),
+    ).toBe(false);
+
+    // The skipped attachments stay visible in the notes file.
+    const notesFile = path.join(dataDir, "tasks", "task-1-Agent.md");
+    const content = await fse.readFile(notesFile, "utf8");
+    expect(content).toContain("report.pdf");
+    expect(content).toContain("(not downloaded)");
+    agent.stop();
+  });
+
   it("should clean up the task folder immediately when the task reaches the cleanup status", async () => {
     const taskId = "48c603af-4725-47f5-ac4e-628e027291e8";
     mockPlanner.listAssignedTasks.mockResolvedValue([

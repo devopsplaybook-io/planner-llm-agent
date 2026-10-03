@@ -602,17 +602,16 @@ export class Agent {
           `- **${comment.userName || comment.userId}** (${comment.dateCreated}): ${comment.text}`,
       )
       .join("\n");
-    const downloadedAttachments = await this.downloadAttachments(task);
+    const downloaded = await this.downloadAttachments(task);
     const attachmentLines =
-      downloadedAttachments.length > 0
-        ? downloadedAttachments.map(
-            (filePath) => `- ${path.basename(filePath)} (${filePath})`,
-          )
-        : task.attachments.length > 0
-          ? task.attachments.map(
-              (attachment) => `- ${attachment.fileName} (download failed)`,
-            )
-          : ["*(none)*"];
+      task.attachments.length > 0
+        ? task.attachments.map((attachment) => {
+            const filePath = downloaded.get(attachment.id);
+            return filePath !== undefined
+              ? `- ${path.basename(filePath)} (${filePath})`
+              : `- ${attachment.fileName} (not downloaded)`;
+          })
+        : ["*(none)*"];
     const brief = [
       `# Task: ${task.title}`,
       "",
@@ -644,22 +643,37 @@ export class Agent {
     await fse.writeFile(notesFile, brief + agentNotes);
   }
 
-  private async downloadAttachments(task: PlannerTask): Promise<string[]> {
+  private async downloadAttachments(
+    task: PlannerTask,
+  ): Promise<Map<string, string>> {
+    const downloaded = new Map<string, string>();
     if (task.attachments.length === 0) {
-      return [];
+      return downloaded;
     }
     const attachmentsDir = path.join(this.getTaskDir(task.id), "attachments");
     await fse.ensureDir(attachmentsDir);
-    const downloaded: string[] = [];
     for (const attachment of task.attachments) {
+      // The file name comes verbatim from the Planner API (it stores the
+      // raw client-provided name): it must never be able to escape the
+      // task attachments directory (path traversal as root). Invalid names
+      // are skipped: one bad attachment must not fail the whole task.
+      const safePath = sanitizeAttachmentFileName(
+        attachment.fileName,
+        attachmentsDir,
+      );
+      if (safePath === null) {
+        logger.warn(
+          `Skipped attachment with unsafe file name '${attachment.fileName}' for task '${task.title}' (${task.id})`,
+        );
+        continue;
+      }
       try {
         const data = await this.planner.downloadTaskAttachment(
           task.id,
           attachment.id,
         );
-        const filePath = path.join(attachmentsDir, attachment.fileName);
-        await fse.writeFile(filePath, data);
-        downloaded.push(filePath);
+        await fse.writeFile(safePath, data);
+        downloaded.set(attachment.id, safePath);
         logger.info(
           `Downloaded attachment '${attachment.fileName}' for task '${task.title}' (${task.id})`,
         );
@@ -733,6 +747,38 @@ function extractTaskId(entry: string): string | undefined {
     /^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i,
   );
   return match ? match[1].toLowerCase() : undefined;
+}
+
+/**
+ * Resolves the local path of a downloaded attachment, or null when the
+ * attachment file name is unsafe. The name is rejected when it is empty, a
+ * dot name or carries a path separator (so '../evil.txt', '/etc/passwd' or
+ * 'a\\b.txt' cannot traverse out of the attachments directory); the
+ * containment of the resolved path is then verified as defense in depth.
+ */
+export function sanitizeAttachmentFileName(
+  fileName: string,
+  attachmentsDir: string,
+): string | null {
+  if (
+    fileName.length === 0 ||
+    fileName === "." ||
+    fileName === ".." ||
+    fileName.includes("/") ||
+    fileName.includes("\\")
+  ) {
+    return null;
+  }
+  const safeName = path.basename(fileName);
+  if (safeName.length === 0 || safeName === "." || safeName === "..") {
+    return null;
+  }
+  const resolvedDir = path.resolve(attachmentsDir);
+  const resolvedPath = path.resolve(resolvedDir, safeName);
+  if (!resolvedPath.startsWith(resolvedDir + path.sep)) {
+    return null;
+  }
+  return resolvedPath;
 }
 
 // A ready (task, action) pair, before the scheduler resolves the project
