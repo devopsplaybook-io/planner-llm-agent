@@ -4,6 +4,7 @@ import * as fse from "fs-extra";
 import { Agent } from "./Agent";
 import { AgentActionsConfig } from "./AgentActions";
 import { Config } from "./Config";
+import { FinalizationStore } from "./FinalizationStore";
 import { createCliAgent } from "./clients/CliAgentRegistry";
 import type { CliAgentClient } from "./clients/CliAgent";
 import { PlannerClient } from "./PlannerClient";
@@ -115,8 +116,9 @@ describe("Agent", () => {
   // without any action (it then processes no task).
   const createAgent = (
     agentActions: AgentActionsConfig | null = WILDCARD_ACTIONS,
+    finalizationStore?: FinalizationStore,
   ): Agent => {
-    const agent = new Agent(config, agentActions);
+    const agent = new Agent(config, agentActions, undefined, finalizationStore);
     agents.push(agent);
     return agent;
   };
@@ -155,6 +157,10 @@ describe("Agent", () => {
     delete process.env.TASK_POLLING_INTERVAL;
     config = new Config();
     config.TASK_POLLING_INTERVAL = 5;
+    // The backoff ceiling equals the base interval: the polling cadence of
+    // the tests below stays at the configured interval unless a test
+    // overrides the ceiling to exercise the backoff.
+    config.TASK_POLLING_MAX_INTERVAL = 5;
     dataDir = path.join(os.tmpdir(), `agent-spec-${Date.now()}`);
     config.DATA_DIR = dataDir;
 
@@ -336,6 +342,147 @@ describe("Agent", () => {
     await flushPoll();
     expect(mockPlanner.getCurrentUser).toHaveBeenCalledTimes(4); // initial + 3 polls
     agent.stop();
+  });
+
+  it("should back off the polling while idle and resume the base cadence on activity", async () => {
+    jest.useFakeTimers();
+    config.TASK_POLLING_INTERVAL = 1;
+    config.TASK_POLLING_MAX_INTERVAL = 8;
+    const realSetTimeout = jest.requireActual("timers").setTimeout;
+    const flushPoll = async (): Promise<void> => {
+      await new Promise((resolve) => realSetTimeout(resolve, 5));
+    };
+    // waitFor() cannot be used under fake timers (it sleeps with the
+    // mocked setTimeout), so the milestones are awaited with real timers.
+    const waitForReal = async (condition: () => boolean): Promise<void> => {
+      for (let i = 0; i < 200 && !condition(); i++) {
+        await new Promise((resolve) => realSetTimeout(resolve, 10));
+      }
+      expect(condition()).toBe(true);
+    };
+    const agent = createAgent();
+    agent.start();
+    await flushPoll(); // poll 1: idle
+    expect(mockPlanner.getCurrentUser).toHaveBeenCalledTimes(1);
+
+    // The first idle poll keeps the base interval.
+    await jest.advanceTimersByTimeAsync(1000);
+    await flushPoll();
+    expect(mockPlanner.getCurrentUser).toHaveBeenCalledTimes(2);
+
+    // The next idle poll doubles the interval: 1 second is not enough.
+    await jest.advanceTimersByTimeAsync(1000);
+    await flushPoll();
+    expect(mockPlanner.getCurrentUser).toHaveBeenCalledTimes(2);
+    await jest.advanceTimersByTimeAsync(1000);
+    await flushPoll();
+    expect(mockPlanner.getCurrentUser).toHaveBeenCalledTimes(3);
+
+    // A task being picked resets the cadence: the next poll runs at the
+    // base interval again.
+    mockPlannerTasks([
+      {
+        id: "task-1",
+        title: "New task",
+        status: "To Do",
+        description: "Work to do",
+        comments: [],
+        attachments: [],
+      },
+    ]);
+    mockQoder.performTask.mockResolvedValue("done");
+    await jest.advanceTimersByTimeAsync(4000); // 4s backoff: poll 4 picks the task
+    await waitForReal(() => mockQoder.performTask.mock.calls.length === 1);
+    expect(mockPlanner.getCurrentUser).toHaveBeenCalledTimes(4);
+
+    await jest.advanceTimersByTimeAsync(1000);
+    await flushPoll();
+    expect(mockPlanner.getCurrentUser).toHaveBeenCalledTimes(5);
+    agent.stop();
+  });
+
+  it("should scope the task fetch to the configured projects when every action is project-bound", async () => {
+    mockPlanner.listProjects.mockResolvedValue([
+      { id: "proj-web", name: "Web", description: "" },
+      { id: "proj-docs", name: "Docs", description: "" },
+      { id: "proj-other", name: "Other", description: "" },
+    ]);
+    mockPlannerTasks([]);
+    const agent = createAgent({
+      defaultModel: "",
+      defaultTimeout: null,
+      actions: [
+        {
+          project: "Web",
+          statusStart: "To Do",
+          statusEnd: "Done",
+          model: "",
+          instruction: "",
+          timeout: null,
+          weight: null,
+        },
+        {
+          project: "Docs*",
+          statusStart: "To Do",
+          statusEnd: "Done",
+          model: "",
+          instruction: "",
+          timeout: null,
+          weight: null,
+        },
+      ],
+    });
+    agent.start();
+    await waitFor(() => mockPlanner.listAssignedTasks.mock.calls.length === 1);
+    agent.stop();
+
+    expect(mockPlanner.listAssignedTasks).toHaveBeenCalledWith(
+      { id: "user-1", name: "Test User" },
+      ["proj-web", "proj-docs"],
+    );
+  });
+
+  it("should fetch the tasks unscoped when an action matches every project", async () => {
+    mockPlannerTasks([]);
+    const agent = createAgent();
+    agent.start();
+    await waitFor(() => mockPlanner.listAssignedTasks.mock.calls.length === 1);
+    agent.stop();
+
+    expect(mockPlanner.listAssignedTasks).toHaveBeenCalledWith(
+      { id: "user-1", name: "Test User" },
+      undefined,
+    );
+  });
+
+  it("should fetch the tasks unscoped when no project matches the patterns", async () => {
+    mockPlanner.listProjects.mockResolvedValue([
+      { id: "proj-other", name: "Other", description: "" },
+    ]);
+    mockPlannerTasks([]);
+    const agent = createAgent({
+      defaultModel: "",
+      defaultTimeout: null,
+      actions: [
+        {
+          project: "Web",
+          statusStart: "To Do",
+          statusEnd: "Done",
+          model: "",
+          instruction: "",
+          timeout: null,
+          weight: null,
+        },
+      ],
+    });
+    agent.start();
+    await waitFor(() => mockPlanner.listAssignedTasks.mock.calls.length === 1);
+    agent.stop();
+
+    expect(mockPlanner.listAssignedTasks).toHaveBeenCalledWith(
+      { id: "user-1", name: "Test User" },
+      undefined,
+    );
   });
 
   it("should not log when assigned tasks are not ready to be processed", async () => {
@@ -887,6 +1034,67 @@ describe("Agent", () => {
     agent.stop();
   });
 
+  it("should skip attachments with unsafe file names and download the valid ones", async () => {
+    config.TASK_STATUS_CLEANUP = "Archived";
+    const unsafeNames = [
+      "../escaped.txt",
+      "../../deep/escape.txt",
+      "/tmp/evil.txt",
+      "a\\b.txt",
+      "sub/dir/name.txt",
+      ".",
+      "..",
+      "",
+    ];
+    mockPlanner.listAssignedTasks.mockResolvedValue([
+      {
+        id: "task-1",
+        title: "Implement feature",
+        status: "To Do",
+        description: "Add a feature",
+        comments: [],
+        attachments: [
+          {
+            id: "attachment-safe",
+            fileName: "notes.txt",
+            filePath: "/uploads/notes.txt",
+            dateCreated: "2026-09-02T00:00:00.000Z",
+          },
+          ...unsafeNames.map((fileName, index) => ({
+            id: `attachment-unsafe-${index}`,
+            fileName,
+            filePath: `/uploads/attachment-${index}`,
+            dateCreated: "2026-09-02T00:00:00.000Z",
+          })),
+        ],
+      },
+    ]);
+    mockPlanner.downloadTaskAttachment.mockResolvedValue(Buffer.from("image"));
+    mockQoder.performTask.mockResolvedValue("Feature implemented");
+
+    const agent = createAgent();
+    agent.start();
+    await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
+
+    // Only the safe attachment is written, inside the attachments directory.
+    const attachmentsDir = path.join(dataDir, "tasks", "task-1", "attachments");
+    expect((await fse.readdir(attachmentsDir)).sort()).toEqual(["notes.txt"]);
+    const tasksDir = path.join(dataDir, "tasks");
+    const taskDirEntries = await fse.readdir(tasksDir);
+    expect(taskDirEntries).toContain("task-1");
+    expect(taskDirEntries).not.toContain("escaped.txt");
+    expect(taskDirEntries).not.toContain("deep");
+
+    // The notes file lists the safe attachment and marks the unsafe ones.
+    const content = await fse.readFile(
+      path.join(dataDir, "tasks", "task-1-Agent.md"),
+      "utf8",
+    );
+    expect(content).toContain("notes.txt");
+    expect(content).toContain("(unsafe file name, skipped)");
+    agent.stop();
+  });
+
   it("should clean up the task folder immediately when the task reaches the cleanup status", async () => {
     const taskId = "48c603af-4725-47f5-ac4e-628e027291e8";
     mockPlanner.listAssignedTasks.mockResolvedValue([
@@ -904,12 +1112,14 @@ describe("Agent", () => {
     const agent = createAgent();
     agent.start();
     await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
-
-    expect(
-      await fse.pathExists(path.join(dataDir, "tasks", `${taskId}-Agent.md`)),
-    ).toBe(false);
-    expect(await fse.pathExists(path.join(dataDir, "tasks", taskId))).toBe(
-      false,
+    // The folder cleanup runs after the status update: wait for the actual
+    // removal instead of racing it.
+    await waitFor(
+      () =>
+        !fse.pathExistsSync(path.join(dataDir, "tasks", taskId)) &&
+        !fse.pathExistsSync(
+          path.join(dataDir, "tasks", `${taskId}-Agent.md`),
+        ),
     );
     agent.stop();
   });
@@ -935,6 +1145,87 @@ describe("Agent", () => {
     ).toBe(false);
     expect(await fse.pathExists(path.join(tasksDir, taskId))).toBe(false);
     agent.stop();
+  });
+
+  it("should not re-execute a task whose summary comment failed and should finalize it on retry", async () => {
+    config.TASK_POLLING_INTERVAL = 0.05;
+    mockPlannerTasks([
+      {
+        id: "task-1",
+        title: "Implement feature",
+        status: "To Do",
+        description: "Add a feature",
+        comments: [],
+        attachments: [],
+      },
+    ]);
+    mockQoder.performTask.mockResolvedValue("All done");
+    // The summary comment POST fails on the first attempt only.
+    let summaryCommentAttempts = 0;
+    mockPlanner.addTaskComment.mockImplementation(
+      async (_id: string, text: string) => {
+        if (text === "All done") {
+          summaryCommentAttempts++;
+          if (summaryCommentAttempts === 1) {
+            throw new Error("Planner is down");
+          }
+        }
+      },
+    );
+
+    const agent = createAgent(
+      WILDCARD_ACTIONS,
+      new FinalizationStore({ retryBaseMs: 10 }),
+    );
+    agent.start();
+    await waitFor(
+      () =>
+        mockPlanner.updateTaskStatus.mock.calls.some(
+          (call) => call[0] === "task-1" && call[1] === "Done",
+        ),
+      5000,
+    );
+
+    // The CLI ran exactly once although the first finalization failed: only
+    // the Planner updates were retried.
+    expect(mockQoder.performTask).toHaveBeenCalledTimes(1);
+    expect(summaryCommentAttempts).toBe(2);
+    expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith("task-1", "Done");
+  });
+
+  it("should not post the summary comment twice when only the status update fails", async () => {
+    config.TASK_POLLING_INTERVAL = 0.05;
+    mockPlanner.listAssignedTasks.mockResolvedValue([
+      {
+        id: "task-1",
+        title: "Implement feature",
+        status: "To Do",
+        description: "Add a feature",
+        comments: [],
+        attachments: [],
+      },
+    ]);
+    mockQoder.performTask.mockResolvedValue("All done");
+    mockPlanner.updateTaskStatus.mockRejectedValue(new Error("Planner is down"));
+
+    const agent = createAgent(
+      WILDCARD_ACTIONS,
+      new FinalizationStore({ retryBaseMs: 10 }),
+    );
+    agent.start();
+    await waitFor(
+      () =>
+        mockPlanner.updateTaskStatus.mock.calls.filter(
+          (call) => call[0] === "task-1" && call[1] === "Done",
+        ).length >= 2,
+      5000,
+    );
+
+    expect(mockQoder.performTask).toHaveBeenCalledTimes(1);
+    const summaryComments = mockPlanner.addTaskComment.mock.calls.filter(
+      (call) => call[1] === "All done",
+    );
+    expect(summaryComments).toHaveLength(1);
   });
 
   it("should process only the tasks matching the action project and start status", async () => {

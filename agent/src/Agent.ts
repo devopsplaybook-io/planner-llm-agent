@@ -6,6 +6,7 @@ import {
   matchProjectPattern,
 } from "./AgentActions";
 import { Config } from "./Config";
+import { FinalizationStore } from "./FinalizationStore";
 import { createCliAgent } from "./clients/CliAgentRegistry";
 import { prepareCliAgent, type CliAgentClient } from "./clients/CliAgent";
 import { resolveModel } from "./clients/BaseCliAgent";
@@ -33,8 +34,30 @@ const logger = OTelLogger().createModuleLogger("agent");
 const AGENT_NOTES_MARKER =
   "<!-- AGENT-NOTES: the content below is maintained by the planner agent. Do not remove this marker. -->";
 
+// Refresh period of the heartbeat file the Kubernetes probes check.
+const HEARTBEAT_INTERVAL_MS = 30000;
+
 // Maximum length of the failure explanation posted on a task.
 const MAX_FAILURE_EXPLANATION_LENGTH = 1000;
+
+/**
+ * Sanitizes a Planner attachment file name for a safe local write: only the
+ * base name is kept, and names carrying path separators or dot-only names
+ * are rejected. The Planner server stores the client-provided name verbatim,
+ * so an unsanitized name is an arbitrary-file-write vector (path traversal)
+ * executed with the agent's privileges. Returns null for an unsafe name
+ * (the attachment is skipped, never written).
+ */
+export function sanitizeAttachmentFileName(fileName: string): string | null {
+  if (fileName.includes("/") || fileName.includes("\\")) {
+    return null;
+  }
+  const base = path.basename(fileName);
+  if (base.length === 0 || base === "." || base === "..") {
+    return null;
+  }
+  return base;
+}
 
 export class Agent {
   private config: Config;
@@ -44,16 +67,26 @@ export class Agent {
   private cliAgents: Map<string, CliAgentClient>;
   private defaultAgent: string;
   private taskEvaluator: TaskEvaluator;
+  private running = false;
   private pollingTimer?: NodeJS.Timeout;
+  private heartbeatTimer?: NodeJS.Timeout;
   // Tasks currently being processed with their scheduling metadata: they
   // are never picked again by a subsequent poll while their processing is
   // still running. In-memory only: one agent process per agent identity is
   // assumed; cross-instance scheduling is not supported.
   private processingTasks = new Map<string, RunningTask>();
+  // Completed tasks waiting for their Planner finalization (summary comment,
+  // end status): while a record exists the task is never picked again, and
+  // only the finalization steps are retried — the CLI work is never re-run.
+  private finalizationStore: FinalizationStore;
   // Single-flight guard: while a poll is still running (task selection,
   // utility-model evaluations or processing start), the next tick is
   // skipped, so tasks can never be registered twice (double-pick race).
   private polling = false;
+  // Adaptive polling: number of consecutive polls that found nothing to
+  // do. The polling delay doubles after every idle poll, capped at
+  // TASK_POLLING_MAX_INTERVAL; any activity resets it to the base interval.
+  private idlePolls = 0;
   // Ready tasks waiting to be admitted by the scheduler: refreshed on every
   // completed poll and reported by the queue gauge (see initQueueMetrics).
   private queuedTasks = 0;
@@ -65,6 +98,7 @@ export class Agent {
     config: Config,
     agentActions?: AgentActionsConfig | null,
     cliAgents?: Map<string, CliAgentClient>,
+    finalizationStore?: FinalizationStore,
   ) {
     this.config = config;
     this.agentActions = agentActions ?? null;
@@ -80,25 +114,82 @@ export class Agent {
     }
     this.cliAgent = this.cliAgents.get(this.defaultAgent)!;
     this.taskEvaluator = new TaskEvaluator(config, this.cliAgent);
+    this.finalizationStore = finalizationStore ?? new FinalizationStore();
     this.initQueueMetrics();
   }
 
   public start(): void {
+    if (this.running) {
+      return;
+    }
+    this.running = true;
     logger.info(
-      `Agent '${this.config.AGENT_NAME}' started (polling every ${this.config.TASK_POLLING_INTERVAL} seconds)`,
+      `Agent '${this.config.AGENT_NAME}' started (polling every ${this.config.TASK_POLLING_INTERVAL} seconds, backing off to at most ${this.maxPollingIntervalSeconds()} seconds between polls when idle)`,
     );
-    void this.pollForTasks();
-    this.pollingTimer = setInterval(() => {
-      void this.pollForTasks();
-    }, this.config.TASK_POLLING_INTERVAL * 1000);
+    void this.pollForTasks()
+      .finally(() => this.scheduleNextPoll())
+      .catch((error: Error) =>
+        logger.error(`Failed to run the polling loop: ${error.message}`),
+      );
+    this.startHeartbeat();
   }
 
   public stop(): void {
-    if (this.pollingTimer) {
-      clearInterval(this.pollingTimer);
-      this.pollingTimer = undefined;
-      logger.info(`Agent '${this.config.AGENT_NAME}' stopped`);
+    if (!this.running) {
+      return;
     }
+    this.running = false;
+    if (this.pollingTimer) {
+      clearTimeout(this.pollingTimer);
+      this.pollingTimer = undefined;
+    }
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = undefined;
+    }
+    logger.info(`Agent '${this.config.AGENT_NAME}' stopped`);
+  }
+
+  // The Kubernetes probes check the freshness of the heartbeat file: it
+  // proves the agent event loop is alive even when no poll runs (the file
+  // is touched at startup too, see App).
+  private startHeartbeat(): void {
+    void this.writeHeartbeat();
+    this.heartbeatTimer = setInterval(() => {
+      void this.writeHeartbeat();
+    }, HEARTBEAT_INTERVAL_MS);
+    this.heartbeatTimer.unref();
+  }
+
+  private async writeHeartbeat(): Promise<void> {
+    try {
+      await fse.ensureDir(this.config.DATA_DIR);
+      await fse.writeFile(
+        path.join(this.config.DATA_DIR, "heartbeat"),
+        new Date().toISOString(),
+      );
+    } catch (error) {
+      logger.error(
+        `Failed to write the heartbeat file: ${(error as Error).message}`,
+      );
+    }
+  }
+
+  // The polling loop is self-rescheduling instead of a fixed interval: the
+  // next poll is scheduled once the current one completed, with a delay
+  // that doubles after every consecutive idle poll (adaptive backoff).
+  private scheduleNextPoll(): void {
+    if (!this.running) {
+      return;
+    }
+    this.pollingTimer = setTimeout(() => {
+      this.pollingTimer = undefined;
+      void this.pollForTasks()
+        .finally(() => this.scheduleNextPoll())
+        .catch((error: Error) =>
+          logger.error(`Failed to run the polling loop: ${error.message}`),
+        );
+    }, this.nextPollDelaySeconds() * 1000);
   }
 
   private async pollForTasks(): Promise<void> {
@@ -107,23 +198,62 @@ export class Agent {
     }
     this.polling = true;
     try {
-      await this.pollOnce();
+      const outcome = await this.pollOnce();
+      this.updatePollCadence(outcome);
     } finally {
       this.polling = false;
     }
   }
 
-  private async pollOnce(): Promise<void> {
+  // The delay before the next poll: the base TASK_POLLING_INTERVAL doubled
+  // after every consecutive idle poll (the first idle poll keeps the base
+  // interval), capped at the effective maximum.
+  private nextPollDelaySeconds(): number {
+    const base = this.pollingIntervalSeconds();
+    const factor = 2 ** Math.max(this.idlePolls - 1, 0);
+    return Math.min(base * factor, this.maxPollingIntervalSeconds());
+  }
+
+  // The effective polling ceiling: the largest of TASK_POLLING_MAX_INTERVAL
+  // and the base interval, so a misconfigured maximum can never make the
+  // agent poll faster than the base interval.
+  private maxPollingIntervalSeconds(): number {
+    return Math.max(
+      this.pollingIntervalSeconds(),
+      this.configuredMaxPollingIntervalSeconds(),
+    );
+  }
+
+  private pollingIntervalSeconds(): number {
+    const value = this.config.TASK_POLLING_INTERVAL;
+    return Number.isFinite(value) && value > 0 ? value : 60;
+  }
+
+  private configuredMaxPollingIntervalSeconds(): number {
+    const value = this.config.TASK_POLLING_MAX_INTERVAL;
+    return Number.isFinite(value) && value > 0 ? value : 300;
+  }
+
+  private updatePollCadence(outcome: PollOutcome): void {
+    if (outcome === "error") {
+      // An error says nothing about idleness: keep the current cadence.
+      return;
+    }
+    // Anything to do keeps the base cadence: picked or queued candidates,
+    // tasks still running and pending Planner finalizations are all work
+    // the next poll must reach without waiting out a backoff.
+    const active =
+      outcome === "actionable" ||
+      this.processingTasks.size > 0 ||
+      this.finalizationStore.size > 0;
+    this.idlePolls = active ? 0 : this.idlePolls + 1;
+  }
+
+  private async pollOnce(): Promise<PollOutcome> {
+    let outcome: PollOutcome = "idle";
     try {
       const user = await this.planner.getCurrentUser();
-      const tasks = await this.planner.listAssignedTasks(user);
-      await this.cleanupCompletedTasks(tasks);
-      this.logRunningTasks();
       const actions = this.getActions();
-      if (actions.length === 0 || tasks.length === 0) {
-        this.queuedTasks = 0;
-        return;
-      }
       // The projects are loaded lazily, once per poll: the project-bound
       // actions match on the project names, and the task brief includes the
       // project name and description.
@@ -136,6 +266,29 @@ export class Agent {
           }
           return projects;
         };
+      // Cut the poll payload: when every action is bound to a project
+      // pattern, the task list is fetched per project instead of across
+      // all projects.
+      const projectScope = await this.taskScopeProjectIds(
+        actions,
+        loadProjects,
+      );
+      const tasks = await this.planner.listAssignedTasks(
+        user,
+        projectScope ?? undefined,
+      );
+      await this.cleanupCompletedTasks(tasks);
+      // Records of the tasks that are no longer assigned can never be
+      // finalized: drop them.
+      this.finalizationStore.prune(new Set(tasks.map((task) => task.id)));
+      this.logRunningTasks();
+      if (actions.length === 0 || tasks.length === 0) {
+        this.queuedTasks = 0;
+        return outcome;
+      }
+      // The project-bound actions match on the project names: the projects
+      // are loaded when any action needs them (the scoped fetch above
+      // already loaded them when every action is project-bound).
       if (actions.some((action) => action.project.length > 0)) {
         await loadProjects();
       }
@@ -150,6 +303,9 @@ export class Agent {
           if (
             !this.matchesAction(task, action, projects) ||
             this.processingTasks.has(task.id) ||
+            // A task with a pending finalization completed already: only its
+            // Planner updates remain, never a new CLI execution.
+            this.finalizationStore.has(task.id) ||
             candidates.some((selected) => selected.task.id === task.id)
           ) {
             continue;
@@ -159,7 +315,7 @@ export class Agent {
       }
       if (candidates.length === 0) {
         this.queuedTasks = 0;
-        return;
+        return outcome;
       }
       // Queue order: higher priorities first; within the same priority the
       // task whose last update is the oldest is picked first. The sort is
@@ -171,15 +327,54 @@ export class Agent {
             dateUpdatedValue(b.task.dateUpdated),
       );
       if (this.isSmartSchedulingEnabled()) {
+        outcome = "actionable";
         await this.selectTasksWithScheduler(candidates, loadProjects);
       } else {
+        outcome = "actionable";
         await this.selectTasksWithKillSwitch(candidates, loadProjects);
       }
     } catch (error) {
       logger.error(
         `Failed to poll tasks from Planner: ${(error as Error).message}`,
       );
+      outcome = "error";
+    } finally {
+      // The finalization retries run after the selection of this poll: a
+      // record deleted by a successful retry can then no longer influence
+      // the (already stale) task list of the same poll, so a task finalized
+      // on retry is never re-picked by that poll.
+      await this.retryDueFinalizations();
     }
+    return outcome;
+  }
+
+  // The project ids the task fetch is scoped to, or null for the unscoped
+  // fetch: the scoping only applies when every action is bound to a
+  // project pattern, and it falls back to the unscoped list when no
+  // project matches the patterns (the client-side matching then rejects
+  // every task, exactly like the unscoped fetch does).
+  private async taskScopeProjectIds(
+    actions: AgentAction[],
+    loadProjects: () => Promise<Map<string, PlannerProject>>,
+  ): Promise<string[] | null> {
+    if (
+      actions.length === 0 ||
+      actions.some((action) => action.project.length === 0)
+    ) {
+      return null;
+    }
+    const projects = await loadProjects();
+    const ids: string[] = [];
+    for (const project of projects.values()) {
+      if (
+        actions.some((action) =>
+          matchProjectPattern(action.project, project.name),
+        )
+      ) {
+        ids.push(project.id);
+      }
+    }
+    return ids.length > 0 ? ids : null;
   }
 
   // Smart scheduling (default): weighted capacity budget, conflict-aware
@@ -503,14 +698,33 @@ export class Agent {
           this.config.TASK_TIMEOUT,
         cwd: taskDir,
       });
-      await this.planner.addTaskComment(task.id, summary);
-      await this.planner.updateTaskStatus(task.id, action.statusEnd);
+      // The CLI work is done: from here on only the Planner finalization
+      // remains, and a failure of it must never re-run the CLI — the record
+      // keeps the task out of the candidates and drives the idempotent
+      // retries (see retryDueFinalizations).
+      this.finalizationStore.record(task.id, {
+        title: task.title,
+        contentVersion: task.dateUpdated,
+        summary,
+        statusEnd: action.statusEnd,
+      });
+      await this.finalizeCompletedTask(task.id);
+      this.finalizationStore.delete(task.id);
       logger.info(
         `Task '${task.title}' (${task.id}) completed and moved to status '${action.statusEnd}'`,
       );
-      await this.cleanupTaskFolderIfNeeded(task.id, action.statusEnd);
     } catch (error) {
       const message = (error as Error).message;
+      if (this.finalizationStore.has(task.id)) {
+        // The CLI execution succeeded; only the Planner finalization failed.
+        // The retry is scheduled with an exponential backoff.
+        this.finalizationStore.scheduleRetry(task.id);
+        const record = this.finalizationStore.get(task.id);
+        logger.error(
+          `Failed to finalize completed task '${task.title}' (${task.id}) (attempt ${record?.attempts ?? 1}, retry scheduled): ${message}`,
+        );
+        return;
+      }
       logger.error(
         `Failed to process task '${task.title}' (${task.id}): ${message}`,
       );
@@ -533,6 +747,48 @@ export class Agent {
       }
     } finally {
       this.processingTasks.delete(task.id);
+    }
+  }
+
+  // Completes a finished task on Planner: posts the summary comment (unless
+  // a previous attempt already did) and moves the task to its end status.
+  // Idempotent, driven by the FinalizationStore record of the task.
+  private async finalizeCompletedTask(taskId: string): Promise<void> {
+    const record = this.finalizationStore.get(taskId);
+    if (!record) {
+      return;
+    }
+    if (!record.commentPosted) {
+      await this.planner.addTaskComment(taskId, record.summary);
+      this.finalizationStore.markCommentPosted(taskId);
+    }
+    await this.planner.updateTaskStatus(taskId, record.statusEnd);
+    await this.cleanupTaskFolderIfNeeded(taskId, record.statusEnd);
+  }
+
+  // Retries the pending finalizations of the completed tasks whose summary
+  // comment or end-status update previously failed. Only the Planner
+  // updates run here: the CLI work is never re-executed. The tasks still
+  // being processed are skipped: their own processTask call is
+  // finalizing them right now.
+  private async retryDueFinalizations(): Promise<void> {
+    for (const taskId of this.finalizationStore.dueTaskIds()) {
+      const record = this.finalizationStore.get(taskId);
+      if (!record || this.processingTasks.has(taskId)) {
+        continue;
+      }
+      try {
+        await this.finalizeCompletedTask(taskId);
+        this.finalizationStore.delete(taskId);
+        logger.info(
+          `Task '${record.title}' (${taskId}) finalized on retry and moved to status '${record.statusEnd}'`,
+        );
+      } catch (error) {
+        this.finalizationStore.scheduleRetry(taskId);
+        logger.error(
+          `Failed to finalize completed task '${record.title}' (${taskId}) (attempt ${record.attempts}, retry scheduled): ${(error as Error).message}`,
+        );
+      }
     }
   }
 
@@ -603,16 +859,23 @@ export class Agent {
       )
       .join("\n");
     const downloadedAttachments = await this.downloadAttachments(task);
+    // One line per attachment: unsafe names are always reported as skipped,
+    // the downloaded ones with their local path, the others as failed.
     const attachmentLines =
-      downloadedAttachments.length > 0
-        ? downloadedAttachments.map(
-            (filePath) => `- ${path.basename(filePath)} (${filePath})`,
-          )
-        : task.attachments.length > 0
-          ? task.attachments.map(
-              (attachment) => `- ${attachment.fileName} (download failed)`,
-            )
-          : ["*(none)*"];
+      task.attachments.length > 0
+        ? task.attachments.map((attachment) => {
+            const name = sanitizeAttachmentFileName(attachment.fileName);
+            if (name === null) {
+              return "- (unsafe file name, skipped)";
+            }
+            const downloadedPath = downloadedAttachments.find(
+              (filePath) => path.basename(filePath) === name,
+            );
+            return downloadedPath !== undefined
+              ? `- ${name} (${downloadedPath})`
+              : `- ${name} (download failed)`;
+          })
+        : ["*(none)*"];
     const brief = [
       `# Task: ${task.title}`,
       "",
@@ -657,7 +920,24 @@ export class Agent {
           task.id,
           attachment.id,
         );
-        const filePath = path.join(attachmentsDir, attachment.fileName);
+        const fileName = sanitizeAttachmentFileName(attachment.fileName);
+        if (fileName === null) {
+          logger.warn(
+            `Skipping attachment with unsafe file name '${attachment.fileName}' for task '${task.title}' (${task.id})`,
+          );
+          continue;
+        }
+        const filePath = path.join(attachmentsDir, fileName);
+        // Containment is enforced again after resolution, on top of the
+        // name sanitization, so no attachment can ever be written outside
+        // the task attachments directory.
+        const resolvedDir = `${path.resolve(attachmentsDir)}${path.sep}`;
+        if (!path.resolve(filePath).startsWith(resolvedDir)) {
+          logger.warn(
+            `Skipping attachment with unsafe file name '${attachment.fileName}' for task '${task.title}' (${task.id})`,
+          );
+          continue;
+        }
         await fse.writeFile(filePath, data);
         downloaded.push(filePath);
         logger.info(
@@ -734,6 +1014,11 @@ function extractTaskId(entry: string): string | undefined {
   );
   return match ? match[1].toLowerCase() : undefined;
 }
+
+// What a poll found: actionable work (scheduler candidates), nothing to
+// do, or a failure to reach Planner (the polling cadence is only adapted
+// on the first two outcomes).
+type PollOutcome = "actionable" | "idle" | "error";
 
 // A ready (task, action) pair, before the scheduler resolves the project
 // name and the scheduling metadata.

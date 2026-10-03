@@ -15,10 +15,60 @@ spec:
       labels:
         app: planner-llm-agent
     spec:
+      # The image runs as the dedicated non-root user (uid/gid 10001, see the
+      # Dockerfile). fsGroup hands ownership of the mounted /data volume to
+      # that group so the agent can write to it; the volume must also be
+      # writable by uid 10001 when the new image rolls out (prerequisite
+      # coordinated in the GitOps repository).
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      # The agent traps SIGTERM and terminates the CLI process groups of the
+      # running tasks (SIGTERM, ~10s grace, then exit): 30s is enough for a
+      # clean stop without delaying a rollout noticeably.
+      terminationGracePeriodSeconds: 30
       containers:
         - image: planner-llm-agent
           name: planner-llm-agent
           imagePullPolicy: Always
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            # readOnlyRootFilesystem is deliberately not set: the coding-agent
+            # CLIs and the Git tooling write caches, configuration and clones
+            # under $HOME and /tmp at runtime.
+          # Health is tracked through the heartbeat file the agent refreshes
+          # every 30 seconds under /data (written early at startup, then by
+          # the polling loop). The startup probe only waits for the first
+          # heartbeat; readiness tolerates 120s of staleness, liveness 300s.
+          startupProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - 'test -f /data/heartbeat'
+            periodSeconds: 10
+            failureThreshold: 60
+          readinessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - 'test $(( $(date +%s) - $(stat -c %Y /data/heartbeat 2>/dev/null || echo 0) )) -lt 120'
+            periodSeconds: 10
+            failureThreshold: 12
+          livenessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - 'test $(( $(date +%s) - $(stat -c %Y /data/heartbeat 2>/dev/null || echo 0) )) -lt 300'
+            periodSeconds: 30
+            failureThreshold: 10
           env:
             - name: AGENT_NAME
               value: "planner-llm-agent"

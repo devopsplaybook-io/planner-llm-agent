@@ -2,6 +2,7 @@ import * as fs from "fs-extra";
 import * as os from "os";
 import * as path from "path";
 import { Config, githubTokenEnvName } from "./Config";
+import { clearConfigEnvironment } from "../jest.setup";
 
 describe("Config", () => {
   const originalEnv = process.env;
@@ -9,19 +10,9 @@ describe("Config", () => {
   beforeEach(() => {
     jest.resetModules();
     process.env = { ...originalEnv };
-    // Clear relevant env vars to test defaults
-    delete process.env.DATA_DIR;
-    delete process.env.TMP_DIR;
-    delete process.env.DEV_MODE;
-    delete process.env.CONFIG_FILE;
-    delete process.env.AGENT_NAME;
-    delete process.env.PLANNER_URL;
-    delete process.env.PLANNER_API_KEY;
-    delete process.env.TASK_POLLING_INTERVAL;
-    delete process.env.OPENTELEMETRY_COLLECTOR_HTTP_TRACES;
-    delete process.env.OPENTELEMETRY_COLLECTOR_HTTP_METRICS;
-    delete process.env.OPENTELEMETRY_COLLECTOR_HTTP_LOGS;
-    delete process.env.OPENTELEMETRY_COLLECT_AUTHORIZATION_HEADER;
+    // The snapshot restore above reintroduces the ambient environment:
+    // clear every configuration-relevant variable to test the defaults.
+    clearConfigEnvironment();
   });
 
   afterAll(() => {

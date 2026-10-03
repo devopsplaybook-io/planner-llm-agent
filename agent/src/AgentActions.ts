@@ -265,6 +265,10 @@ export async function loadAgentActions(
  * pattern matches any project; otherwise the pattern is a glob with '*'
  * wildcards only ('*' matches any sequence of characters, including the
  * empty one) matched in full and case-sensitively.
+ *
+ * Implemented as a greedy linear scan with a single backtrack point instead
+ * of a RegExp so a pathological pattern cannot backtrack exponentially
+ * (ReDoS).
  */
 export function matchProjectPattern(
   pattern: string,
@@ -273,13 +277,35 @@ export function matchProjectPattern(
   if (pattern.length === 0) {
     return true;
   }
-  const regex = new RegExp(
-    `^${pattern
-      .split("*")
-      .map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
-      .join(".*")}$`,
-  );
-  return regex.test(projectName);
+  let g = 0;
+  let v = 0;
+  // Index of the last '*' seen in the glob and the value position that
+  // followed its (initially empty) match; on a mismatch the retry lets that
+  // '*' swallow one more character.
+  let starG = -1;
+  let starV = 0;
+  while (v < projectName.length) {
+    if (g < pattern.length && pattern[g] === "*") {
+      starG = g;
+      starV = v;
+      g++;
+    } else if (g < pattern.length && pattern[g] === projectName[v]) {
+      g++;
+      v++;
+    } else if (starG !== -1) {
+      // Retry: the last '*' swallows one more character; the scan resumes
+      // just after the star.
+      g = starG + 1;
+      v = starV + 1;
+      starV++;
+    } else {
+      return false;
+    }
+  }
+  while (g < pattern.length && pattern[g] === "*") {
+    g++;
+  }
+  return g === pattern.length;
 }
 
 // Reads the optional project pattern of an action: a missing, null or

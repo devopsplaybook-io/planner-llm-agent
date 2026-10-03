@@ -26,12 +26,14 @@ Configuration values are resolved with the following priority:
 | `AGENT_ACTIONS_FILE`    | `/etc/planner/llm-agent.yaml` | Path of the agent actions YAML file, watched for changes at runtime (see [Agent actions](#agent-actions)) |
 | `PLANNER_URL`           | `http://localhost:8080`       | Planner instance base URL                                                 |
 | `PLANNER_API_KEY`       | (empty)                       | Planner API key (required)                                                |
-| `TASK_POLLING_INTERVAL` | `60`                          | Seconds between polls of assigned tasks                                   |
+| `TASK_POLLING_INTERVAL` | `60`                          | Seconds between polls of assigned tasks; doubles after every consecutive idle poll (see [Adaptive polling](#adaptive-polling)) |
+| `TASK_POLLING_MAX_INTERVAL` | `300`                     | Ceiling of the adaptive polling backoff in seconds (the base interval always applies when lower) |
 | `TASK_STATUS_CLEANUP`   | `Done`                        | Local task folder is deleted when a task reaches this status              |
 | `TASK_MAX_PARALLEL`     | `1`                           | Weighted capacity budget of the parallel scheduling (decimals allowed, e.g. `1.9`; at most ceil(budget) CLI processes run concurrently; see [Parallel scheduling](#parallel-scheduling)) |
 | `TASK_SMART_SCHEDULING` | `true`                        | Weighted, conflict-aware scheduling when `true`; `false` restores the historical count-based parallelism |
 | `TASK_CONFLICT_MODE`    | `repo`                        | Automatic conflict keys derived from the task content: `repo`, `project` or `none` (see [Parallel scheduling](#parallel-scheduling)) |
 | `AGENT_UTILITY_MODEL`   | (empty)                       | Fast/cheap model (on the configured CLI) pre-evaluating the weight and repositories of hint-less tasks; empty disables it (zero LLM calls) |
+| `AGENT_EVALUATION_TIMEOUT` | `30`                       | Maximum duration in seconds of one scheduling round's utility-model evaluations (see [Utility model](#utility-model-optional)) |
 | `TASK_TIMEOUT`          | `3600`                        | Maximum duration of a task execution in seconds (fallback when the actions configuration defines no timeout) |
 | `DATA_DIR`              | `/data`                       | Persistent data directory (task documentation files)                      |
 | `TMP_DIR`               | `/tmp`                        | Temporary directory                                                       |
@@ -221,8 +223,18 @@ When `AGENT_UTILITY_MODEL` is set to a model available on the configured CLI, th
 
 - The prompt contains the task title, project and description (plus the latest comments) and expects a single JSON reply: `{"weight": <number>, "conflicts": ["repo:owner/name", ...], "kind": "<code-heavy|code-light|non-code>"}`.
 - The evaluated weight fills the same slot as an action weight (the description directive still wins) and the repository keys returned by the model are merged into the conflict keys. Only keys with the `repo:` shape are accepted, so a model answer cannot inject arbitrary locks; everything else fails open (fallback weight `1`, no extra conflicts).
-- Evaluations are cached per task content version (a task is evaluated once per update, not per poll), only the tasks that could still be admitted this round are evaluated, at most 3 evaluations run concurrently and never more than the process cap of the scheduler (every evaluation is one CLI process), and each is bounded by a 60 seconds timeout. A failing or slow utility model never blocks the scheduling: the task falls back to the default weight and the deterministic conflict keys, and the failure is logged once per content version.
+- Evaluations are cached per task content version (a task is evaluated once per update, not per poll), only the tasks that could still be admitted this round are evaluated, at most 3 evaluations run concurrently and never more than the process cap of the scheduler (every evaluation is one CLI process), and each is bounded by the `AGENT_EVALUATION_TIMEOUT` timeout. A failing or slow utility model never blocks the scheduling: the task falls back to the default weight and the deterministic conflict keys, and the failure is logged once per content version.
+- The scheduling round itself is bounded by the same `AGENT_EVALUATION_TIMEOUT` (seconds, default `30`): the evaluations still running when the bound is hit keep running in the background and feed the later rounds through the cache, while the round proceeds with the fallback for the tasks it could not evaluate in time.
+- A repeatedly timing-out utility model opens a circuit breaker: after 3 consecutive timeouts the utility model is skipped for 5 minutes (the cached evaluations still apply), so a hung model cannot stall every round. The evaluations are counted by outcome in the `evaluations` counter (`result`: `success`, `timeout` or `failure`).
 - When `AGENT_UTILITY_MODEL` is empty (the default) the evaluator makes zero LLM calls.
+
+### Adaptive polling
+
+The agent polls Planner immediately at startup, then again after every completed poll: the delay between polls is `TASK_POLLING_INTERVAL` (default `60` seconds), doubled after every consecutive poll that found nothing to do (no ready task, nothing running and no pending finalization), capped by `TASK_POLLING_MAX_INTERVAL` (default `300` seconds). Any activity — a task picked, tasks running, a pending Planner finalization — and every poll failure restore the base interval, so the pickup latency stays low whenever there is work while an idle agent reduces the Planner polling load to one request per `TASK_POLLING_MAX_INTERVAL` seconds at most.
+
+### Project-scoped task fetch
+
+When every action of the agent is bound to a project pattern, the poll fetches only the tasks of the matching projects (`/api/tasks?projectIds=...`) instead of the full task list across all projects, which cuts the payload of every poll. The fetch falls back to the unscoped list when no project matches the patterns. Note that the local task-folder cleanup uses the same (scoped) list: folders of tasks outside the agent's project scope are treated as no longer assigned and are cleaned up.
 
 ### Working directory and instances
 
@@ -341,3 +353,7 @@ npm run lint    # oxlint
 npm test        # jest
 npm run dev     # run locally against a Planner instance
 ```
+
+## License
+
+[MIT](LICENSE)

@@ -1,5 +1,6 @@
+import type { StandardMeter } from "@devopsplaybook.io/otel-utils";
 import { Config } from "./Config";
-import { OTelLogger } from "./OTelContext";
+import { OTelLogger, OTelMeter } from "./OTelContext";
 import type { PlannerTask } from "./PlannerClient";
 import type { CliAgentClient } from "./clients/CliAgent";
 import {
@@ -12,10 +13,22 @@ import {
 const logger = OTelLogger().createModuleLogger("task-evaluator");
 
 // The utility model is a fast/cheap model: a hung or slow CLI call must not
-// stall the scheduling round, so every evaluation is bounded.
-const EVALUATION_TIMEOUT_MS = 60000;
+// stall the scheduling round, so every evaluation and every scheduling
+// round is bounded by AGENT_EVALUATION_TIMEOUT (seconds). When the round
+// bound is hit, the round proceeds with the evaluations available so far
+// while the still-running ones keep feeding the cache in the background.
+const DEFAULT_EVALUATION_TIMEOUT_SECONDS = 30;
 // At most this many utility-model calls run at the same time.
 const EVALUATION_CONCURRENCY = 3;
+// Circuit breaker: after this many consecutive timed-out evaluations the
+// utility model is clearly unavailable and is skipped for a cooldown.
+const EVALUATION_TIMEOUT_CIRCUIT_THRESHOLD = 3;
+const EVALUATION_CIRCUIT_COOLDOWN_MS = 5 * 60 * 1000;
+// Bound of the evaluator caches: entries older than the TTL or beyond the
+// capacity (LRU) are dropped, so a long-lived process cannot grow them
+// without limit.
+const CACHE_CAPACITY = 500;
+const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 // The evaluation prompt stays small (~1-2k tokens): title, trimmed
 // description and the latest comments are enough for a size estimate.
 const MAX_DESCRIPTION_CHARS = 2000;
@@ -33,6 +46,8 @@ export interface EvaluationInput {
 export interface TaskEvaluatorOptions {
   timeoutMs?: number;
   concurrency?: number;
+  cacheCapacity?: number;
+  cacheTtlMs?: number;
 }
 
 export interface EvaluateAllOptions {
@@ -57,13 +72,21 @@ export class TaskEvaluator {
   private concurrency: number;
   // Evaluations by task id, invalidated when the task content changes
   // (dateUpdated): the steady-state cost of the utility model is zero.
-  private cache = new Map<
-    string,
-    { dateUpdated: string; evaluation: TaskEvaluation }
-  >();
+  // Bounded (TTL + LRU) so a long-lived process cannot grow it without
+  // limit.
+  private cache: BoundedCache<{ dateUpdated: string; evaluation: TaskEvaluation }>;
   // Content version whose evaluation failure was already logged (log once,
-  // not per poll).
-  private failureLogged = new Map<string, string>();
+  // not per poll), bounded like the evaluation cache.
+  private failureLogged: BoundedCache<string>;
+  // Consecutive timed-out evaluations and the instant until which the
+  // utility model is skipped (circuit breaker, see the constants above).
+  private consecutiveTimeouts = 0;
+  private circuitOpenUntil = 0;
+  // Counter of the utility-model evaluations by outcome (success, timeout,
+  // failure): null when OpenTelemetry is not initialized (e.g. in tests).
+  private evaluationCounter: ReturnType<
+    StandardMeter["createCounter"]
+  > | null = null;
   // Semaphore bounding the concurrent utility-model calls.
   private active = 0;
   private waiters: (() => void)[] = [];
@@ -75,8 +98,33 @@ export class TaskEvaluator {
   ) {
     this.config = config;
     this.cliAgent = cliAgent;
-    this.timeoutMs = options?.timeoutMs ?? EVALUATION_TIMEOUT_MS;
+    this.timeoutMs =
+      options?.timeoutMs ?? this.configuredTimeoutMs();
     this.concurrency = Math.max(1, options?.concurrency ?? EVALUATION_CONCURRENCY);
+    this.cache = new BoundedCache(
+      Math.max(1, options?.cacheCapacity ?? CACHE_CAPACITY),
+      Math.max(1, options?.cacheTtlMs ?? CACHE_TTL_MS),
+    );
+    this.failureLogged = new BoundedCache(
+      Math.max(1, options?.cacheCapacity ?? CACHE_CAPACITY),
+      Math.max(1, options?.cacheTtlMs ?? CACHE_TTL_MS),
+    );
+    try {
+      this.evaluationCounter = OTelMeter().createCounter("evaluations");
+    } catch {
+      // OpenTelemetry not initialized (e.g. in tests): the metric stays
+      // disabled and the evaluation keeps working.
+    }
+  }
+
+  // The configured evaluation bound in milliseconds; a hot-reloaded
+  // invalid value falls back to the default instead of arming an
+  // immediate (NaN) or unbounded timer.
+  private configuredTimeoutMs(): number {
+    const seconds = this.config.AGENT_EVALUATION_TIMEOUT;
+    return (Number.isFinite(seconds) && seconds > 0
+      ? seconds
+      : DEFAULT_EVALUATION_TIMEOUT_SECONDS) * 1000;
   }
 
   // The utility model is enabled by setting AGENT_UTILITY_MODEL to a model
@@ -89,6 +137,12 @@ export class TaskEvaluator {
    * Evaluates the given tasks (only the ones the scheduler could still
    * admit are passed in) and returns the results by task id. Without a
    * configured utility model the map stays empty and no LLM call is made.
+   *
+   * The round is bounded by the evaluation timeout: the evaluations still
+   * running when the bound is hit keep running in the background and feed
+   * the later rounds through the cache, while the returned map carries the
+   * fallback evaluation for the tasks the round could not evaluate in
+   * time.
    */
   public async evaluateAll(
     inputs: EvaluationInput[],
@@ -99,15 +153,52 @@ export class TaskEvaluator {
       return evaluations;
     }
     const concurrencyLimit = this.evaluationLimit(options?.maxConcurrent);
-    await Promise.all(
-      inputs.map(async (input) => {
+    // Circuit breaker: while it is open the utility model is not called at
+    // all; the cached evaluations still apply.
+    if (Date.now() < this.circuitOpenUntil) {
+      for (const input of inputs) {
         evaluations.set(
           input.task.id,
-          await this.evaluateTask(input.task, input.projectName, concurrencyLimit),
+          this.cachedEvaluation(input.task) ?? fallbackEvaluation(),
         );
-      }),
-    );
-    return evaluations;
+      }
+      return evaluations;
+    }
+    let roundTimeout: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([
+        Promise.all(
+          inputs.map(async (input) => {
+            evaluations.set(
+              input.task.id,
+              await this.evaluateTask(
+                input.task,
+                input.projectName,
+                concurrencyLimit,
+              ),
+            );
+          }),
+        ),
+        new Promise<void>((resolve) => {
+          roundTimeout = setTimeout(resolve, this.timeoutMs);
+        }),
+      ]);
+    } finally {
+      if (roundTimeout) {
+        clearTimeout(roundTimeout);
+      }
+    }
+    // The tasks the round could not evaluate in time fall back for this
+    // round; their in-flight evaluation lands in the cache for the next
+    // one.
+    for (const input of inputs) {
+      if (!evaluations.has(input.task.id)) {
+        evaluations.set(input.task.id, fallbackEvaluation());
+      }
+    }
+    // A snapshot: the background evaluations keep writing their results
+    // into the internal map and the cache, not into the caller's map.
+    return new Map(evaluations);
   }
 
   public async evaluateTask(
@@ -115,17 +206,17 @@ export class TaskEvaluator {
     projectName: string,
     concurrencyLimit?: number,
   ): Promise<TaskEvaluation> {
-    const cached = this.cache.get(task.id);
-    if (cached && cached.dateUpdated === task.dateUpdated) {
-      return cached.evaluation;
+    const cached = this.cachedEvaluation(task);
+    if (cached !== null) {
+      return cached;
     }
     await this.acquire(this.evaluationLimit(concurrencyLimit));
     try {
       // Re-check the cache once the slot is granted: another evaluation of
       // the same content version may have completed in the meantime.
-      const cachedInSlot = this.cache.get(task.id);
-      if (cachedInSlot && cachedInSlot.dateUpdated === task.dateUpdated) {
-        return cachedInSlot.evaluation;
+      const cachedInSlot = this.cachedEvaluation(task);
+      if (cachedInSlot !== null) {
+        return cachedInSlot;
       }
       const evaluation = await this.callUtilityModel(task, projectName);
       // The fallback is cached too: a failing or slow utility model is not
@@ -135,6 +226,16 @@ export class TaskEvaluator {
     } finally {
       this.release();
     }
+  }
+
+  // The evaluation cached for the exact content version of the task, or
+  // null when none is (or the cache entry expired).
+  private cachedEvaluation(task: PlannerTask): TaskEvaluation | null {
+    const cached = this.cache.get(task.id);
+    if (cached && cached.dateUpdated === task.dateUpdated) {
+      return cached.evaluation;
+    }
+    return null;
   }
 
   // The effective concurrency of a batch: the caller may lower the
@@ -169,6 +270,7 @@ export class TaskEvaluator {
   ): Promise<TaskEvaluation> {
     const prompt = buildEvaluationPrompt(task, projectName);
     let timeout: NodeJS.Timeout | undefined;
+    let timedOut = false;
     try {
       const reply = await Promise.race([
         this.cliAgent.runPrompt(prompt, {
@@ -177,15 +279,14 @@ export class TaskEvaluator {
           purpose: `utility-model evaluation '${task.title.trim()}'`,
         }),
         new Promise<never>((_, reject) => {
-          timeout = setTimeout(
-            () =>
-              reject(
-                new Error(
-                  `utility model did not reply within ${Math.round(this.timeoutMs / 1000)} seconds`,
-                ),
+          timeout = setTimeout(() => {
+            timedOut = true;
+            reject(
+              new Error(
+                `utility model did not reply within ${Math.round(this.timeoutMs / 1000)} seconds`,
               ),
-            this.timeoutMs,
-          );
+            );
+          }, this.timeoutMs);
         }),
       ]);
       const evaluation = parseEvaluation(reply);
@@ -194,8 +295,10 @@ export class TaskEvaluator {
           `the reply is not a valid evaluation: ${reply.trim().slice(0, 200)}`,
         );
       }
+      this.onEvaluationSuccess();
       return evaluation;
     } catch (error) {
+      this.onEvaluationFailure(timedOut);
       if (this.failureLogged.get(task.id) !== task.dateUpdated) {
         this.failureLogged.set(task.id, task.dateUpdated);
         logger.error(
@@ -208,6 +311,78 @@ export class TaskEvaluator {
         clearTimeout(timeout);
       }
     }
+  }
+
+  private onEvaluationSuccess(): void {
+    this.consecutiveTimeouts = 0;
+    this.recordEvaluationMetric("success");
+  }
+
+  private onEvaluationFailure(timedOut: boolean): void {
+    this.recordEvaluationMetric(timedOut ? "timeout" : "failure");
+    if (!timedOut) {
+      return;
+    }
+    this.consecutiveTimeouts++;
+    if (this.consecutiveTimeouts >= EVALUATION_TIMEOUT_CIRCUIT_THRESHOLD) {
+      this.circuitOpenUntil = Date.now() + EVALUATION_CIRCUIT_COOLDOWN_MS;
+      this.consecutiveTimeouts = 0;
+      logger.warn(
+        `Utility-model evaluations timed out ${EVALUATION_TIMEOUT_CIRCUIT_THRESHOLD} times in a row: the utility model is skipped until ${new Date(this.circuitOpenUntil).toISOString()}`,
+      );
+    }
+  }
+
+  private recordEvaluationMetric(
+    result: "success" | "timeout" | "failure",
+  ): void {
+    try {
+      this.evaluationCounter?.add(1, { result });
+    } catch {
+      // The metrics never break the evaluation.
+    }
+  }
+}
+
+// A bounded Map with a TTL and LRU eviction: reads past the TTL miss,
+// reads refresh the recency order and writes evict the oldest entry beyond
+// the capacity. Keeps the evaluator caches of a long-lived process bounded.
+class BoundedCache<V> {
+  private readonly entries = new Map<string, { value: V; cachedAt: number }>();
+
+  constructor(
+    private readonly capacity: number,
+    private readonly ttlMs: number,
+  ) {}
+
+  public get(key: string): V | undefined {
+    const entry = this.entries.get(key);
+    if (entry === undefined) {
+      return undefined;
+    }
+    if (Date.now() - entry.cachedAt > this.ttlMs) {
+      this.entries.delete(key);
+      return undefined;
+    }
+    this.entries.delete(key);
+    this.entries.set(key, entry);
+    return entry.value;
+  }
+
+  public set(key: string, value: V): void {
+    this.entries.delete(key);
+    this.entries.set(key, { value, cachedAt: Date.now() });
+    while (this.entries.size > this.capacity) {
+      const oldest = this.entries.keys().next();
+      if (oldest.done) {
+        break;
+      }
+      this.entries.delete(oldest.value);
+    }
+  }
+
+  public get size(): number {
+    return this.entries.size;
   }
 }
 

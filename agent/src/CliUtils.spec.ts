@@ -4,6 +4,7 @@ import {
   extractErrorDetail,
   PROCESS_GROUP_KILL_GRACE_MS,
   runCli,
+  terminateLiveProcessGroups,
 } from "./CliUtils";
 
 jest.mock("child_process", () => ({
@@ -200,6 +201,135 @@ describe("CliUtils", () => {
     await expect(promise).rejects.toMatchObject({
       stdout: "out",
       stderr: "Error: boom\n",
+    });
+  });
+
+  describe("terminateLiveProcessGroups", () => {
+    it("should resolve immediately when no process group is live", async () => {
+      await expect(terminateLiveProcessGroups(5000)).resolves.toBeUndefined();
+      expect(killSpy).not.toHaveBeenCalled();
+    });
+
+    it("should SIGTERM the live groups and resolve when they settle", async () => {
+      const cliPromise = runCli("cli", ["arg"], {
+        timeout: 60000,
+        encoding: "utf8",
+        killProcessGroup: true,
+      });
+      const terminatePromise = terminateLiveProcessGroups(5000);
+
+      expect(killSpy).toHaveBeenCalledWith(-FAKE_PID, "SIGTERM");
+
+      // The CLI settles and deregisters: the termination resolves without
+      // escalating to SIGKILL.
+      execCallback(null, "out", "");
+      await expect(cliPromise).resolves.toEqual({ stdout: "out", stderr: "" });
+      jest.advanceTimersByTime(50);
+      await expect(terminatePromise).resolves.toBeUndefined();
+      expect(killSpy).not.toHaveBeenCalledWith(-FAKE_PID, "SIGKILL");
+    });
+
+    it("should escalate to SIGKILL for the groups still alive at the deadline", async () => {
+      const cliPromise = runCli("cli", ["arg"], {
+        timeout: 60000,
+        encoding: "utf8",
+        killProcessGroup: true,
+      });
+      const terminatePromise = terminateLiveProcessGroups(100);
+
+      expect(killSpy).toHaveBeenCalledWith(-FAKE_PID, "SIGTERM");
+
+      // The CLI never settles: the wait hits the deadline.
+      jest.advanceTimersByTime(100);
+      await expect(terminatePromise).resolves.toBeUndefined();
+      expect(killSpy).toHaveBeenLastCalledWith(-FAKE_PID, "SIGKILL");
+
+      execCallback(null, "out", "");
+      await expect(cliPromise).resolves.toEqual({ stdout: "out", stderr: "" });
+    });
+
+    it("should not signal anything once the run deregistered its group", async () => {
+      const cliPromise = runCli("cli", ["arg"], {
+        timeout: 60000,
+        encoding: "utf8",
+        killProcessGroup: true,
+      });
+      execCallback(null, "out", "");
+      await expect(cliPromise).resolves.toEqual({ stdout: "out", stderr: "" });
+
+      await expect(terminateLiveProcessGroups(5000)).resolves.toBeUndefined();
+      expect(killSpy).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("stdin input", () => {
+    // Replace the default spawn with a child whose stdin records writes.
+    const mockChildWithStdin = () => {
+      const stdin = { on: jest.fn(), end: jest.fn() };
+      mockExecFile.mockImplementation(
+        (
+          _command: string,
+          _args: string[],
+          _options: unknown,
+          callback: ExecCallback,
+        ) => {
+          execCallback = callback;
+          return { pid: FAKE_PID, stdin };
+        },
+      );
+      return stdin;
+    };
+
+    it("should write the input option to the child's stdin without the process-group kill", async () => {
+      const stdin = mockChildWithStdin();
+      const promise = runCli("cli", ["arg"], {
+        encoding: "utf8",
+        input: "secret",
+      });
+
+      // The input never reaches execFile: it travels through stdin only.
+      const [, , spawnOptions] = mockExecFile.mock.calls[0];
+      expect(spawnOptions).not.toHaveProperty("input");
+      expect(stdin.on).toHaveBeenCalledWith("error", expect.any(Function));
+      expect(stdin.end).toHaveBeenCalledWith("secret");
+
+      // A child that exits before consuming the input (EPIPE) is tolerated.
+      const onError = stdin.on.mock.calls.find((call) => call[0] === "error")?.[1] as
+        | ((error: Error) => void)
+        | undefined;
+      expect(() => onError?.(new Error("write EPIPE"))).not.toThrow();
+
+      execCallback(null, "out", "");
+      await expect(promise).resolves.toEqual({ stdout: "out", stderr: "" });
+    });
+
+    it("should write the input option to the child's stdin with the process-group kill", async () => {
+      const stdin = mockChildWithStdin();
+      const promise = runCli("cli", ["arg"], {
+        timeout: 5000,
+        encoding: "utf8",
+        killProcessGroup: true,
+        input: "secret",
+      });
+
+      const [, , spawnOptions] = mockExecFile.mock.calls[0];
+      expect(spawnOptions).not.toHaveProperty("input");
+      expect(spawnOptions).toMatchObject({ detached: true });
+      expect(stdin.end).toHaveBeenCalledWith("secret");
+
+      execCallback(null, "out", "");
+      await expect(promise).resolves.toEqual({ stdout: "out", stderr: "" });
+    });
+
+    it("should not touch the child's stdin without the input option", async () => {
+      const stdin = mockChildWithStdin();
+      const promise = runCli("cli", ["arg"], { encoding: "utf8" });
+
+      expect(stdin.on).not.toHaveBeenCalled();
+      expect(stdin.end).not.toHaveBeenCalled();
+
+      execCallback(null, "out", "");
+      await expect(promise).resolves.toEqual({ stdout: "out", stderr: "" });
     });
   });
 

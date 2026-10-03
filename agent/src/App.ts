@@ -1,10 +1,13 @@
+import * as fse from "fs-extra";
+import * as path from "path";
 import { watchFile } from "fs-extra";
 import { Agent } from "./Agent";
 import { AgentActionsManager } from "./AgentActionsManager";
 import { AgentConfigRepository } from "./AgentConfigRepository";
 import { AgentNote } from "./AgentNote";
-import { Config } from "./Config";
+import { Config, parseBooleanFlag } from "./Config";
 import { GitEnvironment } from "./GitEnvironment";
+import { terminateLiveProcessGroups } from "./CliUtils";
 import { OTelInit, OTelLogger, OTelTracer } from "./OTelContext";
 import { PlannerClient } from "./PlannerClient";
 import { createCliAgent } from "./clients/CliAgentRegistry";
@@ -35,6 +38,19 @@ Promise.resolve().then(async () => {
       logger.error(`  - ${validationError}`);
     }
     process.exit(1);
+  }
+
+  // Touch the heartbeat file early: the Kubernetes probes check its
+  // freshness (the polling loop refreshes it every 30 seconds once
+  // started, see Agent.startHeartbeat).
+  try {
+    await fse.ensureDir(config.DATA_DIR);
+    await fse.writeFile(
+      path.join(config.DATA_DIR, "heartbeat"),
+      new Date().toISOString(),
+    );
+  } catch (error) {
+    logger.error("Failed to write the heartbeat file", error as Error);
   }
 
   watchFile(config.CONFIG_FILE, () => {
@@ -154,8 +170,9 @@ Promise.resolve().then(async () => {
     await prepareCliAgent(cliAgent);
   }
 
-  // Check authentication for every CLI agent used by the actions.
-  if (config.AGENT_AUTH_CHECK === "true" || config.AGENT_AUTH_CHECK === "1") {
+  // Check authentication for every CLI agent used by the actions. The
+  // documented values are 'true'/'false' ('1'/'0' tolerated).
+  if (parseBooleanFlag(config.AGENT_AUTH_CHECK, true)) {
     for (const cliAgent of cliAgents.values()) {
       try {
         await cliAgent.checkAuthentication();
@@ -215,7 +232,17 @@ Promise.resolve().then(async () => {
   const shutdown = () => {
     logger.info("Shutting down");
     agent.stop();
-    process.exit(0);
+    // Terminate the CLI process groups spawned by the running tasks so a
+    // container stop does not leave coding-agent processes behind; then
+    // exit. The hard exit below only guards against a hung termination.
+    terminateLiveProcessGroups(10000)
+      .catch((error: Error) => {
+        logger.error("Failed to terminate the CLI process groups", error);
+      })
+      .finally(() => {
+        process.exit(0);
+      });
+    setTimeout(() => process.exit(0), 15000).unref();
   };
   process.on("SIGTERM", shutdown);
   process.on("SIGINT", shutdown);

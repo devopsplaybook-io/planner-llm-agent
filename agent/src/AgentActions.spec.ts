@@ -514,6 +514,41 @@ describe("AgentActions", () => {
       expect(matchProjectPattern("a.b", "a.b")).toBe(true);
       expect(matchProjectPattern("a.b", "axb")).toBe(false);
     });
+
+    it("should handle consecutive and repeated wildcards", () => {
+      expect(matchProjectPattern("**", "Anything")).toBe(true);
+      expect(matchProjectPattern("a**b", "ab")).toBe(true);
+      expect(matchProjectPattern("a**b", "axxyb")).toBe(true);
+      expect(matchProjectPattern("*a*b*", "xaybz")).toBe(true);
+      expect(matchProjectPattern("*a*b*", "xab")).toBe(true);
+      expect(matchProjectPattern("*a*b*", "bxa")).toBe(false);
+    });
+
+    it("should require wildcards to cover the whole name", () => {
+      expect(matchProjectPattern("*Cloud*", "ACloudB")).toBe(true);
+      expect(matchProjectPattern("*Cloud*", "ACloud")).toBe(true);
+      expect(matchProjectPattern("*Cloud*", "CloudB")).toBe(true);
+      expect(matchProjectPattern("*Cloud*", "ACloudier")).toBe(true);
+      expect(matchProjectPattern("*Cloud*", "ColudX")).toBe(false);
+    });
+
+    it("should match an empty name only with an empty or all-wildcard pattern", () => {
+      expect(matchProjectPattern("*", "")).toBe(true);
+      expect(matchProjectPattern("**", "")).toBe(true);
+      expect(matchProjectPattern("Project*", "")).toBe(false);
+      expect(matchProjectPattern("*Reader", "")).toBe(false);
+      expect(matchProjectPattern("Project", "")).toBe(false);
+    });
+
+    it("should match long names with a pathological pattern in linear time", () => {
+      // 'a*a*a*...' against a name of 'a' with one 'b' at the end is the
+      // classic backtracking blow-up for a regex engine; the scan must
+      // return quickly (jest's 5s default timeout guards this).
+      const pattern = "a*".repeat(50) + "b";
+      const value = `${"a".repeat(10000)}b`;
+      expect(matchProjectPattern(pattern, value)).toBe(true);
+      expect(matchProjectPattern(pattern, `${"a".repeat(10000)}c`)).toBe(false);
+    });
   });
 
   describe("loadAgentActions", () => {

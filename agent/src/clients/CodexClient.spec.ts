@@ -34,6 +34,18 @@ jest.mock("child_process", () => ({
 
 const mockExecFile = execFile as unknown as jest.Mock;
 
+// Waits for a condition on the real filesystem (the reply-file cleanup is
+// fire-and-forget and may complete shortly after the run settles).
+async function waitFor(condition: () => boolean, timeoutMs = 2000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!condition()) {
+    if (Date.now() > deadline) {
+      throw new Error("waitFor: condition not met within timeout");
+    }
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
 // The CLI call carrying the task prompt (task and standalone prompt calls
 // capture the last message; the authentication probe does not).
 const promptCall = (): { command: string; args: string[] } => {
@@ -184,6 +196,89 @@ describe("CodexClient", () => {
     );
 
     expect(summary).toBe("Implemented the feature");
+  });
+
+  it("should isolate concurrent runs so each captures its own reply", async () => {
+    const replyFiles: string[] = [];
+    const callbacks: ((
+      error: Error | null,
+      stdout: string,
+      stderr: string,
+    ) => void)[] = [];
+    mockExecFile.mockImplementation(
+      (
+        _command: string,
+        args: string[],
+        _options: unknown,
+        callback: (error: Error | null, stdout: string, stderr: string) => void,
+      ) => {
+        const lastIndex = args.indexOf("--output-last-message");
+        replyFiles.push(args[lastIndex + 1] as string);
+        callbacks.push(callback);
+        if (replyFiles.length < 2) {
+          return { pid: replyFiles.length };
+        }
+        // Both runs started before either reply is written: a shared reply
+        // file name would make both runs read the same content.
+        fse.writeFileSync(replyFiles[0], "Reply of run 1\n");
+        fse.writeFileSync(replyFiles[1], "Reply of run 2\n");
+        callbacks.forEach((callback) => callback(null, "event stream", ""));
+        return { pid: 2 };
+      },
+    );
+
+    const summaries = await Promise.all([
+      client.performTask(
+        task(),
+        path.join(os.tmpdir(), "codex-spec", "task-1-Agent.md"),
+      ),
+      client.performTask(
+        task(),
+        path.join(os.tmpdir(), "codex-spec", "task-2-Agent.md"),
+      ),
+    ]);
+
+    expect(summaries.sort()).toEqual(["Reply of run 1", "Reply of run 2"]);
+  });
+
+  it("should use a unique reply file per run and remove it when the run settles", async () => {
+    const replyFiles: string[] = [];
+    mockExecFile.mockImplementation(
+      (
+        _command: string,
+        args: string[],
+        _options: unknown,
+        callback: (error: Error | null, stdout: string, stderr: string) => void,
+      ) => {
+        const lastIndex = args.indexOf("--output-last-message");
+        replyFiles.push(args[lastIndex + 1] as string);
+        fse.writeFileSync(
+          replyFiles[replyFiles.length - 1],
+          "Reply of this run\n",
+        );
+        callback(null, "", "");
+        return { pid: replyFiles.length };
+      },
+    );
+
+    const summary = await client.performTask(
+      task(),
+      path.join(os.tmpdir(), "codex-spec", "task-1-Agent.md"),
+    );
+    expect(summary).toBe("Reply of this run");
+
+    // The reply file is removed after the run settles.
+    await waitFor(() => !fse.pathExistsSync(replyFiles[0]));
+    expect(replyFiles[0]).not.toContain("undefined");
+
+    // A second run gets a different file name.
+    const summary2 = await client.performTask(
+      task(),
+      path.join(os.tmpdir(), "codex-spec", "task-1-Agent.md"),
+    );
+    expect(summary2).toBe("Reply of this run");
+    expect(replyFiles[1]).not.toBe(replyFiles[0]);
+    await waitFor(() => !fse.pathExistsSync(replyFiles[1]));
   });
 
   it("should report a clear error when the CLI is not installed", async () => {

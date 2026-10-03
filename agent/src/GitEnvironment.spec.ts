@@ -57,15 +57,26 @@ const PUBLIC_KEY = "ssh-ed25519 AAAAFAKEPUBLICKEY agent@test.example";
 
 type CliCallback = (error: Error | null, stdout: string, stderr: string) => void;
 
-// Configure the execFile mock to invoke the handler for each command.
+// Configure the execFile mock to invoke the handler for each command. The
+// returned child records the stdin content runCli writes (the 'input' option
+// is consumed before execFile, so it can only be observed on the child).
 function mockCli(
   handler: (command: string, args: string[]) => string | undefined,
 ): void {
   mockExecFile.mockImplementation(
     (command: string, args: string[], _options: unknown, callback: CliCallback) => {
       callback(null, handler(command, args) ?? "", "");
+      return { stdin: { on: jest.fn(), end: jest.fn() } };
     },
   );
+}
+
+// The stdin content runCli wrote for the execFile call at the given index.
+function writtenInput(callIndex: number): string {
+  const child = mockExecFile.mock.results[callIndex]?.value as
+    | { stdin?: { end: jest.Mock } }
+    | undefined;
+  return child?.stdin?.end?.mock?.calls?.[0]?.[0] ?? "";
 }
 
 describe("GitEnvironment", () => {
@@ -361,12 +372,19 @@ describe("GitEnvironment", () => {
         (call) => call[0] === "gpgconf" && call[1].includes("--launch"),
       ),
     ).toBe(true);
-    const verifyCall = mockExecFile.mock.calls.find(
-      (call) => call[0] === "sh" && call[1][1].includes("--clearsign"),
+    const verifyIndex = mockExecFile.mock.calls.findIndex(
+      (call) => call[0] === "gpg" && call[1].includes("--clearsign"),
     );
-    expect(verifyCall[1][1]).toContain(
-      "--local-user 'ABCDEF1234567890ABCDEF1234567890ABCDEF12'",
-    );
+    expect(verifyIndex).toBeGreaterThanOrEqual(0);
+    // The key id is passed as a separate argument (no shell interpolation)
+    // and the throwaway content to sign travels on stdin.
+    expect(mockExecFile.mock.calls[verifyIndex][1]).toEqual([
+      "--batch",
+      "--local-user",
+      "ABCDEF1234567890ABCDEF1234567890ABCDEF12",
+      "--clearsign",
+    ]);
+    expect(writtenInput(verifyIndex)).toBe("agent");
   });
 
   it("uses the explicitly configured GPG key id", async () => {
@@ -406,18 +424,18 @@ describe("GitEnvironment", () => {
       ),
     ).toBe(true);
 
-    const presetCall = mockExecFile.mock.calls.find(
-      (call) =>
-        call[0] === "sh" &&
-        call[1][0] === "-c" &&
-        call[1][1].includes("gpg-preset-passphrase"),
+    const presetIndex = mockExecFile.mock.calls.findIndex(
+      (call) => call[1].includes("--preset"),
     );
-    expect(presetCall).toBeDefined();
-    expect(presetCall[1][1]).toContain("gpg-preset-passphrase");
-    expect(presetCall[1][1]).toContain(
-      "--preset 'KEYGRIP0123456789ABCDEF0123456789ABCDEF'",
-    );
-    expect(presetCall[2].env.GPG_PASSPHRASE).toBe("secret-passphrase");
+    expect(presetIndex).toBeGreaterThanOrEqual(0);
+    // The passphrase travels on stdin: it never appears on a command line or
+    // in the process environment.
+    expect(mockExecFile.mock.calls[presetIndex][1]).toEqual([
+      "--preset",
+      "KEYGRIP0123456789ABCDEF0123456789ABCDEF",
+    ]);
+    expect(writtenInput(presetIndex)).toBe("secret-passphrase");
+    expect(mockExecFile.mock.calls[presetIndex][2].env).toBeUndefined();
   });
 
   it("rejects a non-armored GPG key", async () => {
