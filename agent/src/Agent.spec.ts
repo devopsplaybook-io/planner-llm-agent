@@ -887,6 +887,67 @@ describe("Agent", () => {
     agent.stop();
   });
 
+  it("should skip attachments with unsafe file names and download the valid ones", async () => {
+    config.TASK_STATUS_CLEANUP = "Archived";
+    const unsafeNames = [
+      "../escaped.txt",
+      "../../deep/escape.txt",
+      "/tmp/evil.txt",
+      "a\\b.txt",
+      "sub/dir/name.txt",
+      ".",
+      "..",
+      "",
+    ];
+    mockPlanner.listAssignedTasks.mockResolvedValue([
+      {
+        id: "task-1",
+        title: "Implement feature",
+        status: "To Do",
+        description: "Add a feature",
+        comments: [],
+        attachments: [
+          {
+            id: "attachment-safe",
+            fileName: "notes.txt",
+            filePath: "/uploads/notes.txt",
+            dateCreated: "2026-09-02T00:00:00.000Z",
+          },
+          ...unsafeNames.map((fileName, index) => ({
+            id: `attachment-unsafe-${index}`,
+            fileName,
+            filePath: `/uploads/attachment-${index}`,
+            dateCreated: "2026-09-02T00:00:00.000Z",
+          })),
+        ],
+      },
+    ]);
+    mockPlanner.downloadTaskAttachment.mockResolvedValue(Buffer.from("image"));
+    mockQoder.performTask.mockResolvedValue("Feature implemented");
+
+    const agent = createAgent();
+    agent.start();
+    await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
+
+    // Only the safe attachment is written, inside the attachments directory.
+    const attachmentsDir = path.join(dataDir, "tasks", "task-1", "attachments");
+    expect((await fse.readdir(attachmentsDir)).sort()).toEqual(["notes.txt"]);
+    const tasksDir = path.join(dataDir, "tasks");
+    const taskDirEntries = await fse.readdir(tasksDir);
+    expect(taskDirEntries).toContain("task-1");
+    expect(taskDirEntries).not.toContain("escaped.txt");
+    expect(taskDirEntries).not.toContain("deep");
+
+    // The notes file lists the safe attachment and marks the unsafe ones.
+    const content = await fse.readFile(
+      path.join(dataDir, "tasks", "task-1-Agent.md"),
+      "utf8",
+    );
+    expect(content).toContain("notes.txt");
+    expect(content).toContain("(unsafe file name, skipped)");
+    agent.stop();
+  });
+
   it("should clean up the task folder immediately when the task reaches the cleanup status", async () => {
     const taskId = "48c603af-4725-47f5-ac4e-628e027291e8";
     mockPlanner.listAssignedTasks.mockResolvedValue([

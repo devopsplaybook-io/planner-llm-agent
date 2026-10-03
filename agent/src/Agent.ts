@@ -36,6 +36,25 @@ const AGENT_NOTES_MARKER =
 // Maximum length of the failure explanation posted on a task.
 const MAX_FAILURE_EXPLANATION_LENGTH = 1000;
 
+/**
+ * Sanitizes a Planner attachment file name for a safe local write: only the
+ * base name is kept, and names carrying path separators or dot-only names
+ * are rejected. The Planner server stores the client-provided name verbatim,
+ * so an unsanitized name is an arbitrary-file-write vector (path traversal)
+ * executed with the agent's privileges. Returns null for an unsafe name
+ * (the attachment is skipped, never written).
+ */
+export function sanitizeAttachmentFileName(fileName: string): string | null {
+  if (fileName.includes("/") || fileName.includes("\\")) {
+    return null;
+  }
+  const base = path.basename(fileName);
+  if (base.length === 0 || base === "." || base === "..") {
+    return null;
+  }
+  return base;
+}
+
 export class Agent {
   private config: Config;
   private agentActions: AgentActionsConfig | null;
@@ -603,16 +622,23 @@ export class Agent {
       )
       .join("\n");
     const downloadedAttachments = await this.downloadAttachments(task);
+    // One line per attachment: unsafe names are always reported as skipped,
+    // the downloaded ones with their local path, the others as failed.
     const attachmentLines =
-      downloadedAttachments.length > 0
-        ? downloadedAttachments.map(
-            (filePath) => `- ${path.basename(filePath)} (${filePath})`,
-          )
-        : task.attachments.length > 0
-          ? task.attachments.map(
-              (attachment) => `- ${attachment.fileName} (download failed)`,
-            )
-          : ["*(none)*"];
+      task.attachments.length > 0
+        ? task.attachments.map((attachment) => {
+            const name = sanitizeAttachmentFileName(attachment.fileName);
+            if (name === null) {
+              return "- (unsafe file name, skipped)";
+            }
+            const downloadedPath = downloadedAttachments.find(
+              (filePath) => path.basename(filePath) === name,
+            );
+            return downloadedPath !== undefined
+              ? `- ${name} (${downloadedPath})`
+              : `- ${name} (download failed)`;
+          })
+        : ["*(none)*"];
     const brief = [
       `# Task: ${task.title}`,
       "",
@@ -657,7 +683,24 @@ export class Agent {
           task.id,
           attachment.id,
         );
-        const filePath = path.join(attachmentsDir, attachment.fileName);
+        const fileName = sanitizeAttachmentFileName(attachment.fileName);
+        if (fileName === null) {
+          logger.warn(
+            `Skipping attachment with unsafe file name '${attachment.fileName}' for task '${task.title}' (${task.id})`,
+          );
+          continue;
+        }
+        const filePath = path.join(attachmentsDir, fileName);
+        // Containment is enforced again after resolution, on top of the
+        // name sanitization, so no attachment can ever be written outside
+        // the task attachments directory.
+        const resolvedDir = `${path.resolve(attachmentsDir)}${path.sep}`;
+        if (!path.resolve(filePath).startsWith(resolvedDir)) {
+          logger.warn(
+            `Skipping attachment with unsafe file name '${attachment.fileName}' for task '${task.title}' (${task.id})`,
+          );
+          continue;
+        }
         await fse.writeFile(filePath, data);
         downloaded.push(filePath);
         logger.info(

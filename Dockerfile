@@ -107,6 +107,15 @@ COPY --from=builder /opt/src/agent/dist /opt/app/planner-llm-agent/dist
 COPY agent/config.json /opt/app/planner-llm-agent/config.json
 COPY package.json /opt/app/planner-llm-agent/package.json
 
+# Run as a dedicated non-root user (uid/gid 10001). /data is chowned here for
+# plain bind mounts; on Kubernetes the securityContext (runAsUser 10001,
+# fsGroup 10001) takes ownership of the mounted volume.
+RUN useradd --uid 10001 --user-group --create-home --shell /bin/bash planner && \
+    mkdir -p /data && \
+    chown planner:planner /data
+
 WORKDIR /opt/app/planner-llm-agent
+
+USER planner
 
 CMD [ "node", "dist/App.js" ]

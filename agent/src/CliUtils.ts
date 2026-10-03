@@ -1,5 +1,5 @@
 import { execFile } from "child_process";
-import type { ExecException, ExecFileOptionsWithStringEncoding } from "child_process";
+import type { ChildProcess, ExecException, ExecFileOptionsWithStringEncoding } from "child_process";
 
 export interface ExecFileError extends Error {
   code?: string | number;
@@ -15,6 +15,10 @@ export interface RunCliOptions extends ExecFileOptionsWithStringEncoding {
   // SIGKILL after a grace period) so spawned children do not survive the
   // timeout. Requires 'timeout' to be set.
   killProcessGroup?: boolean;
+  // Content written to the command's stdin before its output is collected:
+  // stdin is the shell-free way to feed secret values (e.g. the GPG
+  // passphrase) to argument-array commands.
+  input?: string;
 }
 
 // Grace period between the SIGTERM and the SIGKILL sent to a timed-out
@@ -43,15 +47,28 @@ export function runCli(
   }
   const execOptions = { ...options };
   delete execOptions.killProcessGroup;
+  const input = execOptions.input;
+  delete execOptions.input;
   return new Promise((resolve, reject) => {
-    execFile(command, args, execOptions, (error, stdout, stderr) => {
+    const child = execFile(command, args, execOptions, (error, stdout, stderr) => {
       if (error) {
         reject(attachCliOutput(error, stdout, stderr));
       } else {
         resolve({ stdout: stdout, stderr: stderr });
       }
     });
+    if (input !== undefined) {
+      writeToStdin(child, input);
+    }
   });
+}
+
+// Writes the stdin content and closes the pipe. A child that exits before
+// consuming the input (EPIPE) must not crash the process: the command
+// result is the authority on the failure.
+function writeToStdin(child: ChildProcess, input: string): void {
+  child.stdin?.on("error", () => undefined);
+  child.stdin?.end(input);
 }
 
 // Node's execFile does not attach the captured output to the error handed
@@ -104,6 +121,8 @@ function runCliWithProcessGroupKill(
     // The timeout is implemented above with the process-group kill, so it
     // must not be handed to execFile as well.
     delete execOptions.timeout;
+    const input = execOptions.input;
+    delete execOptions.input;
     // 'detached' is accepted by execFile at runtime (the options are
     // forwarded to spawn) but is missing from its TypeScript overloads.
     const child = execFile(
@@ -128,6 +147,9 @@ function runCliWithProcessGroupKill(
         }
       },
     );
+    if (input !== undefined) {
+      writeToStdin(child, input);
+    }
 
     const pid = child.pid;
     if (typeof pid === "number") {
