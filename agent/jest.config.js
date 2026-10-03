@@ -11,6 +11,7 @@ module.exports = {
     ],
   },
   testMatch: ["/**/src/**/*.spec.(ts|js)"],
+  setupFilesAfterEnv: ["<rootDir>/jest.setup.ts"],
   testEnvironment: "node",
   coverageProvider: "v8",
 };

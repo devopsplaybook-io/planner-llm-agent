@@ -4,8 +4,9 @@
     "strict": false,
     "noImplicitAny": false,
     "strictNullChecks": false,
-    "types": ["jest", "node"]
+    "types": ["jest", "node"],
+    "rootDir": "."
   },
-  "include": ["src/**/*.spec.ts", "src/**/*.ts"],
+  "include": ["src/**/*.spec.ts", "src/**/*.ts", "jest.setup.ts"],
   "exclude": ["node_modules", "coverage", "dist"]
 }

@@ -1112,12 +1112,14 @@ describe("Agent", () => {
     const agent = createAgent();
     agent.start();
     await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
-
-    expect(
-      await fse.pathExists(path.join(dataDir, "tasks", `${taskId}-Agent.md`)),
-    ).toBe(false);
-    expect(await fse.pathExists(path.join(dataDir, "tasks", taskId))).toBe(
-      false,
+    // The folder cleanup runs after the status update: wait for the actual
+    // removal instead of racing it.
+    await waitFor(
+      () =>
+        !fse.pathExistsSync(path.join(dataDir, "tasks", taskId)) &&
+        !fse.pathExistsSync(
+          path.join(dataDir, "tasks", `${taskId}-Agent.md`),
+        ),
     );
     agent.stop();
   });
