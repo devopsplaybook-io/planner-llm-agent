@@ -13,9 +13,11 @@ export class CodexClient extends BaseCliAgent {
   readonly authHint =
     "Ensure OPENAI_API_KEY is set or that the ChatGPT authentication is complete (codex login)";
 
-  // File receiving the final reply of the current run, set when the prompt
-  // arguments are built and read when the reply is parsed.
-  private lastMessageFile: string | null = null;
+  // Counter making the reply file name unique per invocation: concurrent
+  // invocations starting within the same millisecond must never share one
+  // (the shared mutable file name was a race that could return the reply
+  // of another run).
+  private replyFileCounter = 0;
 
   protected cliCommand(): string {
     return this.config.CODEX_CLI;
@@ -48,25 +50,39 @@ export class CodexClient extends BaseCliAgent {
       "--skip-git-repo-check",
     );
     if (captureLastMessage) {
-      this.lastMessageFile = path.join(
-        os.tmpdir(),
-        `codex-last-message-${process.pid}-${Date.now()}.txt`,
-      );
-      args.push("--output-last-message", this.lastMessageFile);
+      args.push("--output-last-message", this.buildReplyFile());
     }
     args.push(prompt);
     return args;
   }
 
-  protected parseReply(result: {
-    stdout: string;
-    stderr: string;
-  }): string | null {
-    if (this.lastMessageFile !== null) {
+  private buildReplyFile(): string {
+    this.replyFileCounter++;
+    return path.join(
+      os.tmpdir(),
+      `codex-last-message-${process.pid}-${Date.now()}-${this.replyFileCounter}.txt`,
+    );
+  }
+
+  // The reply file of the current invocation is located from the invocation
+  // arguments (never from instance state, which concurrent runs would race
+  // on).
+  private replyFileOf(args?: string[]): string | null {
+    if (!args) {
+      return null;
+    }
+    const index = args.indexOf("--output-last-message");
+    return index !== -1 && index + 1 < args.length ? args[index + 1] : null;
+  }
+
+  protected parseReply(
+    result: { stdout: string; stderr: string },
+    args?: string[],
+  ): string | null {
+    const replyFile = this.replyFileOf(args);
+    if (replyFile !== null) {
       try {
-        const reply = fse
-          .readFileSync(this.lastMessageFile, "utf8")
-          .trim();
+        const reply = fse.readFileSync(replyFile, "utf8").trim();
         if (reply.length > 0) {
           return reply;
         }
@@ -76,6 +92,15 @@ export class CodexClient extends BaseCliAgent {
     }
     const trimmed = result.stdout.trim();
     return trimmed.length > 0 ? trimmed : null;
+  }
+
+  // Removes the reply file of the settled invocation: per-invocation names
+  // would otherwise accumulate in the temp directory.
+  protected onInvocationSettled(args: string[]): void {
+    const replyFile = this.replyFileOf(args);
+    if (replyFile !== null) {
+      fse.remove(replyFile).catch(() => undefined);
+    }
   }
 
   protected extractUsage(): number | null {

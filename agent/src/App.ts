@@ -5,6 +5,7 @@ import { AgentConfigRepository } from "./AgentConfigRepository";
 import { AgentNote } from "./AgentNote";
 import { Config } from "./Config";
 import { GitEnvironment } from "./GitEnvironment";
+import { terminateLiveProcessGroups } from "./CliUtils";
 import { OTelInit, OTelLogger, OTelTracer } from "./OTelContext";
 import { PlannerClient } from "./PlannerClient";
 import { createCliAgent } from "./clients/CliAgentRegistry";
@@ -215,7 +216,17 @@ Promise.resolve().then(async () => {
   const shutdown = () => {
     logger.info("Shutting down");
     agent.stop();
-    process.exit(0);
+    // Terminate the CLI process groups spawned by the running tasks so a
+    // container stop does not leave coding-agent processes behind; then
+    // exit. The hard exit below only guards against a hung termination.
+    terminateLiveProcessGroups(10000)
+      .catch((error: Error) => {
+        logger.error("Failed to terminate the CLI process groups", error);
+      })
+      .finally(() => {
+        process.exit(0);
+      });
+    setTimeout(() => process.exit(0), 15000).unref();
   };
   process.on("SIGTERM", shutdown);
   process.on("SIGINT", shutdown);

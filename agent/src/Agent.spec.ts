@@ -4,6 +4,7 @@ import * as fse from "fs-extra";
 import { Agent } from "./Agent";
 import { AgentActionsConfig } from "./AgentActions";
 import { Config } from "./Config";
+import { FinalizationStore } from "./FinalizationStore";
 import { createCliAgent } from "./clients/CliAgentRegistry";
 import type { CliAgentClient } from "./clients/CliAgent";
 import { PlannerClient } from "./PlannerClient";
@@ -115,8 +116,9 @@ describe("Agent", () => {
   // without any action (it then processes no task).
   const createAgent = (
     agentActions: AgentActionsConfig | null = WILDCARD_ACTIONS,
+    finalizationStore?: FinalizationStore,
   ): Agent => {
-    const agent = new Agent(config, agentActions);
+    const agent = new Agent(config, agentActions, undefined, finalizationStore);
     agents.push(agent);
     return agent;
   };
@@ -996,6 +998,87 @@ describe("Agent", () => {
     ).toBe(false);
     expect(await fse.pathExists(path.join(tasksDir, taskId))).toBe(false);
     agent.stop();
+  });
+
+  it("should not re-execute a task whose summary comment failed and should finalize it on retry", async () => {
+    config.TASK_POLLING_INTERVAL = 0.05;
+    mockPlannerTasks([
+      {
+        id: "task-1",
+        title: "Implement feature",
+        status: "To Do",
+        description: "Add a feature",
+        comments: [],
+        attachments: [],
+      },
+    ]);
+    mockQoder.performTask.mockResolvedValue("All done");
+    // The summary comment POST fails on the first attempt only.
+    let summaryCommentAttempts = 0;
+    mockPlanner.addTaskComment.mockImplementation(
+      async (_id: string, text: string) => {
+        if (text === "All done") {
+          summaryCommentAttempts++;
+          if (summaryCommentAttempts === 1) {
+            throw new Error("Planner is down");
+          }
+        }
+      },
+    );
+
+    const agent = createAgent(
+      WILDCARD_ACTIONS,
+      new FinalizationStore({ retryBaseMs: 10 }),
+    );
+    agent.start();
+    await waitFor(
+      () =>
+        mockPlanner.updateTaskStatus.mock.calls.some(
+          (call) => call[0] === "task-1" && call[1] === "Done",
+        ),
+      5000,
+    );
+
+    // The CLI ran exactly once although the first finalization failed: only
+    // the Planner updates were retried.
+    expect(mockQoder.performTask).toHaveBeenCalledTimes(1);
+    expect(summaryCommentAttempts).toBe(2);
+    expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith("task-1", "Done");
+  });
+
+  it("should not post the summary comment twice when only the status update fails", async () => {
+    config.TASK_POLLING_INTERVAL = 0.05;
+    mockPlanner.listAssignedTasks.mockResolvedValue([
+      {
+        id: "task-1",
+        title: "Implement feature",
+        status: "To Do",
+        description: "Add a feature",
+        comments: [],
+        attachments: [],
+      },
+    ]);
+    mockQoder.performTask.mockResolvedValue("All done");
+    mockPlanner.updateTaskStatus.mockRejectedValue(new Error("Planner is down"));
+
+    const agent = createAgent(
+      WILDCARD_ACTIONS,
+      new FinalizationStore({ retryBaseMs: 10 }),
+    );
+    agent.start();
+    await waitFor(
+      () =>
+        mockPlanner.updateTaskStatus.mock.calls.filter(
+          (call) => call[0] === "task-1" && call[1] === "Done",
+        ).length >= 2,
+      5000,
+    );
+
+    expect(mockQoder.performTask).toHaveBeenCalledTimes(1);
+    const summaryComments = mockPlanner.addTaskComment.mock.calls.filter(
+      (call) => call[1] === "All done",
+    );
+    expect(summaryComments).toHaveLength(1);
   });
 
   it("should process only the tasks matching the action project and start status", async () => {

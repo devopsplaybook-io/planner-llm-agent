@@ -4,6 +4,7 @@ import {
   extractErrorDetail,
   PROCESS_GROUP_KILL_GRACE_MS,
   runCli,
+  terminateLiveProcessGroups,
 } from "./CliUtils";
 
 jest.mock("child_process", () => ({
@@ -200,6 +201,64 @@ describe("CliUtils", () => {
     await expect(promise).rejects.toMatchObject({
       stdout: "out",
       stderr: "Error: boom\n",
+    });
+  });
+
+  describe("terminateLiveProcessGroups", () => {
+    it("should resolve immediately when no process group is live", async () => {
+      await expect(terminateLiveProcessGroups(5000)).resolves.toBeUndefined();
+      expect(killSpy).not.toHaveBeenCalled();
+    });
+
+    it("should SIGTERM the live groups and resolve when they settle", async () => {
+      const cliPromise = runCli("cli", ["arg"], {
+        timeout: 60000,
+        encoding: "utf8",
+        killProcessGroup: true,
+      });
+      const terminatePromise = terminateLiveProcessGroups(5000);
+
+      expect(killSpy).toHaveBeenCalledWith(-FAKE_PID, "SIGTERM");
+
+      // The CLI settles and deregisters: the termination resolves without
+      // escalating to SIGKILL.
+      execCallback(null, "out", "");
+      await expect(cliPromise).resolves.toEqual({ stdout: "out", stderr: "" });
+      jest.advanceTimersByTime(50);
+      await expect(terminatePromise).resolves.toBeUndefined();
+      expect(killSpy).not.toHaveBeenCalledWith(-FAKE_PID, "SIGKILL");
+    });
+
+    it("should escalate to SIGKILL for the groups still alive at the deadline", async () => {
+      const cliPromise = runCli("cli", ["arg"], {
+        timeout: 60000,
+        encoding: "utf8",
+        killProcessGroup: true,
+      });
+      const terminatePromise = terminateLiveProcessGroups(100);
+
+      expect(killSpy).toHaveBeenCalledWith(-FAKE_PID, "SIGTERM");
+
+      // The CLI never settles: the wait hits the deadline.
+      jest.advanceTimersByTime(100);
+      await expect(terminatePromise).resolves.toBeUndefined();
+      expect(killSpy).toHaveBeenLastCalledWith(-FAKE_PID, "SIGKILL");
+
+      execCallback(null, "out", "");
+      await expect(cliPromise).resolves.toEqual({ stdout: "out", stderr: "" });
+    });
+
+    it("should not signal anything once the run deregistered its group", async () => {
+      const cliPromise = runCli("cli", ["arg"], {
+        timeout: 60000,
+        encoding: "utf8",
+        killProcessGroup: true,
+      });
+      execCallback(null, "out", "");
+      await expect(cliPromise).resolves.toEqual({ stdout: "out", stderr: "" });
+
+      await expect(terminateLiveProcessGroups(5000)).resolves.toBeUndefined();
+      expect(killSpy).not.toHaveBeenCalled();
     });
   });
 

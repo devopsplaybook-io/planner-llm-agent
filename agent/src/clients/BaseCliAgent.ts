@@ -17,6 +17,31 @@ export const PROBE_PROMPT = "Reply with exactly: OK";
 
 const MAX_BUFFER_BYTES = 10 * 1024 * 1024;
 
+// Serializes the usage-file writes per file path: concurrent task
+// executions and prompts share one file, and their non-atomic interleaved
+// writes can corrupt it. Each operation chains on the previous one for the
+// same path; the chain is dropped once it becomes the tail and settles.
+const usageWriteLocks = new Map<string, Promise<void>>();
+
+function withUsageWriteLock<T>(
+  filePath: string,
+  operation: () => Promise<T>,
+): Promise<T> {
+  const previous = usageWriteLocks.get(filePath) ?? Promise.resolve();
+  const result = previous.then(operation, operation);
+  const release = result.then(
+    () => undefined,
+    () => undefined,
+  );
+  usageWriteLocks.set(filePath, release);
+  void release.then(() => {
+    if (usageWriteLocks.get(filePath) === release) {
+      usageWriteLocks.delete(filePath);
+    }
+  });
+  return result;
+}
+
 /**
  * CLI-agnostic implementation of a coding-agent client: task prompt
  * composition, model resolution, summary capture, footer building and usage
@@ -59,11 +84,20 @@ export abstract class BaseCliAgent implements CliAgentClient {
   ): string[];
 
   // Reply extraction from the CLI output; null when no reply can be parsed
-  // (the caller falls back to the raw stdout).
-  protected abstract parseReply(result: {
-    stdout: string;
-    stderr: string;
-  }): string | null;
+  // (the caller falls back to the raw stdout). The exact arguments of the
+  // invocation are provided so adapters that receive the reply through a
+  // file (Codex '--output-last-message') can locate it — the file name is
+  // unique per invocation, so it must not be shared through instance state
+  // across concurrent runs.
+  protected abstract parseReply(
+    result: { stdout: string; stderr: string },
+    args?: string[],
+  ): string | null;
+
+  // Called once per CLI invocation when it settles (success or failure):
+  // adapters can clean up per-invocation resources (e.g. the reply file of
+  // the current run).
+  protected onInvocationSettled(_args: string[]): void {}
 
   // Usage metric reported by this run (credits balance, cost, ...); null
   // when the CLI does not report one.
@@ -97,8 +131,20 @@ export abstract class BaseCliAgent implements CliAgentClient {
   }
 
   protected async writeUsage(usage: number): Promise<void> {
+    const filePath = this.usageFilePath();
     try {
-      await fse.outputJson(this.usageFilePath(), { usage });
+      // Atomic write (temp file + rename) under the per-path lock: a
+      // concurrent reader never sees a half-written JSON file.
+      await withUsageWriteLock(filePath, async () => {
+        const tempFile = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+        try {
+          await fse.outputJson(tempFile, { usage });
+          await fse.rename(tempFile, filePath);
+        } finally {
+          // A failed rename leaves the temp file behind: remove it.
+          await fse.remove(tempFile).catch(() => undefined);
+        }
+      });
     } catch {
       // Non-fatal: the usage display is best-effort.
     }
@@ -134,7 +180,7 @@ export abstract class BaseCliAgent implements CliAgentClient {
       }, "authentication check");
       // A zero exit code is not enough: verify that the probe actually
       // produced a reply so an empty-output CLI fails visibly at startup.
-      const reply = this.parseReply(result) ?? result.stdout;
+      const reply = this.parseReply(result, args) ?? result.stdout;
       if (!reply.includes("OK")) {
         throw new Error(
           `${this.displayName} authentication probe did not return the expected reply. CLI output:\n${formatCliOutput(result)}`,
@@ -150,6 +196,7 @@ export abstract class BaseCliAgent implements CliAgentClient {
         );
       }
     } finally {
+      this.onInvocationSettled(args);
       span.end();
     }
   }
@@ -165,6 +212,9 @@ export abstract class BaseCliAgent implements CliAgentClient {
     // filesystem; the notes file directory is the fallback.
     const workingDir = options?.cwd ?? path.dirname(notesFile);
     const summaryFile = getSummaryFile(notesFile);
+    // The arguments identify the per-invocation resources (reply file):
+    // they are kept for the settled cleanup below.
+    let args: string[] | null = null;
     try {
       // Remove any summary file left over from a previous run so only the
       // output of this run is picked up.
@@ -183,7 +233,7 @@ export abstract class BaseCliAgent implements CliAgentClient {
         );
         await this.warnIfModelInvalid(model.model);
       }
-      const args = this.buildPromptArgs(prompt, model?.model ?? null);
+      args = this.buildPromptArgs(prompt, model?.model ?? null);
       const usageBefore = await this.readUsage();
       logger.info(
         `${this.usageLabel()} before task: ${formatUsageValue(usageBefore)}`,
@@ -245,7 +295,7 @@ export abstract class BaseCliAgent implements CliAgentClient {
         // Fall back to the CLI output when the file cannot be read.
       }
       if (summary.length === 0) {
-        const reply = this.parseReply(result);
+        const reply = this.parseReply(result, args ?? undefined);
         if (reply !== null && reply.length > 0) {
           summary = reply;
           source = "cli reply";
@@ -279,6 +329,9 @@ export abstract class BaseCliAgent implements CliAgentClient {
       const footer = this.buildFooter(model, usageBefore, usageAfter);
       return footer.length > 0 ? `${summary}\n\n${footer}` : summary;
     } finally {
+      if (args !== null) {
+        this.onInvocationSettled(args);
+      }
       span.end();
     }
   }
@@ -321,12 +374,13 @@ export abstract class BaseCliAgent implements CliAgentClient {
       logger.info(
         `${this.usageLabel()} after prompt${purposeSuffix}: ${formatUsageValue(usageAfter)}`,
       );
-      const reply = this.parseReply(result);
+      const reply = this.parseReply(result, args);
       if (reply !== null && reply.length > 0) {
         return reply;
       }
       return result.stdout.trim();
     } finally {
+      this.onInvocationSettled(args);
       span.end();
     }
   }

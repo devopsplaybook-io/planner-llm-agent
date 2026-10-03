@@ -25,6 +25,46 @@ export interface RunCliOptions extends ExecFileOptionsWithStringEncoding {
 // process group, so a SIGTERM-trapping CLI can still shut down cleanly.
 export const PROCESS_GROUP_KILL_GRACE_MS = 10000;
 
+// Process groups of the detached CLI runs currently alive: registered when
+// the run starts, deregistered when its execFile callback settles. The
+// graceful shutdown walks this registry so no spawned CLI (or its spawned
+// children) survives the agent process.
+const liveProcessGroups = new Set<number>();
+
+/**
+ * Terminates every live CLI process group: SIGTERM first, then — for the
+ * groups still alive after the grace period — SIGKILL. Resolves once every
+ * group is gone or the grace period has elapsed. Used at shutdown so a
+ * container stop does not leave coding-agent processes running.
+ */
+export function terminateLiveProcessGroups(graceMs: number): Promise<void> {
+  if (liveProcessGroups.size === 0) {
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => {
+    for (const pgid of liveProcessGroups) {
+      signalProcessGroup(pgid, "SIGTERM");
+    }
+    const deadline = Date.now() + graceMs;
+    const poll = setInterval(() => {
+      if (liveProcessGroups.size === 0) {
+        clearInterval(poll);
+        resolve();
+        return;
+      }
+      if (Date.now() >= deadline) {
+        clearInterval(poll);
+        for (const pgid of liveProcessGroups) {
+          signalProcessGroup(pgid, "SIGKILL");
+        }
+        resolve();
+      }
+    }, 50);
+    // Never keep the event loop alive just for the shutdown wait.
+    poll.unref();
+  });
+}
+
 /**
  * Run an external CLI command and capture its output.
  *
@@ -125,12 +165,20 @@ function runCliWithProcessGroupKill(
     delete execOptions.input;
     // 'detached' is accepted by execFile at runtime (the options are
     // forwarded to spawn) but is missing from its TypeScript overloads.
+    // The callback reads the pid through a holder: it can fire
+    // synchronously (before the registration below runs).
+    let pid: number | undefined;
+    let settled = false;
     const child = execFile(
       command,
       args,
       { ...execOptions, detached: true } as ExecFileOptionsWithStringEncoding,
       (error, stdout, stderr) => {
+        settled = true;
         clearTimers();
+        if (typeof pid === "number") {
+          liveProcessGroups.delete(pid);
+        }
         if (timedOut) {
           // Preserve the killed-by-timeout semantics of execFile's built-in
           // timeout so callers keep reporting a timeout error.
@@ -150,14 +198,17 @@ function runCliWithProcessGroupKill(
     if (input !== undefined) {
       writeToStdin(child, input);
     }
-
-    const pid = child.pid;
-    if (typeof pid === "number") {
+    // When the run already settled synchronously there is nothing left to
+    // register or arm.
+    if (!settled && typeof child.pid === "number") {
+      const pgid: number = child.pid;
+      pid = pgid;
+      liveProcessGroups.add(pgid);
       terminateTimer = setTimeout(() => {
         timedOut = true;
-        signalProcessGroup(pid, "SIGTERM");
+        signalProcessGroup(pgid, "SIGTERM");
         killTimer = setTimeout(() => {
-          signalProcessGroup(pid, "SIGKILL");
+          signalProcessGroup(pgid, "SIGKILL");
         }, PROCESS_GROUP_KILL_GRACE_MS);
         killTimer.unref();
       }, options.timeout);

@@ -6,6 +6,7 @@ import {
   matchProjectPattern,
 } from "./AgentActions";
 import { Config } from "./Config";
+import { FinalizationStore } from "./FinalizationStore";
 import { createCliAgent } from "./clients/CliAgentRegistry";
 import { prepareCliAgent, type CliAgentClient } from "./clients/CliAgent";
 import { resolveModel } from "./clients/BaseCliAgent";
@@ -69,6 +70,10 @@ export class Agent {
   // still running. In-memory only: one agent process per agent identity is
   // assumed; cross-instance scheduling is not supported.
   private processingTasks = new Map<string, RunningTask>();
+  // Completed tasks waiting for their Planner finalization (summary comment,
+  // end status): while a record exists the task is never picked again, and
+  // only the finalization steps are retried — the CLI work is never re-run.
+  private finalizationStore: FinalizationStore;
   // Single-flight guard: while a poll is still running (task selection,
   // utility-model evaluations or processing start), the next tick is
   // skipped, so tasks can never be registered twice (double-pick race).
@@ -84,6 +89,7 @@ export class Agent {
     config: Config,
     agentActions?: AgentActionsConfig | null,
     cliAgents?: Map<string, CliAgentClient>,
+    finalizationStore?: FinalizationStore,
   ) {
     this.config = config;
     this.agentActions = agentActions ?? null;
@@ -99,6 +105,7 @@ export class Agent {
     }
     this.cliAgent = this.cliAgents.get(this.defaultAgent)!;
     this.taskEvaluator = new TaskEvaluator(config, this.cliAgent);
+    this.finalizationStore = finalizationStore ?? new FinalizationStore();
     this.initQueueMetrics();
   }
 
@@ -137,6 +144,9 @@ export class Agent {
       const user = await this.planner.getCurrentUser();
       const tasks = await this.planner.listAssignedTasks(user);
       await this.cleanupCompletedTasks(tasks);
+      // Records of the tasks that are no longer assigned can never be
+      // finalized: drop them.
+      this.finalizationStore.prune(new Set(tasks.map((task) => task.id)));
       this.logRunningTasks();
       const actions = this.getActions();
       if (actions.length === 0 || tasks.length === 0) {
@@ -169,6 +179,9 @@ export class Agent {
           if (
             !this.matchesAction(task, action, projects) ||
             this.processingTasks.has(task.id) ||
+            // A task with a pending finalization completed already: only its
+            // Planner updates remain, never a new CLI execution.
+            this.finalizationStore.has(task.id) ||
             candidates.some((selected) => selected.task.id === task.id)
           ) {
             continue;
@@ -198,6 +211,12 @@ export class Agent {
       logger.error(
         `Failed to poll tasks from Planner: ${(error as Error).message}`,
       );
+    } finally {
+      // The finalization retries run after the selection of this poll: a
+      // record deleted by a successful retry can then no longer influence
+      // the (already stale) task list of the same poll, so a task finalized
+      // on retry is never re-picked by that poll.
+      await this.retryDueFinalizations();
     }
   }
 
@@ -522,14 +541,33 @@ export class Agent {
           this.config.TASK_TIMEOUT,
         cwd: taskDir,
       });
-      await this.planner.addTaskComment(task.id, summary);
-      await this.planner.updateTaskStatus(task.id, action.statusEnd);
+      // The CLI work is done: from here on only the Planner finalization
+      // remains, and a failure of it must never re-run the CLI — the record
+      // keeps the task out of the candidates and drives the idempotent
+      // retries (see retryDueFinalizations).
+      this.finalizationStore.record(task.id, {
+        title: task.title,
+        contentVersion: task.dateUpdated,
+        summary,
+        statusEnd: action.statusEnd,
+      });
+      await this.finalizeCompletedTask(task.id);
+      this.finalizationStore.delete(task.id);
       logger.info(
         `Task '${task.title}' (${task.id}) completed and moved to status '${action.statusEnd}'`,
       );
-      await this.cleanupTaskFolderIfNeeded(task.id, action.statusEnd);
     } catch (error) {
       const message = (error as Error).message;
+      if (this.finalizationStore.has(task.id)) {
+        // The CLI execution succeeded; only the Planner finalization failed.
+        // The retry is scheduled with an exponential backoff.
+        this.finalizationStore.scheduleRetry(task.id);
+        const record = this.finalizationStore.get(task.id);
+        logger.error(
+          `Failed to finalize completed task '${task.title}' (${task.id}) (attempt ${record?.attempts ?? 1}, retry scheduled): ${message}`,
+        );
+        return;
+      }
       logger.error(
         `Failed to process task '${task.title}' (${task.id}): ${message}`,
       );
@@ -552,6 +590,48 @@ export class Agent {
       }
     } finally {
       this.processingTasks.delete(task.id);
+    }
+  }
+
+  // Completes a finished task on Planner: posts the summary comment (unless
+  // a previous attempt already did) and moves the task to its end status.
+  // Idempotent, driven by the FinalizationStore record of the task.
+  private async finalizeCompletedTask(taskId: string): Promise<void> {
+    const record = this.finalizationStore.get(taskId);
+    if (!record) {
+      return;
+    }
+    if (!record.commentPosted) {
+      await this.planner.addTaskComment(taskId, record.summary);
+      this.finalizationStore.markCommentPosted(taskId);
+    }
+    await this.planner.updateTaskStatus(taskId, record.statusEnd);
+    await this.cleanupTaskFolderIfNeeded(taskId, record.statusEnd);
+  }
+
+  // Retries the pending finalizations of the completed tasks whose summary
+  // comment or end-status update previously failed. Only the Planner
+  // updates run here: the CLI work is never re-executed. The tasks still
+  // being processed are skipped: their own processTask call is
+  // finalizing them right now.
+  private async retryDueFinalizations(): Promise<void> {
+    for (const taskId of this.finalizationStore.dueTaskIds()) {
+      const record = this.finalizationStore.get(taskId);
+      if (!record || this.processingTasks.has(taskId)) {
+        continue;
+      }
+      try {
+        await this.finalizeCompletedTask(taskId);
+        this.finalizationStore.delete(taskId);
+        logger.info(
+          `Task '${record.title}' (${taskId}) finalized on retry and moved to status '${record.statusEnd}'`,
+        );
+      } catch (error) {
+        this.finalizationStore.scheduleRetry(taskId);
+        logger.error(
+          `Failed to finalize completed task '${record.title}' (${taskId}) (attempt ${record.attempts}, retry scheduled): ${(error as Error).message}`,
+        );
+      }
     }
   }
 

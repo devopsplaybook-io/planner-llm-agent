@@ -73,6 +73,9 @@ class TestCliAgent extends BaseCliAgent {
   readonly displayName = "Test CLI";
   readonly authHint = "hint";
 
+  // Records the onInvocationSettled hook calls (exposed for assertions).
+  readonly settledCalls: string[][] = [];
+
   protected cliCommand(): string {
     return "test-cli";
   }
@@ -103,6 +106,10 @@ class TestCliAgent extends BaseCliAgent {
 
   protected parseModelList(): string[] {
     return [];
+  }
+
+  protected onInvocationSettled(args: string[]): void {
+    this.settledCalls.push(args);
   }
 }
 
@@ -256,6 +263,58 @@ describe("BaseCliAgent", () => {
 
       const { args } = lastCall();
       expect(args[3]).not.toContain("Available skills");
+    });
+  });
+
+  describe("usage persistence", () => {
+    const writeUsage = (usage: number): Promise<void> =>
+      (agent as unknown as { writeUsage: (usage: number) => Promise<void> }).writeUsage(
+        usage,
+      );
+
+    it("persists and reads back the usage metric", async () => {
+      await writeUsage(12.34);
+      await expect(agent.readUsage()).resolves.toBe(12.34);
+      await expect(agent.usageSummary()).resolves.toBe("Units: 12.34");
+    });
+
+    it("keeps the file valid and leaves no temp files behind under concurrent writes", async () => {
+      await Promise.all(
+        Array.from({ length: 30 }, (_, index) => writeUsage(index + 1)),
+      );
+
+      await expect(agent.readUsage()).resolves.toEqual(
+        expect.any(Number),
+      );
+      expect(await agent.readUsage()).toBeGreaterThanOrEqual(1);
+      expect(await agent.readUsage()).toBeLessThanOrEqual(30);
+      const leftovers = (await fse.readdir(dataDir)).filter((entry) =>
+        entry.includes(".tmp"),
+      );
+      expect(leftovers).toEqual([]);
+    });
+
+    it("returns null when no usage has been persisted", async () => {
+      await expect(agent.readUsage()).resolves.toBeNull();
+    });
+  });
+
+  describe("onInvocationSettled", () => {
+    it("is called with the invocation arguments when a prompt settles", async () => {
+      await agent.runPrompt("Settle this prompt");
+
+      expect(agent.settledCalls).toHaveLength(1);
+      expect(agent.settledCalls[0][3]).toContain("Settle this prompt");
+    });
+
+    it("is called when a prompt fails", async () => {
+      MockedRunCli.mockRejectedValueOnce(new Error("boom"));
+
+      await expect(agent.runPrompt("Failing prompt")).rejects.toThrow(
+        "Test CLI prompt failed",
+      );
+      expect(agent.settledCalls).toHaveLength(1);
+      expect(agent.settledCalls[0][3]).toContain("Failing prompt");
     });
   });
 
