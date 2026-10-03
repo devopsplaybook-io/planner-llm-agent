@@ -19,4 +19,7 @@ module.exports = {
   // reports more cores than the cgroup gives), where parallel workers
   // starve the timers and flake the timing-sensitive tests.
   maxWorkers: 1,
+  // Generous per-test budget for the same reason: under CPU throttling the
+  // real-timer waits need wall clock, not just CPU.
+  testTimeout: 30000,
 };

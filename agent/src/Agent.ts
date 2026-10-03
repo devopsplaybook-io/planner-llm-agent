@@ -206,6 +206,13 @@ export class Agent {
         this.queuedTasks = 0;
         return "idle";
       }
+      // stop() does not cancel the in-flight poll: without this guard the
+      // draining poll could still pick and start tasks after the agent was
+      // stopped (e.g. the data it reads has changed in the meantime).
+      if (this.stopped) {
+        this.queuedTasks = 0;
+        return "idle";
+      }
       // Only tasks matching an action are ready, and a task already being
       // processed is never picked again by a subsequent poll. Every matching
       // (task, action) pair is a candidate; the scheduler then fills the

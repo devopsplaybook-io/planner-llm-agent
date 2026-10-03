@@ -88,10 +88,12 @@ const WILDCARD_ACTIONS: AgentActionsConfig = {
 };
 
 // Wait for the asynchronous processing chain (which performs real file I/O)
-// to reach a visible milestone before asserting.
+// to reach a visible milestone before asserting. The default budget is
+// generous: on a CPU-throttled environment the polling timers are scheduled
+// late and the milestones can take seconds of wall clock to be reached.
 async function waitFor(
   condition: () => boolean,
-  timeoutMs = 2000,
+  timeoutMs = 10000,
 ): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (!condition()) {
