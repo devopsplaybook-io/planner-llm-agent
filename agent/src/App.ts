@@ -1,9 +1,11 @@
+import * as fse from "fs-extra";
+import * as path from "path";
 import { watchFile } from "fs-extra";
 import { Agent } from "./Agent";
 import { AgentActionsManager } from "./AgentActionsManager";
 import { AgentConfigRepository } from "./AgentConfigRepository";
 import { AgentNote } from "./AgentNote";
-import { Config } from "./Config";
+import { Config, parseBooleanFlag } from "./Config";
 import { GitEnvironment } from "./GitEnvironment";
 import { terminateLiveProcessGroups } from "./CliUtils";
 import { OTelInit, OTelLogger, OTelTracer } from "./OTelContext";
@@ -36,6 +38,19 @@ Promise.resolve().then(async () => {
       logger.error(`  - ${validationError}`);
     }
     process.exit(1);
+  }
+
+  // Touch the heartbeat file early: the Kubernetes probes check its
+  // freshness (the polling loop refreshes it every 30 seconds once
+  // started, see Agent.startHeartbeat).
+  try {
+    await fse.ensureDir(config.DATA_DIR);
+    await fse.writeFile(
+      path.join(config.DATA_DIR, "heartbeat"),
+      new Date().toISOString(),
+    );
+  } catch (error) {
+    logger.error("Failed to write the heartbeat file", error as Error);
   }
 
   watchFile(config.CONFIG_FILE, () => {
@@ -155,8 +170,9 @@ Promise.resolve().then(async () => {
     await prepareCliAgent(cliAgent);
   }
 
-  // Check authentication for every CLI agent used by the actions.
-  if (config.AGENT_AUTH_CHECK === "true" || config.AGENT_AUTH_CHECK === "1") {
+  // Check authentication for every CLI agent used by the actions. The
+  // documented values are 'true'/'false' ('1'/'0' tolerated).
+  if (parseBooleanFlag(config.AGENT_AUTH_CHECK, true)) {
     for (const cliAgent of cliAgents.values()) {
       try {
         await cliAgent.checkAuthentication();

@@ -353,3 +353,7 @@ npm run lint    # oxlint
 npm test        # jest
 npm run dev     # run locally against a Planner instance
 ```
+
+## License
+
+[MIT](LICENSE)

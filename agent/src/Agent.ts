@@ -34,6 +34,9 @@ const logger = OTelLogger().createModuleLogger("agent");
 const AGENT_NOTES_MARKER =
   "<!-- AGENT-NOTES: the content below is maintained by the planner agent. Do not remove this marker. -->";
 
+// Refresh period of the heartbeat file the Kubernetes probes check.
+const HEARTBEAT_INTERVAL_MS = 30000;
+
 // Maximum length of the failure explanation posted on a task.
 const MAX_FAILURE_EXPLANATION_LENGTH = 1000;
 
@@ -66,6 +69,7 @@ export class Agent {
   private taskEvaluator: TaskEvaluator;
   private running = false;
   private pollingTimer?: NodeJS.Timeout;
+  private heartbeatTimer?: NodeJS.Timeout;
   // Tasks currently being processed with their scheduling metadata: they
   // are never picked again by a subsequent poll while their processing is
   // still running. In-memory only: one agent process per agent identity is
@@ -127,6 +131,7 @@ export class Agent {
       .catch((error: Error) =>
         logger.error(`Failed to run the polling loop: ${error.message}`),
       );
+    this.startHeartbeat();
   }
 
   public stop(): void {
@@ -138,7 +143,36 @@ export class Agent {
       clearTimeout(this.pollingTimer);
       this.pollingTimer = undefined;
     }
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = undefined;
+    }
     logger.info(`Agent '${this.config.AGENT_NAME}' stopped`);
+  }
+
+  // The Kubernetes probes check the freshness of the heartbeat file: it
+  // proves the agent event loop is alive even when no poll runs (the file
+  // is touched at startup too, see App).
+  private startHeartbeat(): void {
+    void this.writeHeartbeat();
+    this.heartbeatTimer = setInterval(() => {
+      void this.writeHeartbeat();
+    }, HEARTBEAT_INTERVAL_MS);
+    this.heartbeatTimer.unref();
+  }
+
+  private async writeHeartbeat(): Promise<void> {
+    try {
+      await fse.ensureDir(this.config.DATA_DIR);
+      await fse.writeFile(
+        path.join(this.config.DATA_DIR, "heartbeat"),
+        new Date().toISOString(),
+      );
+    } catch (error) {
+      logger.error(
+        `Failed to write the heartbeat file: ${(error as Error).message}`,
+      );
+    }
   }
 
   // The polling loop is self-rescheduling instead of a fixed interval: the

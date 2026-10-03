@@ -56,14 +56,21 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg -o 
     apt-get install -y --no-install-recommends gh && \
     rm -rf /var/lib/apt/lists/*
 
-# Kubernetes CLI
+# Kubernetes CLI (version pinned for reproducible builds)
+ARG KUBECTL_VERSION=v1.37.1
 RUN ARCH=$(dpkg --print-architecture) && \
-    KUBECTL_VERSION=$(curl -fsSL https://dl.k8s.io/release/stable.txt) && \
     curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${ARCH}/kubectl" -o /usr/local/bin/kubectl && \
     chmod +x /usr/local/bin/kubectl
 
-# Helm CLI
-RUN curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+# Helm CLI (version pinned for reproducible builds, checksum verified)
+ARG HELM_VERSION=v4.3.0
+RUN ARCH=$(dpkg --print-architecture) && \
+    curl -fsSL "https://get.helm.sh/helm-${HELM_VERSION}-linux-${ARCH}.tar.gz" -o /tmp/helm.tar.gz && \
+    curl -fsSL "https://get.helm.sh/helm-${HELM_VERSION}-linux-${ARCH}.tar.gz.sha256sum" -o /tmp/helm.tar.gz.sha256sum && \
+    echo "$(awk '{print $1}' /tmp/helm.tar.gz.sha256sum)  /tmp/helm.tar.gz" | sha256sum -c - && \
+    tar -C /tmp -xzf /tmp/helm.tar.gz && \
+    install /tmp/linux-${ARCH}/helm /usr/local/bin/helm && \
+    rm -rf /tmp/helm.tar.gz /tmp/helm.tar.gz.sha256sum /tmp/linux-${ARCH}
 
 # yq
 ARG YQ_VERSION=v4.53.6
@@ -79,20 +86,32 @@ RUN ARCH=$(dpkg --print-architecture) && \
     rm -f /tmp/go.tar.gz
 ENV PATH="/usr/local/go/bin:${PATH}"
 
-# Rust
+# Rust (rustup-init from the pinned release archive, toolchain pinned for
+# reproducible builds)
+ARG RUSTUP_VERSION=1.28.2
+ARG RUST_TOOLCHAIN=1.99.0
 ENV RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo \
     PATH="/usr/local/cargo/bin:${PATH}"
-RUN curl -fsSL https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal
+RUN RUSTUP_ARCH=$(case "$(dpkg --print-architecture)" in \
+      amd64) echo x86_64 ;; \
+      arm64) echo aarch64 ;; \
+      *) echo "unsupported architecture for Rust" >&2 && exit 1 ;; \
+    esac) && \
+    curl -fsSL "https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/${RUSTUP_ARCH}-unknown-linux-gnu/rustup-init" -o /tmp/rustup-init && \
+    chmod +x /tmp/rustup-init && \
+    /tmp/rustup-init -y --no-modify-path --profile minimal --default-toolchain "${RUST_TOOLCHAIN}" && \
+    rm -f /tmp/rustup-init
 
-# Coding agent CLIs (Qoder is the default; the others are selected with
-# AGENT_CLI: claude-code, copilot-cli, codex, gemini-cli)
+# Coding agent CLIs (versions pinned for reproducible builds; Qoder is the
+# default, the others are selected with AGENT_CLI: claude-code, copilot-cli,
+# codex, gemini-cli)
 RUN npm install -g \
-      @qoder-ai/qodercli \
-      @anthropic-ai/claude-code \
-      @github/copilot \
-      @openai/codex \
-      @google/gemini-cli
+      @qoder-ai/qodercli@1.1.65 \
+      @anthropic-ai/claude-code@2.1.288 \
+      @github/copilot@1.0.91 \
+      @openai/codex@0.160.0 \
+      @google/gemini-cli@0.62.0
 
 # Verify all tools are available
 RUN node --version && npm --version && git --version && gh --version && \
