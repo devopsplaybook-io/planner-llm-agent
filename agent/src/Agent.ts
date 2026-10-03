@@ -46,6 +46,12 @@ export class Agent {
   private defaultAgent: string;
   private taskEvaluator: TaskEvaluator;
   private pollingTimer?: NodeJS.Timeout;
+  // Current adaptive polling interval in seconds (M4): starts at
+  // TASK_POLLING_INTERVAL, doubles on idle polls up to
+  // TASK_POLLING_MAX_INTERVAL, and resets on any actionable poll.
+  private currentPollingInterval: number;
+  // Set by stop(): the self-scheduled polling chain stops re-arming itself.
+  private stopped = false;
   // Tasks currently being processed with their scheduling metadata: they
   // are never picked again by a subsequent poll while their processing is
   // still running. In-memory only: one agent process per agent identity is
@@ -89,49 +95,73 @@ export class Agent {
   }
 
   public start(): void {
+    this.stopped = false;
+    this.currentPollingInterval = this.config.TASK_POLLING_INTERVAL;
     logger.info(
-      `Agent '${this.config.AGENT_NAME}' started (polling every ${this.config.TASK_POLLING_INTERVAL} seconds)`,
+      `Agent '${this.config.AGENT_NAME}' started (polling every ${this.config.TASK_POLLING_INTERVAL} seconds, backing off up to ${this.config.TASK_POLLING_MAX_INTERVAL} seconds when idle)`,
     );
     void this.pollForTasks();
-    this.pollingTimer = setInterval(() => {
-      void this.pollForTasks();
-    }, this.config.TASK_POLLING_INTERVAL * 1000);
   }
 
   public stop(): void {
+    this.stopped = true;
     if (this.pollingTimer) {
-      clearInterval(this.pollingTimer);
+      clearTimeout(this.pollingTimer);
       this.pollingTimer = undefined;
       logger.info(`Agent '${this.config.AGENT_NAME}' stopped`);
     }
   }
 
+  // The polling chain is self-scheduling (one timer armed at a time): the
+  // next poll is scheduled when the current one completes, at the current
+  // adaptive interval (M4).
+  private scheduleNextPoll(): void {
+    if (this.stopped) {
+      return;
+    }
+    this.pollingTimer = setTimeout(() => {
+      void this.pollForTasks();
+    }, this.currentPollingInterval * 1000);
+  }
+
   private async pollForTasks(): Promise<void> {
     if (this.polling) {
+      // Single-flight guard: the previous poll is still running and
+      // schedules the next one itself when it completes.
       return;
     }
     this.polling = true;
     try {
-      await this.pollOnce();
+      const outcome = await this.pollOnce();
+      if (outcome === "idle" && !this.finalizations.hasPending()) {
+        // Adaptive idle polling (M4): consecutive polls without anything
+        // actionable double the interval up to the configured maximum, so
+        // an idle agent pays less per poll. Anything actionable, any error
+        // or any pending finalization retry restores the base interval.
+        this.currentPollingInterval = Math.min(
+          this.currentPollingInterval * 2,
+          this.config.TASK_POLLING_MAX_INTERVAL,
+        );
+      } else {
+        this.currentPollingInterval = this.config.TASK_POLLING_INTERVAL;
+      }
     } finally {
       this.polling = false;
+      this.scheduleNextPoll();
     }
   }
 
-  private async pollOnce(): Promise<void> {
+  private async pollOnce(): Promise<"actionable" | "idle" | "error"> {
     try {
       // Tasks waiting for a retry of their finalization come first: their
       // comment and status move are retried with a backoff, never the CLI
       // run itself.
       await this.finalizePendingTasks();
       const user = await this.planner.getCurrentUser();
-      const tasks = await this.planner.listAssignedTasks(user);
-      await this.cleanupCompletedTasks(tasks);
-      this.logRunningTasks();
       const actions = this.getActions();
-      if (actions.length === 0 || tasks.length === 0) {
+      if (actions.length === 0) {
         this.queuedTasks = 0;
-        return;
+        return "idle";
       }
       // The projects are loaded lazily, once per poll: the project-bound
       // actions match on the project names, and the task brief includes the
@@ -145,8 +175,36 @@ export class Agent {
           }
           return projects;
         };
-      if (actions.some((action) => action.project.length > 0)) {
+      // Project-scoped fetch (M4): when every action is bound to a project
+      // pattern, only the projects matching at least one pattern are
+      // requested from Planner instead of the full task list.
+      let scopedProjectIds: string[] | undefined;
+      if (actions.every((action) => action.project.length > 0)) {
         await loadProjects();
+        const matchingIds: string[] = [];
+        for (const [projectId, project] of projects!) {
+          if (
+            actions.some((action) =>
+              matchProjectPattern(action.project, project.name),
+            )
+          ) {
+            matchingIds.push(projectId);
+          }
+        }
+        if (matchingIds.length === 0) {
+          // No project matches the configured actions: no task can be
+          // actionable this poll.
+          this.queuedTasks = 0;
+          return "idle";
+        }
+        scopedProjectIds = matchingIds;
+      }
+      const tasks = await this.planner.listAssignedTasks(user, scopedProjectIds);
+      await this.cleanupCompletedTasks(tasks);
+      this.logRunningTasks();
+      if (tasks.length === 0) {
+        this.queuedTasks = 0;
+        return "idle";
       }
       // Only tasks matching an action are ready, and a task already being
       // processed is never picked again by a subsequent poll. Every matching
@@ -171,7 +229,7 @@ export class Agent {
       }
       if (candidates.length === 0) {
         this.queuedTasks = 0;
-        return;
+        return "idle";
       }
       // Queue order: higher priorities first; within the same priority the
       // task whose last update is the oldest is picked first. The sort is
@@ -187,10 +245,12 @@ export class Agent {
       } else {
         await this.selectTasksWithKillSwitch(candidates, loadProjects);
       }
+      return "actionable";
     } catch (error) {
       logger.error(
         `Failed to poll tasks from Planner: ${(error as Error).message}`,
       );
+      return "error";
     }
   }
 
@@ -218,18 +278,25 @@ export class Agent {
       this.processingTasks,
       options,
     );
-    const evaluations = await this.taskEvaluator.evaluateAll(
-      shortlist.map((candidate) => ({
-        task: candidate.task,
-        projectName: candidate.projectName,
-      })),
-      // The evaluations are CLI processes too: they share the process cap
-      // of the scheduler instead of stacking on top of the running tasks.
-      { maxConcurrent: maxConcurrentTasks(maxParallel) },
-    );
+    const shortlistInputs = shortlist.map((candidate) => ({
+      task: candidate.task,
+      projectName: candidate.projectName,
+    }));
+    // The utility model never blocks the scheduling round (M3): selection
+    // starts from the evaluations cached by previous rounds, and the
+    // missing ones are evaluated in the background for the next rounds.
+    // A utility-model failure never rejects (it becomes a fallback), the
+    // catch is only a guard.
+    void this.taskEvaluator
+      .evaluateAll(shortlistInputs, {
+        // The evaluations are CLI processes too: they share the process cap
+        // of the scheduler instead of stacking on top of the running tasks.
+        maxConcurrent: maxConcurrentTasks(maxParallel),
+      })
+      .catch(() => undefined);
     const selection = selectTasks(schedulerCandidates, this.processingTasks, {
       ...options,
-      evaluations,
+      evaluations: this.taskEvaluator.cachedEvaluations(shortlistInputs),
     });
     this.logSchedulingRound(selection);
     this.queuedTasks = candidates.length - selection.picks.length;

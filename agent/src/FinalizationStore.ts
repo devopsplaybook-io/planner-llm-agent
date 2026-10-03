@@ -66,6 +66,18 @@ export class FinalizationStore {
     return this.pending.has(taskId);
   }
 
+  // True while at least one finalization still awaits a retry: the polling
+  // must stay at the base interval so idle backoff cannot delay the
+  // retries.
+  public hasPending(): boolean {
+    for (const entry of this.pending.values()) {
+      if (!entry.surrendered) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   // Entries whose next finalization attempt is due.
   public ready(now: number = Date.now()): PendingFinalization[] {
     return [...this.pending.values()].filter(

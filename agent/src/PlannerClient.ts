@@ -4,6 +4,9 @@ import { OTelTracer } from "./OTelContext";
 
 const REQUEST_TIMEOUT_MS = 30000;
 
+// The session user is refetched at most once per hour.
+const CURRENT_USER_TTL_MS = 3600000;
+
 type PlannerSpan = ReturnType<StandardTracer["startSpan"]>;
 
 export interface PlannerUser {
@@ -56,12 +59,23 @@ type PlannerTaskJson = any;
 
 export class PlannerClient {
   private config: Config;
+  // The session user is stable for the lifetime of the API key: it is cached
+  // (with a TTL) so idle polls do not pay a session request every cycle.
+  private currentUser: PlannerUser | null = null;
+  private currentUserAt = 0;
 
   constructor(config: Config) {
     this.config = config;
   }
 
   public async getCurrentUser(): Promise<PlannerUser> {
+    const now = Date.now();
+    if (
+      this.currentUser !== null &&
+      now - this.currentUserAt < CURRENT_USER_TTL_MS
+    ) {
+      return this.currentUser;
+    }
     const span = OTelTracer().startSpan("planner-client.get-current-user");
     try {
       const body = await this.request("/api/users/session", "POST", span);
@@ -69,7 +83,9 @@ export class PlannerClient {
       if (!user?.id || !user?.name) {
         throw new Error("Planner session response is missing user information");
       }
-      return { id: user.id as string, name: user.name as string };
+      this.currentUser = { id: user.id as string, name: user.name as string };
+      this.currentUserAt = now;
+      return this.currentUser;
     } catch (error) {
       span.recordException(error as Error);
       throw error;
@@ -78,10 +94,20 @@ export class PlannerClient {
     }
   }
 
-  public async listAssignedTasks(user: PlannerUser): Promise<PlannerTask[]> {
+  public async listAssignedTasks(
+    user: PlannerUser,
+    projectIds?: string[],
+  ): Promise<PlannerTask[]> {
     const span = OTelTracer().startSpan("planner-client.list-assigned-tasks");
     try {
-      const body = await this.request("/api/tasks", "GET", span);
+      // The planner endpoint supports a 'projectIds' filter (no assignee
+      // filter): when the caller knows the projects covered by its actions,
+      // only those tasks are transferred.
+      const path =
+        projectIds !== undefined && projectIds.length > 0
+          ? `/api/tasks?projectIds=${projectIds.map(encodeURIComponent).join(",")}`
+          : "/api/tasks";
+      const body = await this.request(path, "GET", span);
       if (!Array.isArray(body)) {
         throw new Error("Planner tasks response is not a list");
       }

@@ -77,6 +77,47 @@ describe("PlannerClient", () => {
     );
   });
 
+  it("should cache the current user across calls", async () => {
+    fetchMock.mockResolvedValue(
+      new Response(
+        JSON.stringify({ user: { id: "user-1", name: "Didier" } }),
+        { status: 201 },
+      ),
+    );
+
+    const client = new PlannerClient(config);
+    await client.getCurrentUser();
+    const user = await client.getCurrentUser();
+
+    expect(user).toEqual({ id: "user-1", name: "Didier" });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("should refetch the current user after the cache TTL", async () => {
+    jest.useFakeTimers();
+    try {
+      fetchMock.mockImplementation(
+        () =>
+          new Response(
+            JSON.stringify({ user: { id: "user-1", name: "Didier" } }),
+            { status: 201 },
+          ),
+      );
+
+      const client = new PlannerClient(config);
+      await client.getCurrentUser();
+      jest.setSystemTime(Date.now() + 3599999);
+      await client.getCurrentUser();
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+
+      jest.setSystemTime(Date.now() + 3600000);
+      await client.getCurrentUser();
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
   it("should list only tasks assigned to the given user", async () => {
     fetchMock.mockResolvedValue(
       new Response(
@@ -148,6 +189,33 @@ describe("PlannerClient", () => {
         method: "GET",
         headers: expect.objectContaining({ "x-api-key": "test-api-key" }),
       }),
+    );
+  });
+
+  it("should request only the given projects when listing tasks", async () => {
+    fetchMock.mockResolvedValue(new Response(JSON.stringify([]), { status: 200 }));
+
+    const client = new PlannerClient(config);
+    await client.listAssignedTasks({ id: "user-1", name: "Didier" }, [
+      "p-1",
+      "p 2",
+    ]);
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://planner.test:8080/api/tasks?projectIds=p-1,p%202",
+      expect.objectContaining({ method: "GET" }),
+    );
+  });
+
+  it("should request all tasks when the project list is empty", async () => {
+    fetchMock.mockResolvedValue(new Response(JSON.stringify([]), { status: 200 }));
+
+    const client = new PlannerClient(config);
+    await client.listAssignedTasks({ id: "user-1", name: "Didier" }, []);
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://planner.test:8080/api/tasks",
+      expect.objectContaining({ method: "GET" }),
     );
   });
 

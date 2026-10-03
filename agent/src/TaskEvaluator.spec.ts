@@ -8,6 +8,31 @@ import {
   parseEvaluation,
 } from "./TaskEvaluator";
 
+// Partial mock: the real logger keeps flowing through console.log (the
+// logSpy assertions), only the meter is captured so the evaluation-timeout
+// counter can be asserted.
+jest.mock("./OTelContext", () => {
+  const actual = jest.requireActual("./OTelContext");
+  const counters: { add: jest.Mock }[] = [];
+  return {
+    ...actual,
+    OTelMeter: jest.fn(() => ({
+      createCounter: jest.fn(() => {
+        const counter = { add: jest.fn() };
+        counters.push(counter);
+        return counter;
+      }),
+    })),
+    __evaluationCounters: counters,
+  };
+});
+
+const evaluationCounters = (
+  jest.requireMock("./OTelContext") as {
+    __evaluationCounters: { add: jest.Mock }[];
+  }
+).__evaluationCounters;
+
 const buildTask = (overrides: Partial<PlannerTask> & { id: string }): PlannerTask => ({
   projectId: "p1",
   title: `Task ${overrides.id}`,
@@ -59,6 +84,7 @@ describe("TaskEvaluator", () => {
 
   beforeEach(() => {
     logSpy = jest.spyOn(console, "log").mockImplementation(jest.fn());
+    evaluationCounters.length = 0;
   });
 
   afterEach(() => {
@@ -160,7 +186,7 @@ describe("TaskEvaluator", () => {
       expect(prompt).toContain("Implement the feature");
       expect(options).toEqual({
         model: "qwen3-flash",
-        timeoutMs: 60000,
+        timeoutMs: 20000,
         purpose: "utility-model evaluation 'Task t1'",
       });
     });
@@ -259,6 +285,130 @@ describe("TaskEvaluator", () => {
       expect(logSpy.mock.calls.some((call) => String(call[0]).includes("did not reply within"))).toBe(
         true,
       );
+    });
+
+    it("counts the evaluation timeouts", async () => {
+      const mockCli = buildMockCli();
+      mockCli.runPrompt.mockImplementation(() =>
+        new Promise<string>(() => undefined),
+      );
+      const evaluator = buildEvaluator(mockCli, { timeoutMs: 20 });
+      const task = buildTask({ id: "t1" });
+      for (let i = 0; i < 3; i += 1) {
+        await evaluator.evaluateTask(
+          { ...task, dateUpdated: `2026-09-01T00:00:0${i}.000Z` },
+          "Web",
+        );
+      }
+      expect(evaluationCounters).toHaveLength(1);
+      expect(evaluationCounters[0].add).toHaveBeenCalledTimes(3);
+    });
+
+    it("opens the circuit breaker after consecutive timeouts and skips the utility model", async () => {
+      const mockCli = buildMockCli();
+      mockCli.runPrompt.mockImplementation(() =>
+        new Promise<string>(() => undefined),
+      );
+      const evaluator = buildEvaluator(mockCli, { timeoutMs: 20 });
+      const task = buildTask({ id: "t1" });
+      for (let i = 0; i < 3; i += 1) {
+        await evaluator.evaluateTask(
+          { ...task, dateUpdated: `2026-09-01T00:00:0${i}.000Z` },
+          "Web",
+        );
+      }
+      expect(mockCli.runPrompt).toHaveBeenCalledTimes(3);
+
+      // The breaker is open: a new content version falls back immediately,
+      // without a CLI call and without caching the fallback.
+      const evaluation = await evaluator.evaluateTask(
+        { ...task, dateUpdated: "2026-09-04T00:00:00.000Z" },
+        "Web",
+      );
+      expect(evaluation).toEqual(fallbackEvaluation());
+      expect(mockCli.runPrompt).toHaveBeenCalledTimes(3);
+      expect(logSpy.mock.calls.some((call) =>
+        String(call[0]).includes("circuit breaker is open"),
+      )).toBe(true);
+    });
+
+    it("closes the circuit breaker after the cooldown when the model recovers", async () => {
+      jest.useFakeTimers();
+      jest.setSystemTime(new Date("2026-09-01T00:00:00.000Z"));
+      try {
+        const mockCli = buildMockCli();
+        mockCli.runPrompt.mockImplementation(() =>
+          new Promise<string>(() => undefined),
+        );
+        const evaluator = buildEvaluator(mockCli, { timeoutMs: 20 });
+        const task = buildTask({ id: "t1" });
+        for (let i = 0; i < 3; i += 1) {
+          const evaluation = evaluator.evaluateTask(
+            { ...task, dateUpdated: `2026-09-01T00:00:0${i}.000Z` },
+            "Web",
+          );
+          await jest.advanceTimersByTimeAsync(20);
+          await evaluation;
+        }
+        expect(mockCli.runPrompt).toHaveBeenCalledTimes(3);
+
+        // Past the jittered cooldown the model is consulted again.
+        mockCli.runPrompt.mockResolvedValue(
+          '{"weight": 0.5, "conflicts": [], "kind": "code-light"}',
+        );
+        jest.setSystemTime(new Date("2026-09-01T00:08:00.000Z"));
+        const evaluation = await evaluator.evaluateTask(
+          { ...task, dateUpdated: "2026-09-05T00:00:00.000Z" },
+          "Web",
+        );
+        expect(evaluation).toEqual({
+          weight: 0.5,
+          conflicts: [],
+          kind: "code-light",
+        });
+        expect(mockCli.runPrompt).toHaveBeenCalledTimes(4);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it("expires cached evaluations after the TTL", async () => {
+      jest.useFakeTimers();
+      jest.setSystemTime(new Date("2026-09-01T00:00:00.000Z"));
+      try {
+        const mockCli = buildMockCli();
+        mockCli.runPrompt.mockResolvedValue(
+          '{"weight": 0.5, "conflicts": [], "kind": "code-light"}',
+        );
+        const evaluator = buildEvaluator(mockCli);
+        const task = buildTask({ id: "t1" });
+        await evaluator.evaluateTask(task, "Web");
+        await evaluator.evaluateTask(task, "Web");
+        expect(mockCli.runPrompt).toHaveBeenCalledTimes(1);
+
+        jest.setSystemTime(new Date("2026-09-01T00:31:00.000Z"));
+        await evaluator.evaluateTask(task, "Web");
+        expect(mockCli.runPrompt).toHaveBeenCalledTimes(2);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it("bounds the evaluation cache size", async () => {
+      const mockCli = buildMockCli();
+      mockCli.runPrompt.mockResolvedValue(
+        '{"weight": 0.5, "conflicts": [], "kind": "code-light"}',
+      );
+      const evaluator = buildEvaluator(mockCli);
+      for (let i = 0; i < 505; i += 1) {
+        await evaluator.evaluateTask(buildTask({ id: `t${i}` }), "Web");
+      }
+      // The oldest entry was evicted: it is evaluated again.
+      await evaluator.evaluateTask(buildTask({ id: "t0" }), "Web");
+      expect(mockCli.runPrompt).toHaveBeenCalledTimes(506);
+      // A recent entry is still cached.
+      await evaluator.evaluateTask(buildTask({ id: "t504" }), "Web");
+      expect(mockCli.runPrompt).toHaveBeenCalledTimes(506);
     });
 
     it("bounds the concurrent utility-model calls", async () => {
