@@ -13,13 +13,16 @@ import { CLI_AGENT_NAMES } from "./Config";
  * seconds for the tasks of this action; null falls back to the actions
  * default timeout. The weight is the scheduling weight (task units) of the
  * tasks of this action in the weighted budget (see the Scheduler module);
- * null falls back to the default weight.
+ * null falls back to the default weight. The statusError is the status a
+ * failed task is moved to; when not set it falls back to the actions
+ * default status error, then to the end status.
  */
 export interface AgentAction {
   project: string;
   statusStart: string;
   statusEnd: string;
   agent?: string;
+  statusError?: string;
   model: string;
   instruction: string;
   timeout: number | null;
@@ -29,12 +32,14 @@ export interface AgentAction {
 /**
  * The agent actions configuration: the default model applied to the
  * actions without their own model, the default task timeout (seconds)
- * applied to the actions without their own timeout, and the actions
- * themselves.
+ * applied to the actions without their own timeout, the default error
+ * status applied to the actions without their own status error, and the
+ * actions themselves.
  */
 export interface AgentActionsConfig {
   defaultAgent?: string;
   defaultModel: string;
+  defaultStatusError?: string;
   defaultTimeout: number | null;
   actions: AgentAction[];
 }
@@ -47,21 +52,23 @@ export interface AgentActionsConfig {
  *   agent: <CLI agent name>
  *   model: <model name>
  *   timeout: <seconds>
+ *   status_error: <status name>
  * actions:
  *   - project: <project pattern>
  *     status_start: <status name>
  *     status_end: <status name>
+ *     status_error: <status name>
  *     agent: <CLI agent name>
  *     model: <model name>
  *     instruction: <instruction>
  *     timeout: <seconds>
  *
- * 'default' and per-action 'agent'/'model'/'instruction'/'timeout'/'weight'
- * are optional; 'project' is optional too: a missing, null or empty project
- * matches any project, and a non-empty project is a glob pattern where '*'
- * matches any sequence of characters. Everything else is required and
- * unknown fields are rejected. Throws an Error listing every problem found
- * when the configuration is invalid.
+ * 'default' and per-action 'agent'/'model'/'instruction'/'timeout'/'weight'/
+ * 'status_error' are optional; 'project' is optional too: a missing, null or
+ * empty project matches any project, and a non-empty project is a glob
+ * pattern where '*' matches any sequence of characters. Everything else is
+ * required and unknown fields are rejected. Throws an Error listing every
+ * problem found when the configuration is invalid.
  */
 export function parseAgentActions(content: string): AgentActionsConfig {
   let parsed: unknown;
@@ -99,7 +106,12 @@ export function parseAgentActions(content: string): AgentActionsConfig {
     } else {
       const defaults = root.default as Record<string, unknown>;
       for (const key of Object.keys(defaults)) {
-        if (key !== "agent" && key !== "model" && key !== "timeout") {
+        if (
+          key !== "agent" &&
+          key !== "model" &&
+          key !== "timeout" &&
+          key !== "status_error"
+        ) {
           errors.push(`Unknown 'default' field '${key}'`);
         }
       }
@@ -129,6 +141,16 @@ export function parseAgentActions(content: string): AgentActionsConfig {
       if (timeout !== null) {
         config.defaultTimeout = timeout;
       }
+      const statusError = readString(
+        defaults,
+        "status_error",
+        "default.status_error",
+        errors,
+        true,
+      );
+      if (statusError !== null) {
+        config.defaultStatusError = statusError;
+      }
     }
   }
 
@@ -150,6 +172,7 @@ export function parseAgentActions(content: string): AgentActionsConfig {
             "project",
             "status_start",
             "status_end",
+            "status_error",
             "agent",
             "model",
             "instruction",
@@ -176,6 +199,13 @@ export function parseAgentActions(content: string): AgentActionsConfig {
         "status_end",
         `actions[${index}].status_end`,
         errors,
+      );
+      const statusError = readString(
+        action,
+        "status_error",
+        `actions[${index}].status_error`,
+        errors,
+        true,
       );
       const agent = readAgent(
         action,
@@ -224,6 +254,7 @@ export function parseAgentActions(content: string): AgentActionsConfig {
           project: project,
           statusStart: statusStart,
           statusEnd: statusEnd,
+          ...(statusError === null ? {} : { statusError }),
           ...(agent === null ? {} : { agent }),
           model: model ?? "",
           instruction: instruction ?? "",

@@ -729,20 +729,26 @@ export class Agent {
         `Failed to process task '${task.title}' (${task.id}): ${message}`,
       );
       // A failing task must not block the agent by staying in the start
-      // status forever: it is moved to the end status with an explanation.
+      // status forever: it is moved to the resolved error status (the action
+      // status_error, then the actions default status_error, then the end
+      // status) with an explanation.
+      const errorStatus =
+        action.statusError ??
+        this.agentActions?.defaultStatusError ??
+        action.statusEnd;
       try {
         await this.planner.addTaskComment(
           task.id,
-          buildFailureComment(message, action.statusEnd),
+          buildFailureComment(message, errorStatus),
         );
-        await this.planner.updateTaskStatus(task.id, action.statusEnd);
+        await this.planner.updateTaskStatus(task.id, errorStatus);
         logger.info(
-          `Task '${task.title}' (${task.id}) moved to status '${action.statusEnd}' after a processing failure`,
+          `Task '${task.title}' (${task.id}) moved to status '${errorStatus}' after a processing failure`,
         );
-        await this.cleanupTaskFolderIfNeeded(task.id, action.statusEnd);
+        await this.cleanupTaskFolderIfNeeded(task.id, errorStatus);
       } catch (cleanupError) {
         logger.error(
-          `Failed to move task '${task.title}' (${task.id}) to status '${action.statusEnd}' after the processing failure: ${(cleanupError as Error).message}`,
+          `Failed to move task '${task.title}' (${task.id}) to status '${errorStatus}' after the processing failure: ${(cleanupError as Error).message}`,
         );
       }
     } finally {

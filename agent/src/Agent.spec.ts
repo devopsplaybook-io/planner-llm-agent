@@ -692,6 +692,95 @@ describe("Agent", () => {
     agent.stop();
   });
 
+  it("should move a failing task to the action error status when configured", async () => {
+    mockPlanner.listAssignedTasks.mockResolvedValue([
+      {
+        id: "task-1",
+        title: "Implement feature",
+        status: "To Do",
+        description: "Add a feature",
+        comments: [],
+        attachments: [],
+      },
+    ]);
+    mockQoder.performTask.mockRejectedValue(new Error("boom"));
+
+    const actions: AgentActionsConfig = {
+      defaultStatusError: "Review",
+      defaultModel: "",
+      defaultTimeout: null,
+      actions: [
+        {
+          project: "",
+          statusStart: "To Do",
+          statusEnd: "Done",
+          statusError: "Blocked",
+          model: "",
+          instruction: "",
+          timeout: null,
+          weight: null,
+        },
+      ],
+    };
+    const agent = createAgent(actions);
+    agent.start();
+    await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
+
+    expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith(
+      "task-1",
+      "Blocked",
+    );
+    expect(mockPlanner.addTaskComment).toHaveBeenCalledWith(
+      "task-1",
+      expect.stringContaining("The task was moved to 'Blocked'"),
+    );
+    agent.stop();
+  });
+
+  it("should move a failing task to the default error status when the action has none", async () => {
+    mockPlanner.listAssignedTasks.mockResolvedValue([
+      {
+        id: "task-1",
+        title: "Implement feature",
+        status: "To Do",
+        description: "Add a feature",
+        comments: [],
+        attachments: [],
+      },
+    ]);
+    mockQoder.performTask.mockRejectedValue(new Error("boom"));
+
+    const actions: AgentActionsConfig = {
+      defaultStatusError: "Review",
+      defaultModel: "",
+      defaultTimeout: null,
+      actions: [
+        {
+          project: "",
+          statusStart: "To Do",
+          statusEnd: "Done",
+          model: "",
+          instruction: "",
+          timeout: null,
+          weight: null,
+        },
+      ],
+    };
+    const agent = createAgent(actions);
+    agent.start();
+    await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
+
+    expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith(
+      "task-1",
+      "Review",
+    );
+    expect(mockPlanner.addTaskComment).toHaveBeenCalledWith(
+      "task-1",
+      expect.stringContaining("The task was moved to 'Review'"),
+    );
+    agent.stop();
+  });
+
   it("should truncate a long failure explanation", async () => {
     mockPlanner.listAssignedTasks.mockResolvedValue([
       {

@@ -72,6 +72,74 @@ describe("AgentActions", () => {
       expect(config.actions[0].agent).toBe("copilot-cli");
     });
 
+    it("should parse the default and per-action error statuses", () => {
+      const config = parseAgentActions(
+        [
+          "default:",
+          "  status_error: Review",
+          "actions:",
+          "  - project: Web",
+          "    status_start: To Do",
+          "    status_end: Done",
+          "    status_error: Blocked",
+          "  - project: Backend",
+          "    status_start: To Do",
+          "    status_end: Done",
+        ].join("\n"),
+      );
+      expect(config.defaultStatusError).toBe("Review");
+      expect(config.actions[0].statusError).toBe("Blocked");
+      expect(config.actions[1].statusError).toBeUndefined();
+    });
+
+    it("should trim the configured error statuses", () => {
+      const config = parseAgentActions(
+        [
+          "default:",
+          '  status_error: "  Review  "',
+          "actions:",
+          "  - project: Web",
+          "    status_start: To Do",
+          "    status_end: Done",
+          '    status_error: " Blocked "',
+        ].join("\n"),
+      );
+      expect(config.defaultStatusError).toBe("Review");
+      expect(config.actions[0].statusError).toBe("Blocked");
+    });
+
+    it("should reject an empty or non-string default status_error", () => {
+      const failure = (value: string): (() => unknown) => () =>
+        parseAgentActions(
+          ["default:", `  status_error: ${value}`, "actions: []"].join("\n"),
+        );
+      expect(failure('""')).toThrow(
+        /'default\.status_error' must be a non-empty string/,
+      );
+      expect(failure("42")).toThrow(
+        /'default\.status_error' must be a non-empty string/,
+      );
+    });
+
+    it("should reject an empty or non-string action status_error", () => {
+      const failure = (value: string): (() => unknown) => () =>
+        parseAgentActions(
+          [
+            "actions:",
+            "  - project: Web",
+            "    status_start: To Do",
+            "    status_end: Done",
+            `    status_error: ${value}`,
+          ].join("\n"),
+        );
+      expect(failure('""')).toThrow(
+        /'actions\[0\]\.status_error' must be a non-empty string/,
+      );
+      expect(failure("42")).toThrow(
+        /'actions\[0\]\.status_error' must be a non-empty string/,
+      );
+    });
+
     it("should parse a minimal configuration without defaults", () => {
       const config = parseAgentActions(
         [
