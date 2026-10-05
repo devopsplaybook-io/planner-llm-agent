@@ -257,10 +257,12 @@ default:
   agent: qoder
   model: DeepSeek-Flash
   timeout: 3600
+  status_error: Review
 actions:
   - project: Web
     status_start: To Do
     status_end: In Review
+    status_error: Blocked
     agent: copilot-cli
     model: gpt-6-luna
     instruction: Follow the repository coding guidelines and open a PR when the task is done.
@@ -273,14 +275,15 @@ actions:
     status_end: Done
 ```
 
-For every poll, the agent checks if an assigned task matches the project pattern and the start status of an action. Matching tasks are processed with the action model and instruction (on top of the task information) and moved to the action end status once processed (including after a processing failure, same as the default behavior).
+For every poll, the agent checks if an assigned task matches the project pattern and the start status of an action. Matching tasks are processed with the action model and instruction (on top of the task information) and moved to the action end status once processed; a processing failure moves the task to the resolved `status_error` instead (see below).
 
-- `status_start` and `status_end` are required; `project`, `agent`, `model`, `instruction`, `timeout` and `weight` are optional. `project` matches any project when missing, null or empty; otherwise it is a case-sensitive glob pattern where `*` matches any sequence of characters (e.g. `Project*` matches `Projects` and `Projects - Planner`). Overlapping patterns are allowed: the first matching action in the list processes the task, and a task whose project cannot be resolved never matches a project-bound action.
+- `status_start` and `status_end` are required; `project`, `agent`, `model`, `instruction`, `timeout`, `weight` and `status_error` are optional. `project` matches any project when missing, null or empty; otherwise it is a case-sensitive glob pattern where `*` matches any sequence of characters (e.g. `Project*` matches `Projects` and `Projects - Planner`). Overlapping patterns are allowed: the first matching action in the list processes the task, and a task whose project cannot be resolved never matches a project-bound action.
 - `default.agent` selects the CLI agent used by default; when omitted, `AGENT_CLI` is used (Qoder by default). An action-level `agent` overrides it. Supported values are `qoder`, `claude-code`, `copilot-cli`, `codex` and `gemini-cli`. Every distinct configured agent is validated and its authentication is checked at startup when `AGENT_AUTH_CHECK` is enabled. `default.model` applies to the default agent; set `model` on an action that uses another agent when it needs a specific model.
 - `weight` is the scheduling weight of the tasks handled by the action (a number greater than 0 and at most 1, e.g. `0.5` for a batch of small routine tasks); an `agent-weight:` line in the task description still takes precedence (see [Parallel scheduling](#parallel-scheduling)).
 - `default.model` is the fallback model for actions without their own model, and `default.timeout` is the fallback timeout for actions without their own timeout. A model id must be accepted by the selected CLI (`gpt-6-luna` and not the display name `GPT-6 Luna`, for example): a bad id fails the task immediately with the CLI error.
 - The task timeout is resolved per task with the following priority: the `timeout` of the matching action, then `default.timeout`, then the global `TASK_TIMEOUT` configuration (default `3600` = 1 hour). It must be a positive integer in seconds.
-- When the task timeout expires, the whole CLI process group is killed (SIGTERM, then SIGKILL after a 10 seconds grace period), so processes spawned by the coding-agent CLI (shells, `git`, `npm test`, dev servers) cannot survive the timeout. The task then fails and is moved to the end status with an explanation.
+- `status_error` is the status a failed task is moved to (a CLI error, a task timeout, a preparation failure): it is resolved per task with the following priority: the `status_error` of the matching action, then `default.status_error`, then the action `status_end` (the historical behavior). A successfully processed task is always moved to the `status_end`. The resolved status must be one of the statuses of the target project on Planner.
+- When the task timeout expires, the whole CLI process group is killed (SIGTERM, then SIGKILL after a 10 seconds grace period), so processes spawned by the coding-agent CLI (shells, `git`, `npm test`, dev servers) cannot survive the timeout. The task then fails and is moved to the resolved `status_error` with an explanation.
 - When the agent starts working on a task, it posts a one-line comment on the task (`Agent '<AGENT_NAME>' started working on this task.`) to notify the user. This notification is best-effort: a failure to post it does not fail the task.
 - The format is checked at startup: when the file exists but is invalid (bad YAML, missing or empty required fields, non-string projects, invalid timeouts or weights, unknown fields, duplicate project pattern and start status), the agent exits immediately with the list of problems.
 - When the file does not exist, the agent starts with no action and processes no task (a warning is logged at startup).
