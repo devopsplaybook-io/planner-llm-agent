@@ -2082,6 +2082,241 @@ describe("Agent", () => {
     agent.stop();
   });
 
+  it("should process tasks by the action priority over the task priority", async () => {
+    config.TASK_POLLING_INTERVAL = 1;
+    const resolvers: ((value: string) => void)[] = [];
+    mockPlanner.listProjects.mockResolvedValue([
+      { id: "p1", name: "Alpha", description: "" },
+      { id: "p2", name: "Beta", description: "" },
+    ]);
+    mockPlannerTasks([
+      {
+        id: "task-alpha-low",
+        projectId: "p1",
+        title: "Low priority task of a high-priority action",
+        status: "To Do",
+        description: "",
+        comments: [],
+        attachments: [],
+        priority: "low",
+      },
+      {
+        id: "task-beta-high",
+        projectId: "p2",
+        title: "High priority task of a default action",
+        status: "To Do",
+        description: "",
+        comments: [],
+        attachments: [],
+        priority: "high",
+      },
+    ]);
+    mockQoder.performTask.mockImplementation(
+      () =>
+        new Promise<string>((resolve) => {
+          resolvers.push(resolve);
+        }),
+    );
+
+    const agent = createAgent({
+      defaultModel: "",
+      defaultTimeout: null,
+      actions: [
+        {
+          project: "Alpha*",
+          statusStart: "To Do",
+          statusEnd: "Done",
+          model: "",
+          instruction: "",
+          timeout: null,
+          weight: null,
+          priority: "high",
+        },
+        {
+          project: "Beta*",
+          statusStart: "To Do",
+          statusEnd: "Done",
+          model: "",
+          instruction: "",
+          timeout: null,
+          weight: null,
+        },
+      ],
+    });
+    agent.start();
+    await waitFor(() => mockQoder.performTask.mock.calls.length === 1);
+    expect(mockQoder.performTask).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "task-alpha-low" }),
+      expect.any(String),
+      expect.anything(),
+    );
+
+    resolvers[0]("Alpha done");
+    await waitFor(() => mockQoder.performTask.mock.calls.length === 2);
+    expect(mockQoder.performTask).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "task-beta-high" }),
+      expect.any(String),
+      expect.anything(),
+    );
+    resolvers[1]("Beta done");
+    await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length === 2);
+    agent.stop();
+  });
+
+  it("should demote the tasks of a low-priority action", async () => {
+    config.TASK_POLLING_INTERVAL = 1;
+    const resolvers: ((value: string) => void)[] = [];
+    mockPlanner.listProjects.mockResolvedValue([
+      { id: "p1", name: "Gamma", description: "" },
+      { id: "p2", name: "Delta", description: "" },
+    ]);
+    mockPlannerTasks([
+      {
+        id: "task-gamma-high",
+        projectId: "p1",
+        title: "High priority task of a low-priority action",
+        status: "To Do",
+        description: "",
+        comments: [],
+        attachments: [],
+        priority: "high",
+      },
+      {
+        id: "task-delta-medium",
+        projectId: "p2",
+        title: "Medium priority task of a default action",
+        status: "To Do",
+        description: "",
+        comments: [],
+        attachments: [],
+        priority: "medium",
+      },
+    ]);
+    mockQoder.performTask.mockImplementation(
+      () =>
+        new Promise<string>((resolve) => {
+          resolvers.push(resolve);
+        }),
+    );
+
+    const agent = createAgent({
+      defaultModel: "",
+      defaultTimeout: null,
+      actions: [
+        {
+          project: "Gamma*",
+          statusStart: "To Do",
+          statusEnd: "Done",
+          model: "",
+          instruction: "",
+          timeout: null,
+          weight: null,
+          priority: "low",
+        },
+        {
+          project: "Delta*",
+          statusStart: "To Do",
+          statusEnd: "Done",
+          model: "",
+          instruction: "",
+          timeout: null,
+          weight: null,
+        },
+      ],
+    });
+    agent.start();
+    await waitFor(() => mockQoder.performTask.mock.calls.length === 1);
+    expect(mockQoder.performTask).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "task-delta-medium" }),
+      expect.any(String),
+      expect.anything(),
+    );
+
+    resolvers[0]("Delta done");
+    await waitFor(() => mockQoder.performTask.mock.calls.length === 2);
+    expect(mockQoder.performTask).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "task-gamma-high" }),
+      expect.any(String),
+      expect.anything(),
+    );
+    resolvers[1]("Gamma done");
+    await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length === 2);
+    agent.stop();
+  });
+
+  it("should apply the action priority with the oldest-update tiebreak", async () => {
+    config.TASK_POLLING_INTERVAL = 1;
+    const resolvers: ((value: string) => void)[] = [];
+    mockPlanner.listProjects.mockResolvedValue([
+      { id: "p1", name: "Epsilon", description: "" },
+    ]);
+    mockPlannerTasks([
+      {
+        id: "task-newest",
+        projectId: "p1",
+        title: "Newest task",
+        status: "To Do",
+        description: "",
+        comments: [],
+        attachments: [],
+        priority: "low",
+        dateUpdated: "2026-09-10T00:00:00.000Z",
+      },
+      {
+        id: "task-oldest",
+        projectId: "p1",
+        title: "Oldest task",
+        status: "To Do",
+        description: "",
+        comments: [],
+        attachments: [],
+        priority: "low",
+        dateUpdated: "2026-09-01T00:00:00.000Z",
+      },
+    ]);
+    mockQoder.performTask.mockImplementation(
+      () =>
+        new Promise<string>((resolve) => {
+          resolvers.push(resolve);
+        }),
+    );
+
+    const agent = createAgent({
+      defaultModel: "",
+      defaultTimeout: null,
+      actions: [
+        {
+          project: "Epsilon*",
+          statusStart: "To Do",
+          statusEnd: "Done",
+          model: "",
+          instruction: "",
+          timeout: null,
+          weight: null,
+          priority: "high",
+        },
+      ],
+    });
+    agent.start();
+    await waitFor(() => mockQoder.performTask.mock.calls.length === 1);
+    expect(mockQoder.performTask).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "task-oldest" }),
+      expect.any(String),
+      expect.anything(),
+    );
+
+    resolvers[0]("Oldest done");
+    await waitFor(() => mockQoder.performTask.mock.calls.length === 2);
+    expect(mockQoder.performTask).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "task-newest" }),
+      expect.any(String),
+      expect.anything(),
+    );
+    resolvers[1]("Newest done");
+    await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length === 2);
+    agent.stop();
+  });
+
   it("should include the project name and description in the task notes", async () => {
     config.TASK_STATUS_CLEANUP = "Archived";
     mockPlanner.listProjects.mockResolvedValue([

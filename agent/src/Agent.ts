@@ -318,11 +318,15 @@ export class Agent {
         return outcome;
       }
       // Queue order: higher priorities first; within the same priority the
-      // task whose last update is the oldest is picked first. The sort is
-      // stable, so equal candidates keep the actions configuration order.
+      // task whose last update is the oldest is picked first. The queue
+      // priority of a task is the priority of its matching action when the
+      // action sets one, and the task's own Planner priority otherwise. The
+      // sort is stable, so equal candidates keep the actions configuration
+      // order.
       candidates.sort(
         (a, b) =>
-          priorityRank(b.task.priority) - priorityRank(a.task.priority) ||
+          priorityRank(queuePriorityOf(b.task, b.action)) -
+            priorityRank(queuePriorityOf(a.task, a.action)) ||
           dateUpdatedValue(a.task.dateUpdated) -
             dateUpdatedValue(b.task.dateUpdated),
       );
@@ -1057,6 +1061,12 @@ const PRIORITY_RANKS: Record<string, number> = {
 
 function priorityRank(priority: string): number {
   return PRIORITY_RANKS[priority] ?? PRIORITY_RANKS.medium;
+}
+
+// Queue priority of a candidate: the priority of the matching action
+// overrides the task's own Planner priority when the action sets one.
+function queuePriorityOf(task: PlannerTask, action: AgentAction): string {
+  return action.priority ?? task.priority;
 }
 
 // Sort key of the task last update, ascending: the oldest update comes
