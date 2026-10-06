@@ -1,6 +1,5 @@
-import type { StandardMeter } from "@devopsplaybook.io/otel-utils";
 import { Config } from "./Config";
-import { OTelLogger, OTelMeter } from "./OTelContext";
+import { OTelLogger } from "./OTelContext";
 import type { PlannerTask } from "./PlannerClient";
 import type { CliAgentClient } from "./clients/CliAgent";
 import {
@@ -82,11 +81,6 @@ export class TaskEvaluator {
   // utility model is skipped (circuit breaker, see the constants above).
   private consecutiveTimeouts = 0;
   private circuitOpenUntil = 0;
-  // Counter of the utility-model evaluations by outcome (success, timeout,
-  // failure): null when OpenTelemetry is not initialized (e.g. in tests).
-  private evaluationCounter: ReturnType<
-    StandardMeter["createCounter"]
-  > | null = null;
   // Semaphore bounding the concurrent utility-model calls.
   private active = 0;
   private waiters: (() => void)[] = [];
@@ -109,12 +103,6 @@ export class TaskEvaluator {
       Math.max(1, options?.cacheCapacity ?? CACHE_CAPACITY),
       Math.max(1, options?.cacheTtlMs ?? CACHE_TTL_MS),
     );
-    try {
-      this.evaluationCounter = OTelMeter().createCounter("evaluations");
-    } catch {
-      // OpenTelemetry not initialized (e.g. in tests): the metric stays
-      // disabled and the evaluation keeps working.
-    }
   }
 
   // The configured evaluation bound in milliseconds; a hot-reloaded
@@ -315,11 +303,9 @@ export class TaskEvaluator {
 
   private onEvaluationSuccess(): void {
     this.consecutiveTimeouts = 0;
-    this.recordEvaluationMetric("success");
   }
 
   private onEvaluationFailure(timedOut: boolean): void {
-    this.recordEvaluationMetric(timedOut ? "timeout" : "failure");
     if (!timedOut) {
       return;
     }
@@ -330,16 +316,6 @@ export class TaskEvaluator {
       logger.warn(
         `Utility-model evaluations timed out ${EVALUATION_TIMEOUT_CIRCUIT_THRESHOLD} times in a row: the utility model is skipped until ${new Date(this.circuitOpenUntil).toISOString()}`,
       );
-    }
-  }
-
-  private recordEvaluationMetric(
-    result: "success" | "timeout" | "failure",
-  ): void {
-    try {
-      this.evaluationCounter?.add(1, { result });
-    } catch {
-      // The metrics never break the evaluation.
     }
   }
 }

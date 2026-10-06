@@ -8,31 +8,18 @@ import {
   parseEvaluation,
 } from "./TaskEvaluator";
 
-// The OpenTelemetry meter is mocked so the evaluation counter is observable;
-// the logger still reaches console.log for the logSpy assertions.
+// The OpenTelemetry logger is mocked so it still reaches console.log for
+// the logSpy assertions without requiring an initialized meter.
 jest.mock("./OTelContext", () => {
-  const counters: Record<string, { add: jest.Mock }> = {};
   const logger = {
     info: (...args: unknown[]) => console.log(...args),
     warn: (...args: unknown[]) => console.log(...args),
     error: (...args: unknown[]) => console.log(...args),
   };
   return {
-    __counters: counters,
     OTelLogger: () => ({ createModuleLogger: () => logger }),
-    OTelMeter: () => ({
-      createCounter: (key: string) => {
-        counters[key] ??= { add: jest.fn() };
-        return counters[key];
-      },
-    }),
   };
 });
-
-const evaluationCounters = (): Record<string, { add: jest.Mock }> =>
-  (jest.requireMock("./OTelContext") as {
-    __counters: Record<string, { add: jest.Mock }>;
-  }).__counters;
 
 const buildTask = (overrides: Partial<PlannerTask> & { id: string }): PlannerTask => ({
   projectId: "p1",
@@ -438,29 +425,6 @@ describe("TaskEvaluator", () => {
       expect(mockCli.runPrompt).toHaveBeenCalledTimes(1);
       expect(after.get("t4")?.weight).toBe(0.75);
       nowSpy.mockRestore();
-    });
-
-    it("counts the evaluations by outcome", async () => {
-      const mockCli = buildMockCli();
-      mockCli.runPrompt
-        .mockResolvedValueOnce(
-          '{"weight": 0.5, "conflicts": [], "kind": "code-light"}',
-        )
-        .mockRejectedValueOnce(new Error("CLI is down"))
-        .mockImplementation(() => new Promise<string>(() => undefined));
-      const evaluator = buildEvaluator(mockCli, {
-        timeoutMs: 10,
-        concurrency: 3,
-      });
-
-      await evaluator.evaluateTask(buildTask({ id: "t1" }), "Web");
-      await evaluator.evaluateTask(buildTask({ id: "t2" }), "Web");
-      await evaluator.evaluateTask(buildTask({ id: "t3" }), "Web");
-
-      const add = evaluationCounters()["evaluations"].add;
-      expect(add).toHaveBeenCalledWith(1, { result: "success" });
-      expect(add).toHaveBeenCalledWith(1, { result: "failure" });
-      expect(add).toHaveBeenCalledWith(1, { result: "timeout" });
     });
 
     it("evicts the least recently used evaluations beyond the cache capacity", async () => {
