@@ -448,6 +448,84 @@ describe("AgentActions", () => {
       );
     });
 
+    it("should parse the action priority", () => {
+      const config = parseAgentActions(
+        [
+          "actions:",
+          "  - project: Web",
+          "    status_start: To Do",
+          "    status_end: Done",
+          "    priority: low",
+          "  - project: Backend",
+          "    status_start: To Do",
+          "    status_end: Done",
+          "    priority: high",
+        ].join("\n"),
+      );
+      expect(config.actions[0].priority).toBe("low");
+      expect(config.actions[1].priority).toBe("high");
+    });
+
+    it("should normalize the action priority case and whitespace", () => {
+      const config = parseAgentActions(
+        [
+          "actions:",
+          "  - project: Web",
+          "    status_start: To Do",
+          "    status_end: Done",
+          '    priority: " High "',
+        ].join("\n"),
+      );
+      expect(config.actions[0].priority).toBe("high");
+    });
+
+    it("should leave the action priority unset when omitted", () => {
+      const config = parseAgentActions(
+        [
+          "actions:",
+          "  - project: Web",
+          "    status_start: To Do",
+          "    status_end: Done",
+        ].join("\n"),
+      );
+      expect(config.actions[0].priority).toBeUndefined();
+    });
+
+    it("should throw on invalid action priority values", () => {
+      const failure = (value: string): (() => unknown) => () =>
+        parseAgentActions(
+          [
+            "actions:",
+            "  - project: Web",
+            "    status_start: To Do",
+            "    status_end: Done",
+            `    priority: ${value}`,
+          ].join("\n"),
+        );
+      expect(failure("urgent")).toThrow(
+        /'actions\[0\]\.priority' must be one of high, medium, low/,
+      );
+      expect(failure('""')).toThrow(
+        /'actions\[0\]\.priority' must be one of high, medium, low/,
+      );
+      expect(failure("5")).toThrow(
+        /'actions\[0\]\.priority' must be one of high, medium, low/,
+      );
+    });
+
+    it("should reject a default priority", () => {
+      expect(() =>
+        parseAgentActions(
+          [
+            "default:",
+            "  model: m",
+            "  priority: low",
+            "actions: []",
+          ].join("\n"),
+        ),
+      ).toThrow(/Unknown 'default' field 'priority'/);
+    });
+
     it("should throw on empty or non-string values", () => {
       const failure = (): unknown =>
         parseAgentActions(

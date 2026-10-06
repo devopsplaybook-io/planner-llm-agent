@@ -28,6 +28,10 @@ data:
         # greater than 0 and at most 1 (optional, default 1; see the
         # "Parallel scheduling" section of the README).
         # weight: 0.5
+        # Queue priority of the tasks handled by this action: high, medium
+        # or low (optional, overrides the task priority; see the "Agent
+        # actions" section of the README).
+        # priority: low
       - project: Backend
         status_start: To Do
         status_end: Done

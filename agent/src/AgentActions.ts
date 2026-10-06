@@ -15,7 +15,9 @@ import { CLI_AGENT_NAMES } from "./Config";
  * tasks of this action in the weighted budget (see the Scheduler module);
  * null falls back to the default weight. The statusError is the status a
  * failed task is moved to; when not set it falls back to the actions
- * default status error, then to the end status.
+ * default status error, then to the end status. The priority is the queue
+ * priority of the tasks of this action; when not set the task's own
+ * Planner priority applies.
  */
 export interface AgentAction {
   project: string;
@@ -23,6 +25,7 @@ export interface AgentAction {
   statusEnd: string;
   agent?: string;
   statusError?: string;
+  priority?: string;
   model: string;
   instruction: string;
   timeout: number | null;
@@ -62,9 +65,12 @@ export interface AgentActionsConfig {
  *     model: <model name>
  *     instruction: <instruction>
  *     timeout: <seconds>
+ *     weight: <number>
+ *     priority: <high|medium|low>
  *
  * 'default' and per-action 'agent'/'model'/'instruction'/'timeout'/'weight'/
- * 'status_error' are optional; 'project' is optional too: a missing, null or
+ * 'status_error'/'priority' are optional; 'project' is optional too: a
+ * missing, null or
  * empty project matches any project, and a non-empty project is a glob
  * pattern where '*' matches any sequence of characters. Everything else is
  * required and unknown fields are rejected. Throws an Error listing every
@@ -178,6 +184,7 @@ export function parseAgentActions(content: string): AgentActionsConfig {
             "instruction",
             "timeout",
             "weight",
+            "priority",
           ].includes(key)
         ) {
           errors.push(`actions[${index}] has unknown field '${key}'`);
@@ -239,6 +246,12 @@ export function parseAgentActions(content: string): AgentActionsConfig {
         `actions[${index}].weight`,
         errors,
       );
+      const priority = readPriority(
+        action,
+        "priority",
+        `actions[${index}].priority`,
+        errors,
+      );
       if (statusStart !== null) {
         const key = `${project}\n${statusStart}`;
         if (seen.has(key)) {
@@ -256,6 +269,7 @@ export function parseAgentActions(content: string): AgentActionsConfig {
           statusEnd: statusEnd,
           ...(statusError === null ? {} : { statusError }),
           ...(agent === null ? {} : { agent }),
+          ...(priority === null ? {} : { priority }),
           model: model ?? "",
           instruction: instruction ?? "",
           timeout: timeout,
@@ -401,6 +415,31 @@ function readAgent(
     return null;
   }
   return selector;
+}
+
+// Reads an optional queue priority of an action: high, medium or low
+// (case-insensitive). Missing fields report 'not set' (null). An empty,
+// non-string or unsupported value always produces a validation error so
+// typos fail fast at startup.
+function readPriority(
+  source: Record<string, unknown>,
+  field: string,
+  label: string,
+  errors: string[],
+): string | null {
+  const value = source[field];
+  if (value === undefined) {
+    return null;
+  }
+  const raw = typeof value === "string" ? value.trim() : String(value);
+  const priority = raw.toLowerCase();
+  if (!["high", "medium", "low"].includes(priority)) {
+    errors.push(
+      `'${label}' must be one of high, medium, low (current value: '${raw}')`,
+    );
+    return null;
+  }
+  return priority;
 }
 
 // Reads an optional positive integer field (a timeout in seconds); missing
