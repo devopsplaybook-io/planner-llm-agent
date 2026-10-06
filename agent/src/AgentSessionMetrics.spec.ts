@@ -30,6 +30,7 @@ describe("AgentSessionMetrics", () => {
 
     expect(meterProvider.createHistogram).toHaveBeenCalledWith(
       "session.duration",
+      { unprefixed: true },
     );
   });
 

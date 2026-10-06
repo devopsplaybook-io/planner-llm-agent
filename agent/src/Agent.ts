@@ -600,13 +600,14 @@ export class Agent {
   }
 
   // One gauge consolidating the scheduling queue: one data point per
-  // value, selected by the 'type' attribute. The gauge is exported as-is
-  // (observable gauges are not prefixed by the shared meter wrapper).
+  // value, selected by the 'type' attribute. The instrument name carries
+  // its own namespace because observable gauges are exported as-is,
+  // without the service-name prefix (so the exported name is tasks.queue).
   private initQueueMetrics(): void {
     try {
       const meter = OTelMeter();
       meter.createObservableGauge(
-        "queue",
+        "tasks.queue",
         (result) => {
           result.observe(this.queuedTasks, { type: "tasks_queued" });
           result.observe(this.processingTasks.size, {

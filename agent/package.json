@@ -1,6 +1,6 @@
 {
   "name": "agent",
-  "version": "0.20.0",
+  "version": "0.21.0",
   "description": "LLM agent that connects to a Planner instance and executes assigned tasks",
   "author": "",
   "license": "MIT",
@@ -13,8 +13,9 @@
     "dev": "tsx watch ./src/App.ts"
   },
   "dependencies": {
-    "@devopsplaybook.io/otel-utils": "^1.1.3",
-    "fs-extra": "^11.4.0"
+    "@devopsplaybook.io/otel-utils": "^1.5.0",
+    "fs-extra": "^11.4.0",
+    "yaml": "^2.8.3"
   },
   "devDependencies": {
     "@swc/core": "^1.16.2",

@@ -22,7 +22,9 @@ export class AgentSessionMetrics {
   constructor(meterProvider?: StandardMeter) {
     try {
       const meter = meterProvider ?? OTelMeter();
-      this.sessionDuration = meter.createHistogram("session.duration");
+      this.sessionDuration = meter.createHistogram("session.duration", {
+        unprefixed: true,
+      });
     } catch {
       // OpenTelemetry not initialized: the metrics stay disabled.
     }

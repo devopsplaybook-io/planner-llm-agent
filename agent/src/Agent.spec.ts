@@ -922,7 +922,7 @@ describe("Agent", () => {
     createAgent();
 
     const result = { observe: jest.fn() };
-    observableGauges["queue"](result);
+    observableGauges["tasks.queue"](result);
 
     expect(result.observe.mock.calls).toEqual([
       [0, { type: "tasks_queued" }],
@@ -966,7 +966,7 @@ describe("Agent", () => {
     // One task is being processed (default weight 1) and the second one is
     // waiting to be admitted by the scheduler.
     const result = { observe: jest.fn() };
-    observableGauges["queue"](result);
+    observableGauges["tasks.queue"](result);
 
     expect(result.observe.mock.calls).toEqual([
       [1, { type: "tasks_queued" }],
