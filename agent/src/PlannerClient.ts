@@ -54,6 +54,16 @@ export interface PlannerNote {
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type PlannerTaskJson = any;
 
+/**
+ * Sparse fieldsets requested for the poll: every field the pipeline needs
+ * (scheduling directives, evaluation prompt, session documents) and only
+ * the ones it needs — labels, checklist and dueDate are dropped because
+ * the PlannerTask mapping discards them anyway. The full default shape is
+ * still safe: the server only omits keys when fields is sent.
+ */
+const AGENT_TASK_FIELDS =
+  "id,projectId,title,description,status,priority,assignees,comments,attachments,dateCreated,dateUpdated";
+
 export class PlannerClient {
   private config: Config;
 
@@ -78,20 +88,22 @@ export class PlannerClient {
     }
   }
 
-  // When project ids are given, the fetch is scoped to them through the
-  // endpoint's comma-separated 'projectIds' filter: the poll payload then
-  // only carries the tasks of the projects the agent's actions cover
-  // instead of every project's full list.
+  // The poll is scoped server-side through the 'assigneeUserId' filter (all
+  // statuses, composing with 'projectIds') and slimmed through the
+  // 'fields' sparse fieldsets. The client-side assignee filter below is
+  // kept as a safety net: against a server that ignores 'assigneeUserId'
+  // (older deploy), a filter-less poll would hand the agent every
+  // human-assigned task in scope.
   public async listAssignedTasks(
     user: PlannerUser,
     projectIds?: string[],
   ): Promise<PlannerTask[]> {
     const span = OTelTracer().startSpan("planner-client.list-assigned-tasks");
     try {
-      const path =
-        projectIds && projectIds.length > 0
-          ? `/api/tasks?projectIds=${encodeURIComponent(projectIds.join(","))}`
-          : "/api/tasks";
+      let path = `/api/tasks?assigneeUserId=${encodeURIComponent(user.id)}&fields=${AGENT_TASK_FIELDS}`;
+      if (projectIds && projectIds.length > 0) {
+        path += `&projectIds=${encodeURIComponent(projectIds.join(","))}`;
+      }
       const body = await this.request(path, "GET", span);
       if (!Array.isArray(body)) {
         throw new Error("Planner tasks response is not a list");

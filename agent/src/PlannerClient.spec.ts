@@ -143,7 +143,7 @@ describe("PlannerClient", () => {
       },
     ]);
     expect(fetchMock).toHaveBeenCalledWith(
-      "http://planner.test:8080/api/tasks",
+      "http://planner.test:8080/api/tasks?assigneeUserId=user-1&fields=id,projectId,title,description,status,priority,assignees,comments,attachments,dateCreated,dateUpdated",
       expect.objectContaining({
         method: "GET",
         headers: expect.objectContaining({ "x-api-key": "test-api-key" }),
@@ -161,11 +161,39 @@ describe("PlannerClient", () => {
     ]);
 
     expect(fetchMock).toHaveBeenCalledWith(
-      "http://planner.test:8080/api/tasks?projectIds=p1%2Cp2",
+      "http://planner.test:8080/api/tasks?assigneeUserId=user-1&fields=id,projectId,title,description,status,priority,assignees,comments,attachments,dateCreated,dateUpdated&projectIds=p1%2Cp2",
       expect.objectContaining({
         method: "GET",
         headers: expect.objectContaining({ "x-api-key": "test-api-key" }),
       }),
+    );
+  });
+
+  it("should request every field the agent pipeline relies on", async () => {
+    fetchMock.mockResolvedValue(new Response(JSON.stringify([]), { status: 200 }));
+
+    const client = new PlannerClient(config);
+    await client.listAssignedTasks({ id: "user-1", name: "Didier" });
+
+    const url = fetchMock.mock.calls[0]![0] as string;
+    const fields = new URLSearchParams(url).get("fields") ?? "";
+    for (const required of [
+      "id",
+      "projectId",
+      "title",
+      "description",
+      "status",
+      "priority",
+      "assignees",
+      "comments",
+      "attachments",
+      "dateCreated",
+      "dateUpdated",
+    ]) {
+      expect(fields.split(",")).toContain(required);
+    }
+    expect(fetchMock.mock.calls[0]![0] as string).toContain(
+      "assigneeUserId=user-1",
     );
   });
 
