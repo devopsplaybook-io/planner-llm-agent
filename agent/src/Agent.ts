@@ -11,9 +11,15 @@ import { createCliAgent } from "./clients/CliAgentRegistry";
 import { prepareCliAgent, type CliAgentClient } from "./clients/CliAgent";
 import { resolveModel } from "./clients/BaseCliAgent";
 import { OTelLogger, OTelMeter } from "./OTelContext";
-import { PlannerClient, PlannerProject, PlannerTask } from "./PlannerClient";
+import {
+  PlannerClient,
+  PlannerProject,
+  PlannerTask,
+  PlannerTaskDependency,
+} from "./PlannerClient";
 import {
   DEFAULT_TASK_WEIGHT,
+  SchedulerDeferral,
   SchedulerOptions,
   SchedulerPick,
   SchedulerSelection,
@@ -293,11 +299,15 @@ export class Agent {
         await loadProjects();
       }
       // Only tasks matching an action are ready, and a task already being
-      // processed is never picked again by a subsequent poll. Every matching
+      // processed is never picked again by a subsequent poll. A task with a
+      // dependency that is not Done yet is never picked either: it is only
+      // reported as deferred (no status change, no error comment) and is
+      // picked up naturally once its dependencies complete. Every matching
       // (task, action) pair is a candidate; the scheduler then fills the
       // capacity budget from the candidates sorted by queue priority. The
       // budget is shared by every action.
       const candidates: SchedulerPickless[] = [];
+      const dependencyDeferrals: SchedulerDeferral[] = [];
       for (const action of actions) {
         for (const task of tasks) {
           if (
@@ -310,10 +320,18 @@ export class Agent {
           ) {
             continue;
           }
+          const blocking = blockingDependencies(task);
+          if (blocking.length > 0) {
+            dependencyDeferrals.push({
+              task,
+              reason: `dependency:${blocking[0].taskId}`,
+            });
+            continue;
+          }
           candidates.push({ task, action });
         }
       }
-      if (candidates.length === 0) {
+      if (candidates.length === 0 && dependencyDeferrals.length === 0) {
         this.queuedTasks = 0;
         return outcome;
       }
@@ -332,10 +350,18 @@ export class Agent {
       );
       if (this.isSmartSchedulingEnabled()) {
         outcome = "actionable";
-        await this.selectTasksWithScheduler(candidates, loadProjects);
+        await this.selectTasksWithScheduler(
+          candidates,
+          dependencyDeferrals,
+          loadProjects,
+        );
       } else {
         outcome = "actionable";
-        await this.selectTasksWithKillSwitch(candidates, loadProjects);
+        await this.selectTasksWithKillSwitch(
+          candidates,
+          dependencyDeferrals,
+          loadProjects,
+        );
       }
     } catch (error) {
       logger.error(
@@ -386,6 +412,7 @@ export class Agent {
   // pre-evaluation of the tasks without explicit hints.
   private async selectTasksWithScheduler(
     candidates: SchedulerPickless[],
+    dependencyDeferrals: SchedulerDeferral[],
     loadProjects: () => Promise<Map<string, PlannerProject>>,
   ): Promise<void> {
     // The project names feed the conflict keys, the utility-model prompt
@@ -418,8 +445,15 @@ export class Agent {
       ...options,
       evaluations,
     });
-    this.logSchedulingRound(selection);
-    this.queuedTasks = candidates.length - selection.picks.length;
+    // The dependency-gated tasks never reach the scheduler: they are merged
+    // into the deferrals so the scheduling round reports them like any other
+    // blocked task.
+    this.logSchedulingRound({
+      picks: selection.picks,
+      deferrals: [...dependencyDeferrals, ...selection.deferrals],
+    });
+    this.queuedTasks =
+      candidates.length + dependencyDeferrals.length - selection.picks.length;
     if (selection.picks.length === 0) {
       return;
     }
@@ -436,6 +470,7 @@ export class Agent {
   // ignored.
   private async selectTasksWithKillSwitch(
     candidates: SchedulerPickless[],
+    dependencyDeferrals: SchedulerDeferral[],
     loadProjects: () => Promise<Map<string, PlannerProject>>,
   ): Promise<void> {
     const tasksToProcess = selectTasksLegacy(
@@ -443,7 +478,10 @@ export class Agent {
       this.config.TASK_MAX_PARALLEL,
       this.processingTasks.size,
     );
-    this.queuedTasks = candidates.length - tasksToProcess.length;
+    // The kill-switch path keeps its historical silence about the scheduling
+    // rounds; the dependency-gated tasks are only counted in the queue gauge.
+    this.queuedTasks =
+      candidates.length + dependencyDeferrals.length - tasksToProcess.length;
     if (tasksToProcess.length === 0) {
       return;
     }
@@ -898,6 +936,9 @@ export class Agent {
       "",
       task.description.trim().length > 0 ? task.description : "*(empty)*",
       "",
+      // The dependencies section is only rendered when the task declares
+      // dependencies: the brief tells the agent what the task waits on.
+      ...dependencyBrief(task.dependencies),
       // The project section is only rendered when the project has a
       // description.
       ...(project !== null && project.description.trim().length > 0
@@ -1074,6 +1115,43 @@ function queuePriorityOf(task: PlannerTask, action: AgentAction): string {
 function dateUpdatedValue(dateUpdated: string): number {
   const time = Date.parse(dateUpdated);
   return Number.isNaN(time) ? Number.NEGATIVE_INFINITY : time;
+}
+
+// The dependencies that still block a task: only an explicit 'Done' status
+// satisfies a dependency (the only done-like status in the catalog, matching
+// the 'doneSince' and TASK_STATUS_CLEANUP semantics). A dependency without a
+// hydrated status blocks too: fail-closed, since the planner reports the
+// status of every existing dependency. An older server that omits the
+// dependencies field entirely gates nothing (it has no dependency data).
+export function blockingDependencies(
+  task: PlannerTask,
+): PlannerTaskDependency[] {
+  return (task.dependencies ?? []).filter(
+    (dependency) => dependency.status !== "Done",
+  );
+}
+
+// One line per dependency in the task brief: the current title and status
+// when the planner hydrated them, the id alone otherwise.
+function dependencyLines(dependencies: PlannerTaskDependency[]): string {
+  return dependencies
+    .map((dependency) => {
+      const title = dependency.title ?? dependency.taskId;
+      const status = dependency.status ?? "unknown";
+      return `- ${title} (${dependency.taskId}) — status: ${status}`;
+    })
+    .join("\n");
+}
+
+// The dependencies section of the task brief: empty unless the task
+// declares dependencies.
+function dependencyBrief(
+  dependencies: PlannerTaskDependency[] | undefined,
+): string[] {
+  if (!dependencies || dependencies.length === 0) {
+    return [];
+  }
+  return ["## Dependencies", "", dependencyLines(dependencies), ""];
 }
 
 // The comment posted on a task that failed to process: the explanation of

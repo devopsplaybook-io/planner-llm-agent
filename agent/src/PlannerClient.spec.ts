@@ -140,10 +140,11 @@ describe("PlannerClient", () => {
           },
         ],
         attachments: [],
+        dependencies: [],
       },
     ]);
     expect(fetchMock).toHaveBeenCalledWith(
-      "http://planner.test:8080/api/tasks?assigneeUserId=user-1&fields=id,projectId,title,description,status,priority,assignees,comments,attachments,dateCreated,dateUpdated",
+      "http://planner.test:8080/api/tasks?assigneeUserId=user-1&fields=id,projectId,title,description,status,priority,assignees,comments,attachments,dependencies,dateCreated,dateUpdated",
       expect.objectContaining({
         method: "GET",
         headers: expect.objectContaining({ "x-api-key": "test-api-key" }),
@@ -161,7 +162,7 @@ describe("PlannerClient", () => {
     ]);
 
     expect(fetchMock).toHaveBeenCalledWith(
-      "http://planner.test:8080/api/tasks?assigneeUserId=user-1&fields=id,projectId,title,description,status,priority,assignees,comments,attachments,dateCreated,dateUpdated&projectIds=p1%2Cp2",
+      "http://planner.test:8080/api/tasks?assigneeUserId=user-1&fields=id,projectId,title,description,status,priority,assignees,comments,attachments,dependencies,dateCreated,dateUpdated&projectIds=p1%2Cp2",
       expect.objectContaining({
         method: "GET",
         headers: expect.objectContaining({ "x-api-key": "test-api-key" }),
@@ -187,6 +188,7 @@ describe("PlannerClient", () => {
       "assignees",
       "comments",
       "attachments",
+      "dependencies",
       "dateCreated",
       "dateUpdated",
     ]) {
@@ -233,7 +235,46 @@ describe("PlannerClient", () => {
         dateUpdated: "2026-09-10T12:00:00.000Z",
         comments: [],
         attachments: [],
+        dependencies: [],
       },
+    ]);
+  });
+
+  it("should map task dependencies with their current title and status", async () => {
+    fetchMock.mockResolvedValue(
+      new Response(
+        JSON.stringify([
+          {
+            id: "task-1",
+            title: "Follow-up work",
+            status: "To Do",
+            comments: [],
+            assignees: [{ userId: "user-1" }],
+            dependencies: [
+              {
+                taskId: "task-2",
+                title: "First step",
+                status: "Done",
+              },
+              {
+                taskId: "task-3",
+              },
+            ],
+          },
+        ]),
+        { status: 200 },
+      ),
+    );
+
+    const client = new PlannerClient(config);
+    const tasks = await client.listAssignedTasks({
+      id: "user-1",
+      name: "Didier",
+    });
+
+    expect(tasks[0]!.dependencies).toEqual([
+      { taskId: "task-2", title: "First step", status: "Done" },
+      { taskId: "task-3", title: undefined, status: undefined },
     ]);
   });
 
@@ -286,6 +327,7 @@ describe("PlannerClient", () => {
             dateCreated: "2026-09-02T00:00:00.000Z",
           },
         ],
+        dependencies: [],
       },
     ]);
   });

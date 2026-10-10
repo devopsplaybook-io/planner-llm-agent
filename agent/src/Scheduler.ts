@@ -67,7 +67,7 @@ export interface SchedulerPick {
 
 export interface SchedulerDeferral {
   task: PlannerTask;
-  // 'capacity' or 'conflict:<key>'.
+  // 'capacity', 'conflict:<key>' or 'dependency:<taskId>'.
   reason: string;
 }
 
