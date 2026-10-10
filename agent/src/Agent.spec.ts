@@ -574,6 +574,132 @@ describe("Agent", () => {
     agent.stop();
   });
 
+  it("should not process a task whose dependencies are not Done", async () => {
+    let resolvePoll: (() => void) | undefined = undefined;
+    mockPlanner.listAssignedTasks.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolvePoll = () =>
+            resolve([
+              {
+                id: "task-1",
+                title: "Blocked work",
+                status: "To Do",
+                description: "Add a feature",
+                comments: [],
+                attachments: [],
+                dependencies: [
+                  { taskId: "task-2", title: "First step", status: "In Progress" },
+                ],
+              },
+            ]);
+        }),
+    );
+
+    const agent = createAgent();
+    agent.start();
+    await waitFor(() => mockPlanner.listAssignedTasks.mock.calls.length === 1);
+    resolvePoll!();
+    // The selection round loads the projects before reporting the deferrals.
+    await waitFor(() => mockPlanner.listProjects.mock.calls.length > 0);
+
+    expect(mockQoder.performTask).not.toHaveBeenCalled();
+    expect(mockPlanner.updateTaskStatus).not.toHaveBeenCalled();
+    expect(mockPlanner.addTaskComment).not.toHaveBeenCalled();
+    agent.stop();
+  });
+
+  it("should not process a task whose dependency has no hydrated status", async () => {
+    let resolvePoll: (() => void) | undefined = undefined;
+    mockPlanner.listAssignedTasks.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolvePoll = () =>
+            resolve([
+              {
+                id: "task-1",
+                title: "Blocked work",
+                status: "To Do",
+                description: "Add a feature",
+                comments: [],
+                attachments: [],
+                dependencies: [{ taskId: "task-2" }],
+              },
+            ]);
+        }),
+    );
+
+    const agent = createAgent();
+    agent.start();
+    await waitFor(() => mockPlanner.listAssignedTasks.mock.calls.length === 1);
+    resolvePoll!();
+    await waitFor(() => mockPlanner.listProjects.mock.calls.length > 0);
+
+    expect(mockQoder.performTask).not.toHaveBeenCalled();
+    expect(mockPlanner.updateTaskStatus).not.toHaveBeenCalled();
+    agent.stop();
+  });
+
+  it("should process a task whose dependencies are all Done", async () => {
+    mockPlanner.listAssignedTasks.mockResolvedValue([
+      {
+        id: "task-1",
+        title: "Unblocked work",
+        status: "To Do",
+        description: "Add a feature",
+        comments: [],
+        attachments: [],
+        dependencies: [
+          { taskId: "task-2", title: "First step", status: "Done" },
+        ],
+      },
+    ]);
+    mockQoder.performTask.mockResolvedValue("Feature implemented");
+
+    const agent = createAgent();
+    agent.start();
+    await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
+
+    expect(mockQoder.performTask).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "task-1" }),
+      path.join(dataDir, "tasks", "task-1-Agent.md"),
+      expect.objectContaining({ model: "", instruction: "" }),
+    );
+    expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith("task-1", "Done");
+    agent.stop();
+  });
+
+  it("should render the dependencies in the task notes file", async () => {
+    config.TASK_STATUS_CLEANUP = "Archived";
+    mockPlanner.listAssignedTasks.mockResolvedValue([
+      {
+        id: "task-1",
+        title: "Follow-up work",
+        status: "To Do",
+        description: "Add a feature",
+        comments: [],
+        attachments: [],
+        dependencies: [
+          { taskId: "task-2", title: "First step", status: "Done" },
+          { taskId: "task-3", status: "Done" },
+        ],
+      },
+    ]);
+    mockQoder.performTask.mockResolvedValue("Feature implemented");
+
+    const agent = createAgent();
+    agent.start();
+    await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
+
+    const notesFile = path.join(dataDir, "tasks", "task-1-Agent.md");
+    expect(await fse.pathExists(notesFile)).toBe(true);
+    const content = await fse.readFile(notesFile, "utf8");
+    expect(content).toContain("## Dependencies");
+    expect(content).toContain("- First step (task-2) — status: Done");
+    expect(content).toContain("- task-3 (task-3) — status: Done");
+    agent.stop();
+  });
+
   it("should write the task notes file with description and comments", async () => {
     config.TASK_STATUS_CLEANUP = "Archived";
     mockPlanner.listAssignedTasks.mockResolvedValue([

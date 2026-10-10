@@ -26,6 +26,12 @@ export interface PlannerTaskAttachment {
   dateCreated: string;
 }
 
+export interface PlannerTaskDependency {
+  taskId: string;
+  title?: string;
+  status?: string;
+}
+
 export interface PlannerTask {
   id: string;
   projectId: string;
@@ -36,6 +42,9 @@ export interface PlannerTask {
   dateUpdated: string;
   comments: PlannerTaskComment[];
   attachments: PlannerTaskAttachment[];
+  // Hydrated when the poll requests the dependencies field; optional so the
+  // consumers also tolerate the unmapped task shapes (tests, older servers).
+  dependencies?: PlannerTaskDependency[];
 }
 
 export interface PlannerProject {
@@ -56,13 +65,14 @@ type PlannerTaskJson = any;
 
 /**
  * Sparse fieldsets requested for the poll: every field the pipeline needs
- * (scheduling directives, evaluation prompt, session documents) and only
- * the ones it needs — labels, checklist and dueDate are dropped because
- * the PlannerTask mapping discards them anyway. The full default shape is
- * still safe: the server only omits keys when fields is sent.
+ * (scheduling directives, evaluation prompt, session documents, dependency
+ * gating) and only the ones it needs — labels, checklist and dueDate are
+ * dropped because the PlannerTask mapping discards them anyway. The full
+ * default shape is still safe: the server only omits keys when fields is
+ * sent.
  */
 const AGENT_TASK_FIELDS =
-  "id,projectId,title,description,status,priority,assignees,comments,attachments,dateCreated,dateUpdated";
+  "id,projectId,title,description,status,priority,assignees,comments,attachments,dependencies,dateCreated,dateUpdated";
 
 export class PlannerClient {
   private config: Config;
@@ -154,6 +164,17 @@ export class PlannerClient {
                   fileName: String(attachment.fileName),
                   filePath: String(attachment.filePath),
                   dateCreated: String(attachment.dateCreated),
+                }),
+              )
+            : [],
+          dependencies: Array.isArray(task.dependencies)
+            ? task.dependencies.map(
+                (dependency: PlannerTaskJson): PlannerTaskDependency => ({
+                  taskId: String(dependency.taskId),
+                  title: dependency.title ? String(dependency.title) : undefined,
+                  status: dependency.status
+                    ? String(dependency.status)
+                    : undefined,
                 }),
               )
             : [],
