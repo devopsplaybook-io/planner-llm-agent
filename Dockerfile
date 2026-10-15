@@ -10,7 +10,7 @@ RUN cd agent && \
     npm run build
 
 # RUN
-FROM ubuntu:24.04
+FROM ubuntu:26.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -63,7 +63,7 @@ RUN ARCH=$(dpkg --print-architecture) && \
     chmod +x /usr/local/bin/kubectl
 
 # Helm CLI (version pinned for reproducible builds, checksum verified)
-ARG HELM_VERSION=v4.3.0
+ARG HELM_VERSION=v4.3.1
 RUN ARCH=$(dpkg --print-architecture) && \
     curl -fsSL "https://get.helm.sh/helm-${HELM_VERSION}-linux-${ARCH}.tar.gz" -o /tmp/helm.tar.gz && \
     curl -fsSL "https://get.helm.sh/helm-${HELM_VERSION}-linux-${ARCH}.tar.gz.sha256sum" -o /tmp/helm.tar.gz.sha256sum && \
@@ -73,13 +73,13 @@ RUN ARCH=$(dpkg --print-architecture) && \
     rm -rf /tmp/helm.tar.gz /tmp/helm.tar.gz.sha256sum /tmp/linux-${ARCH}
 
 # yq
-ARG YQ_VERSION=v4.53.6
+ARG YQ_VERSION=v4.54.1
 RUN ARCH=$(dpkg --print-architecture) && \
     curl -fsSL "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_${ARCH}" -o /usr/local/bin/yq && \
     chmod +x /usr/local/bin/yq
 
 # Go
-ARG GO_VERSION=1.27.1
+ARG GO_VERSION=1.27.2
 RUN ARCH=$(dpkg --print-architecture) && \
     curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-${ARCH}.tar.gz" -o /tmp/go.tar.gz && \
     tar -C /usr/local -xzf /tmp/go.tar.gz && \
@@ -88,7 +88,7 @@ ENV PATH="/usr/local/go/bin:${PATH}"
 
 # Rust (rustup-init from the pinned release archive, toolchain pinned for
 # reproducible builds)
-ARG RUSTUP_VERSION=1.28.2
+ARG RUSTUP_VERSION=1.29.1
 ARG RUST_TOOLCHAIN=1.99.0
 ENV RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo \
@@ -107,11 +107,11 @@ RUN RUSTUP_ARCH=$(case "$(dpkg --print-architecture)" in \
 # default, the others are selected with AGENT_CLI: claude-code, copilot-cli,
 # codex, gemini-cli)
 RUN npm install -g \
-      @qoder-ai/qodercli@1.1.65 \
-      @anthropic-ai/claude-code@2.1.288 \
-      @github/copilot@1.0.91 \
-      @openai/codex@0.160.0 \
-      @google/gemini-cli@0.62.0
+      @qoder-ai/qodercli@1.1.71 \
+      @anthropic-ai/claude-code@2.1.300 \
+      @github/copilot@1.0.98 \
+      @openai/codex@0.162.1 \
+      @google/gemini-cli@0.64.0
 
 # Verify all tools are available
 RUN node --version && npm --version && git --version && gh --version && \
