@@ -332,6 +332,130 @@ describe("PlannerClient", () => {
     ]);
   });
 
+  it("should fetch a single task with its full shape", async () => {
+    fetchMock.mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          id: "task-1",
+          projectId: "p1",
+          title: "Fix the build",
+          status: "In Progress",
+          priority: "high",
+          description: "The build is broken",
+          dateUpdated: "2026-09-10T12:00:00.000Z",
+          comments: [
+            {
+              id: "comment-1",
+              userId: "user-2",
+              userName: "Alice",
+              text: "Please add tests",
+              dateCreated: "2026-09-02T00:00:00.000Z",
+            },
+          ],
+          attachments: [
+            {
+              id: "attachment-1",
+              fileName: "screenshot.png",
+              filePath: "/uploads/screenshot.png",
+              dateCreated: "2026-09-02T00:00:00.000Z",
+            },
+          ],
+          dependencies: [
+            { taskId: "task-2", title: "First step", status: "Done" },
+          ],
+        }),
+        { status: 200 },
+      ),
+    );
+
+    const client = new PlannerClient(config);
+    const task = await client.getTask("task-1");
+
+    expect(task).toEqual({
+      id: "task-1",
+      projectId: "p1",
+      title: "Fix the build",
+      status: "In Progress",
+      priority: "high",
+      description: "The build is broken",
+      dateUpdated: "2026-09-10T12:00:00.000Z",
+      comments: [
+        {
+          id: "comment-1",
+          userId: "user-2",
+          userName: "Alice",
+          text: "Please add tests",
+          dateCreated: "2026-09-02T00:00:00.000Z",
+        },
+      ],
+      attachments: [
+        {
+          id: "attachment-1",
+          fileName: "screenshot.png",
+          filePath: "/uploads/screenshot.png",
+          dateCreated: "2026-09-02T00:00:00.000Z",
+        },
+      ],
+      dependencies: [
+        { taskId: "task-2", title: "First step", status: "Done" },
+      ],
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://planner.test:8080/api/tasks/task-1",
+      expect.objectContaining({
+        method: "GET",
+        headers: expect.objectContaining({ "x-api-key": "test-api-key" }),
+      }),
+    );
+  });
+
+  it("should apply the missing-field defaults when fetching a single task", async () => {
+    fetchMock.mockResolvedValue(
+      new Response(
+        JSON.stringify({ id: "task-1", title: "Minimal", status: "To Do" }),
+        { status: 200 },
+      ),
+    );
+
+    const client = new PlannerClient(config);
+    const task = await client.getTask("task-1");
+
+    expect(task).toEqual({
+      id: "task-1",
+      projectId: "",
+      title: "Minimal",
+      status: "To Do",
+      priority: "medium",
+      description: "",
+      dateUpdated: "",
+      comments: [],
+      attachments: [],
+      dependencies: [],
+    });
+  });
+
+  it("should throw a clear error when fetching a missing task", async () => {
+    fetchMock.mockResolvedValue(
+      new Response(JSON.stringify({ error: "Not found" }), { status: 404 }),
+    );
+
+    const client = new PlannerClient(config);
+    await expect(client.getTask("task-1")).rejects.toThrow(
+      "Planner request to '/api/tasks/task-1' failed with status 404",
+    );
+  });
+
+  it("should throw a clear error when the single-task response is invalid", async () => {
+    fetchMock.mockResolvedValue(
+      new Response(JSON.stringify({ error: "boom" }), { status: 200 }),
+    );
+
+    const client = new PlannerClient(config);
+    await expect(client.getTask("task-1")).rejects.toThrow(
+      "Planner task response is missing the task id",
+    );
+  });
+
   it("should download a task attachment", async () => {
     fetchMock.mockResolvedValue(
       new Response(Buffer.from("file-content"), { status: 200 }),

@@ -49,6 +49,7 @@ const observableGauges = (
 const mockPlanner = {
   getCurrentUser: jest.fn(),
   listAssignedTasks: jest.fn(),
+  getTask: jest.fn(),
   listProjects: jest.fn(),
   addTaskComment: jest.fn(),
   updateTaskStatus: jest.fn(),
@@ -172,6 +173,7 @@ describe("Agent", () => {
     for (const mock of [
       mockPlanner.getCurrentUser,
       mockPlanner.listAssignedTasks,
+      mockPlanner.getTask,
       mockPlanner.listProjects,
       mockPlanner.addTaskComment,
       mockPlanner.updateTaskStatus,
@@ -192,6 +194,25 @@ describe("Agent", () => {
       name: "Test User",
     });
     mockPlanner.listAssignedTasks.mockResolvedValue([]);
+    // Default getTask: mirrors the task as the last poll saw it, so the
+    // new-comment check of every processed task sees no new comments.
+    // Overridden per test when a new-comment scenario is exercised.
+    mockPlanner.getTask.mockImplementation(async (taskId: string) => {
+      const tasks = (await mockPlanner.listAssignedTasks()) as {
+        id: string;
+        comments?: Record<string, unknown>[];
+      }[];
+      const task = tasks.find((candidate) => candidate.id === taskId);
+      if (!task) {
+        throw new Error(
+          `Planner request to '/api/tasks/${taskId}' failed with status 404`,
+        );
+      }
+      return {
+        ...task,
+        comments: (task.comments ?? []).map((comment) => ({ ...comment })),
+      };
+    });
     mockPlanner.listProjects.mockResolvedValue([]);
   });
 
@@ -3095,6 +3116,431 @@ describe("Agent", () => {
     await waitFor(() => mockQoder.performTask.mock.calls.length === 1);
     await new Promise((resolve) => setTimeout(resolve, 1500));
     expect(mockQoder.performTask).toHaveBeenCalledTimes(1);
+    agent.stop();
+  });
+
+  it("should finalize the task without an adjustment pass when no new comments arrived", async () => {
+    config.TASK_ADJUSTMENT_MAX_ROUNDS = 2;
+    mockPlanner.listAssignedTasks.mockResolvedValue([
+      {
+        id: "task-1",
+        title: "Implement feature",
+        status: "To Do",
+        description: "Add a feature",
+        comments: [],
+        attachments: [],
+      },
+    ]);
+    mockQoder.performTask.mockResolvedValue("Feature implemented");
+
+    const agent = createAgent();
+    agent.start();
+    await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
+
+    expect(mockQoder.performTask).toHaveBeenCalledTimes(1);
+    expect(mockPlanner.getTask).toHaveBeenCalledTimes(1);
+    expect(mockPlanner.addTaskComment).toHaveBeenCalledWith(
+      "task-1",
+      "Feature implemented",
+    );
+    expect(mockPlanner.updateTaskStatus).toHaveBeenCalledTimes(1);
+    expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith("task-1", "Done");
+    agent.stop();
+  });
+
+  it("should re-run the CLI with the new comments before finalizing when a human comments during the run", async () => {
+    config.TASK_STATUS_CLEANUP = "Archived";
+    const notesFile = path.join(dataDir, "tasks", "task-1-Agent.md");
+    await fse.ensureDir(path.dirname(notesFile));
+    await fse.writeFile(
+      notesFile,
+      [
+        "# Task: Implement feature",
+        "",
+        AGENT_NOTES_MARKER,
+        "",
+        "## Agent Notes",
+        "",
+        "Notes from a previous run",
+      ].join("\n"),
+    );
+    mockPlanner.listAssignedTasks.mockResolvedValue([
+      {
+        id: "task-1",
+        title: "Implement feature",
+        status: "To Do",
+        description: "Add a feature",
+        comments: [
+          {
+            id: "comment-old",
+            userId: "user-2",
+            userName: "Alice",
+            text: "Start with the tests",
+            dateCreated: "2026-10-14T00:00:00.000Z",
+          },
+        ],
+        attachments: [],
+      },
+    ]);
+    // A human comment arrives while the CLI runs: the fresh fetch sees it.
+    mockPlanner.getTask.mockResolvedValue({
+      id: "task-1",
+      projectId: "",
+      title: "Implement feature",
+      status: "To Do",
+      priority: "medium",
+      description: "Add a feature",
+      dateUpdated: "2026-10-15T01:00:00.000Z",
+      comments: [
+        {
+          id: "comment-old",
+          userId: "user-2",
+          userName: "Alice",
+          text: "Start with the tests",
+          dateCreated: "2026-10-14T00:00:00.000Z",
+        },
+        {
+          id: "comment-new",
+          userId: "user-2",
+          userName: "Alice",
+          text: "Please also update the docs",
+          dateCreated: "2026-10-15T00:30:00.000Z",
+        },
+      ],
+      attachments: [],
+      dependencies: [],
+    });
+    mockQoder.performTask
+      .mockResolvedValueOnce("First run summary")
+      .mockResolvedValueOnce("Adjusted summary");
+
+    const agent = createAgent();
+    agent.start();
+    await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
+
+    expect(mockQoder.performTask).toHaveBeenCalledTimes(2);
+    const secondOptions = mockQoder.performTask.mock.calls[1]![2] as {
+      instruction: string;
+    };
+    expect(secondOptions.instruction).toContain(
+      "New comments were posted on this task after your previous run",
+    );
+    expect(secondOptions.instruction).toContain(
+      "**Alice** (2026-10-15T00:30:00.000Z): Please also update the docs",
+    );
+    const content = await fse.readFile(notesFile, "utf8");
+    expect(content).toContain("Please also update the docs");
+    expect(content).toContain("Notes from a previous run");
+    expect(mockPlanner.addTaskComment).toHaveBeenCalledWith(
+      "task-1",
+      "Adjusted summary",
+    );
+    expect(mockPlanner.updateTaskStatus).toHaveBeenCalledTimes(1);
+    expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith("task-1", "Done");
+    agent.stop();
+  });
+
+  it("should not count the agent's own comments as new messages", async () => {
+    mockPlanner.listAssignedTasks.mockResolvedValue([
+      {
+        id: "task-1",
+        title: "Implement feature",
+        status: "To Do",
+        description: "Add a feature",
+        comments: [],
+        attachments: [],
+      },
+    ]);
+    // The agent's start comment (its own Planner user) is the only new one.
+    mockPlanner.getTask.mockResolvedValue({
+      id: "task-1",
+      projectId: "",
+      title: "Implement feature",
+      status: "To Do",
+      priority: "medium",
+      description: "Add a feature",
+      dateUpdated: "2026-10-15T01:00:00.000Z",
+      comments: [
+        {
+          id: "comment-agent",
+          userId: "user-1",
+          userName: "Test User",
+          text: "Agent 'planner-llm-agent' started working on this task.",
+          dateCreated: "2026-10-15T00:30:00.000Z",
+        },
+      ],
+      attachments: [],
+      dependencies: [],
+    });
+    mockQoder.performTask.mockResolvedValue("Feature implemented");
+
+    const agent = createAgent();
+    agent.start();
+    await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
+
+    expect(mockQoder.performTask).toHaveBeenCalledTimes(1);
+    expect(mockPlanner.addTaskComment).toHaveBeenCalledWith(
+      "task-1",
+      "Feature implemented",
+    );
+    agent.stop();
+  });
+
+  it("should finalize the task as-is when the new-comment check fails", async () => {
+    mockPlanner.listAssignedTasks.mockResolvedValue([
+      {
+        id: "task-1",
+        title: "Implement feature",
+        status: "To Do",
+        description: "Add a feature",
+        comments: [],
+        attachments: [],
+      },
+    ]);
+    mockPlanner.getTask.mockRejectedValue(
+      new Error(
+        "Planner request to '/api/tasks/task-1' failed with status 500",
+      ),
+    );
+    mockQoder.performTask.mockResolvedValue("Feature implemented");
+
+    const agent = createAgent();
+    agent.start();
+    await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
+
+    expect(mockQoder.performTask).toHaveBeenCalledTimes(1);
+    expect(mockPlanner.addTaskComment).toHaveBeenCalledWith(
+      "task-1",
+      "Feature implemented",
+    );
+    expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith("task-1", "Done");
+    expect(
+      logSpy.mock.calls.some((call) =>
+        String(call[0]).includes(
+          "Failed to check task 'Implement feature' (task-1) for new comments",
+        ),
+      ),
+    ).toBe(true);
+    agent.stop();
+  });
+
+  it("should bound the adjustment rounds by TASK_ADJUSTMENT_MAX_ROUNDS", async () => {
+    config.TASK_ADJUSTMENT_MAX_ROUNDS = 2;
+    mockPlanner.listAssignedTasks.mockResolvedValue([
+      {
+        id: "task-1",
+        title: "Implement feature",
+        status: "To Do",
+        description: "Add a feature",
+        comments: [],
+        attachments: [],
+      },
+    ]);
+    // A new human comment every time the task is re-fetched.
+    let fetchRound = 0;
+    mockPlanner.getTask.mockImplementation(async () => {
+      fetchRound++;
+      return {
+        id: "task-1",
+        projectId: "",
+        title: "Implement feature",
+        status: "To Do",
+        priority: "medium",
+        description: "Add a feature",
+        dateUpdated: `2026-10-15T0${fetchRound}:00:00.000Z`,
+        comments: [
+          {
+            id: `comment-during-${fetchRound}`,
+            userId: "user-2",
+            userName: "Alice",
+            text: `Message ${fetchRound}`,
+            dateCreated: `2026-10-15T0${fetchRound}:00:00.000Z`,
+          },
+        ],
+        attachments: [],
+        dependencies: [],
+      };
+    });
+    mockQoder.performTask.mockImplementation(async () => {
+      return `Summary after call ${mockQoder.performTask.mock.calls.length}`;
+    });
+
+    const agent = createAgent();
+    agent.start();
+    await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
+
+    expect(mockQoder.performTask).toHaveBeenCalledTimes(3);
+    expect(mockPlanner.getTask).toHaveBeenCalledTimes(3);
+    expect(mockPlanner.addTaskComment).toHaveBeenCalledWith(
+      "task-1",
+      "Summary after call 3",
+    );
+    expect(
+      logSpy.mock.calls.some((call) =>
+        String(call[0]).includes("adjustment budget of 2 round(s)"),
+      ),
+    ).toBe(true);
+    agent.stop();
+  });
+
+  it("should not re-run the CLI when TASK_ADJUSTMENT_MAX_ROUNDS is 0", async () => {
+    config.TASK_ADJUSTMENT_MAX_ROUNDS = 0;
+    mockPlanner.listAssignedTasks.mockResolvedValue([
+      {
+        id: "task-1",
+        title: "Implement feature",
+        status: "To Do",
+        description: "Add a feature",
+        comments: [],
+        attachments: [],
+      },
+    ]);
+    mockPlanner.getTask.mockResolvedValue({
+      id: "task-1",
+      projectId: "",
+      title: "Implement feature",
+      status: "To Do",
+      priority: "medium",
+      description: "Add a feature",
+      dateUpdated: "2026-10-15T01:00:00.000Z",
+      comments: [
+        {
+          id: "comment-new",
+          userId: "user-2",
+          userName: "Alice",
+          text: "A late message",
+          dateCreated: "2026-10-15T00:30:00.000Z",
+        },
+      ],
+      attachments: [],
+      dependencies: [],
+    });
+    mockQoder.performTask.mockResolvedValue("Feature implemented");
+
+    const agent = createAgent();
+    agent.start();
+    await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
+
+    expect(mockQoder.performTask).toHaveBeenCalledTimes(1);
+    expect(mockPlanner.getTask).toHaveBeenCalledTimes(1);
+    expect(mockPlanner.addTaskComment).toHaveBeenCalledWith(
+      "task-1",
+      "Feature implemented",
+    );
+    expect(
+      logSpy.mock.calls.some((call) =>
+        String(call[0]).includes("adjustment budget of 0 round(s)"),
+      ),
+    ).toBe(true);
+    agent.stop();
+  });
+
+  it("should move the task to the error status when an adjustment run fails", async () => {
+    mockPlanner.listAssignedTasks.mockResolvedValue([
+      {
+        id: "task-1",
+        title: "Implement feature",
+        status: "To Do",
+        description: "Add a feature",
+        comments: [],
+        attachments: [],
+      },
+    ]);
+    mockPlanner.getTask.mockResolvedValue({
+      id: "task-1",
+      projectId: "",
+      title: "Implement feature",
+      status: "To Do",
+      priority: "medium",
+      description: "Add a feature",
+      dateUpdated: "2026-10-15T01:00:00.000Z",
+      comments: [
+        {
+          id: "comment-new",
+          userId: "user-2",
+          userName: "Alice",
+          text: "A late message",
+          dateCreated: "2026-10-15T00:30:00.000Z",
+        },
+      ],
+      attachments: [],
+      dependencies: [],
+    });
+    mockQoder.performTask
+      .mockResolvedValueOnce("First run summary")
+      .mockRejectedValueOnce(new Error("Adjustment run failed"));
+
+    const agent = createAgent();
+    agent.start();
+    await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
+
+    expect(mockQoder.performTask).toHaveBeenCalledTimes(2);
+    expect(mockPlanner.addTaskComment).toHaveBeenCalledWith(
+      "task-1",
+      expect.stringContaining("Task processing failed:"),
+    );
+    expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith("task-1", "Done");
+    agent.stop();
+  });
+
+  it("should record the last summary and the fresh content version in the finalization store", async () => {
+    const store = new FinalizationStore({ retryBaseMs: 60000 });
+    mockPlanner.listAssignedTasks.mockResolvedValue([
+      {
+        id: "task-1",
+        title: "Implement feature",
+        status: "To Do",
+        description: "Add a feature",
+        comments: [],
+        attachments: [],
+      },
+    ]);
+    mockPlanner.getTask.mockResolvedValue({
+      id: "task-1",
+      projectId: "",
+      title: "Implement feature",
+      status: "To Do",
+      priority: "medium",
+      description: "Add a feature",
+      dateUpdated: "2026-10-15T01:00:00.000Z",
+      comments: [
+        {
+          id: "comment-new",
+          userId: "user-2",
+          userName: "Alice",
+          text: "A late message",
+          dateCreated: "2026-10-15T00:30:00.000Z",
+        },
+      ],
+      attachments: [],
+      dependencies: [],
+    });
+    mockQoder.performTask
+      .mockResolvedValueOnce("First run summary")
+      .mockResolvedValueOnce("Adjusted summary");
+    // The summary comment POST fails so the record stays inspectable.
+    let summaryAttempts = 0;
+    mockPlanner.addTaskComment.mockImplementation(
+      async (_id: string, text: string) => {
+        if (text === "Adjusted summary") {
+          summaryAttempts++;
+          if (summaryAttempts === 1) {
+            throw new Error("Planner is down");
+          }
+        }
+      },
+    );
+
+    const agent = createAgent(WILDCARD_ACTIONS, store);
+    agent.start();
+    await waitFor(
+      () => store.has("task-1") && store.get("task-1")!.attempts >= 1,
+      5000,
+    );
+
+    const record = store.get("task-1")!;
+    expect(record.summary).toBe("Adjusted summary");
+    expect(record.contentVersion).toBe("2026-10-15T01:00:00.000Z");
     agent.stop();
   });
 });

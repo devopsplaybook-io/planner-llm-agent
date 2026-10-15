@@ -36,6 +36,7 @@ describe("Config", () => {
       expect(config.TASK_MAX_PARALLEL).toBe(1);
       expect(config.TASK_SMART_SCHEDULING).toBe(true);
       expect(config.TASK_CONFLICT_MODE).toBe("repo");
+      expect(config.TASK_ADJUSTMENT_MAX_ROUNDS).toBe(2);
       expect(config.AGENT_UTILITY_MODEL).toBe("");
       expect(config.GITHUB_TOKENS).toBe("");
       expect(config.AGENT_CLI).toBe("qoder");
@@ -164,6 +165,27 @@ describe("Config", () => {
       expect(config.TASK_SMART_SCHEDULING).toBe(true);
       expect(config.TASK_CONFLICT_MODE).toBe("none");
       expect(config.AGENT_UTILITY_MODEL).toBe("env-utility-model");
+
+      await fs.remove(tmpDir);
+    });
+
+    it("should load the new-comment adjustment budget from the config file and environment", async () => {
+      const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-config-"));
+      const configFile = path.join(tmpDir, "config.json");
+      await fs.writeJson(configFile, {
+        TASK_ADJUSTMENT_MAX_ROUNDS: 1,
+      });
+      process.env.CONFIG_FILE = configFile;
+
+      const config = new Config();
+      await config.reload();
+      // The kill switch (0) is a valid configured value.
+      expect(config.TASK_ADJUSTMENT_MAX_ROUNDS).toBe(1);
+      process.env.TASK_ADJUSTMENT_MAX_ROUNDS = "0";
+
+      const envConfig = new Config();
+      await envConfig.reload();
+      expect(envConfig.TASK_ADJUSTMENT_MAX_ROUNDS).toBe(0);
 
       await fs.remove(tmpDir);
     });
@@ -345,6 +367,17 @@ describe("Config", () => {
       const errors = config.validate();
       expect(errors).toEqual([
         "TASK_TIMEOUT must be a positive integer (current value: '0')",
+      ]);
+    });
+
+    it("should report an invalid TASK_ADJUSTMENT_MAX_ROUNDS", () => {
+      const config = new Config();
+      config.PLANNER_API_KEY = "key";
+      config.TASK_ADJUSTMENT_MAX_ROUNDS = -1;
+
+      const errors = config.validate();
+      expect(errors).toEqual([
+        "TASK_ADJUSTMENT_MAX_ROUNDS must be a non-negative integer (current value: '-1')",
       ]);
     });
 
