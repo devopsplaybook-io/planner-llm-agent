@@ -15,9 +15,14 @@ import { CLI_AGENT_NAMES } from "./Config";
  * tasks of this action in the weighted budget (see the Scheduler module);
  * null falls back to the default weight. The statusError is the status a
  * failed task is moved to; when not set it falls back to the actions
- * default status error, then to the end status. The priority is the queue
- * priority of the tasks of this action; when not set the task's own
- * Planner priority applies.
+ * default status error, then to the end status. The statusInProgress is the
+ * optional status a task is moved to while it is being processed; when not
+ * set it falls back to the actions default status in progress (no
+ * transition when neither is set). The statusAbort is the optional status
+ * that cancels a running task when a user moves the task to it on Planner;
+ * when not set it falls back to the actions default status abort. The
+ * priority is the queue priority of the tasks of this action; when not set
+ * the task's own Planner priority applies.
  */
 export interface AgentAction {
   project: string;
@@ -25,6 +30,8 @@ export interface AgentAction {
   statusEnd: string;
   agent?: string;
   statusError?: string;
+  statusInProgress?: string;
+  statusAbort?: string;
   priority?: string;
   model: string;
   instruction: string;
@@ -35,15 +42,19 @@ export interface AgentAction {
 /**
  * The agent actions configuration: the default model applied to the
  * actions without their own model, the default task timeout (seconds)
- * applied to the actions without their own timeout, the default error
- * status applied to the actions without their own status error, and the
- * actions themselves.
+ * applied to the actions without their own timeout, the default statuses
+ * applied to the actions without their own status error / in-progress /
+ * abort status, the named instruction templates the actions can reference,
+ * and the actions themselves.
  */
 export interface AgentActionsConfig {
   defaultAgent?: string;
   defaultModel: string;
   defaultStatusError?: string;
+  defaultStatusInProgress?: string;
+  defaultStatusAbort?: string;
   defaultTimeout: number | null;
+  instructions?: Record<string, string>;
   actions: AgentAction[];
 }
 
@@ -51,30 +62,40 @@ export interface AgentActionsConfig {
  * Parses and validates the agent actions YAML content. The format is
  * checked strictly so a misconfiguration fails fast at startup:
  *
+ * instructions:
+ *   <template name>: <instruction text>
  * default:
  *   agent: <CLI agent name>
  *   model: <model name>
  *   timeout: <seconds>
  *   status_error: <status name>
+ *   status_in_progress: <status name>
+ *   status_abort: <status name>
  * actions:
  *   - project: <project pattern>
  *     status_start: <status name>
  *     status_end: <status name>
  *     status_error: <status name>
+ *     status_in_progress: <status name>
+ *     status_abort: <status name>
  *     agent: <CLI agent name>
  *     model: <model name>
- *     instruction: <instruction>
+ *     instruction: <instruction or template name>
  *     timeout: <seconds>
  *     weight: <number>
  *     priority: <high|medium|low>
  *
  * 'default' and per-action 'agent'/'model'/'instruction'/'timeout'/'weight'/
- * 'status_error'/'priority' are optional; 'project' is optional too: a
- * missing, null or
+ * 'status_error'/'status_in_progress'/'status_abort'/'priority' are
+ * optional; 'project' is optional too: a missing, null or
  * empty project matches any project, and a non-empty project is a glob
- * pattern where '*' matches any sequence of characters. Everything else is
- * required and unknown fields are rejected. Throws an Error listing every
- * problem found when the configuration is invalid.
+ * pattern where '*' matches any sequence of characters. The optional
+ * 'instructions' root mapping defines named instruction templates: an
+ * action 'instruction' value that exactly matches a template name resolves
+ * to the template content, any other value is used verbatim as an inline
+ * instruction. Everything else is required and unknown fields are rejected.
+ * Throws an Error listing every problem found when the configuration is
+ * invalid.
  */
 export function parseAgentActions(content: string): AgentActionsConfig {
   let parsed: unknown;
@@ -102,6 +123,11 @@ export function parseAgentActions(content: string): AgentActionsConfig {
     actions: [],
   };
 
+  const instructions = readInstructions(root, errors);
+  if (instructions !== null) {
+    config.instructions = instructions;
+  }
+
   if (root.default !== undefined) {
     if (
       typeof root.default !== "object" ||
@@ -116,7 +142,9 @@ export function parseAgentActions(content: string): AgentActionsConfig {
           key !== "agent" &&
           key !== "model" &&
           key !== "timeout" &&
-          key !== "status_error"
+          key !== "status_error" &&
+          key !== "status_in_progress" &&
+          key !== "status_abort"
         ) {
           errors.push(`Unknown 'default' field '${key}'`);
         }
@@ -157,6 +185,26 @@ export function parseAgentActions(content: string): AgentActionsConfig {
       if (statusError !== null) {
         config.defaultStatusError = statusError;
       }
+      const statusInProgress = readString(
+        defaults,
+        "status_in_progress",
+        "default.status_in_progress",
+        errors,
+        true,
+      );
+      if (statusInProgress !== null) {
+        config.defaultStatusInProgress = statusInProgress;
+      }
+      const statusAbort = readString(
+        defaults,
+        "status_abort",
+        "default.status_abort",
+        errors,
+        true,
+      );
+      if (statusAbort !== null) {
+        config.defaultStatusAbort = statusAbort;
+      }
     }
   }
 
@@ -179,6 +227,8 @@ export function parseAgentActions(content: string): AgentActionsConfig {
             "status_start",
             "status_end",
             "status_error",
+            "status_in_progress",
+            "status_abort",
             "agent",
             "model",
             "instruction",
@@ -211,6 +261,20 @@ export function parseAgentActions(content: string): AgentActionsConfig {
         action,
         "status_error",
         `actions[${index}].status_error`,
+        errors,
+        true,
+      );
+      const statusInProgress = readString(
+        action,
+        "status_in_progress",
+        `actions[${index}].status_in_progress`,
+        errors,
+        true,
+      );
+      const statusAbort = readString(
+        action,
+        "status_abort",
+        `actions[${index}].status_abort`,
         errors,
         true,
       );
@@ -268,10 +332,12 @@ export function parseAgentActions(content: string): AgentActionsConfig {
           statusStart: statusStart,
           statusEnd: statusEnd,
           ...(statusError === null ? {} : { statusError }),
+          ...(statusInProgress === null ? {} : { statusInProgress }),
+          ...(statusAbort === null ? {} : { statusAbort }),
           ...(agent === null ? {} : { agent }),
           ...(priority === null ? {} : { priority }),
           model: model ?? "",
-          instruction: instruction ?? "",
+          instruction: resolveInstruction(instruction, instructions) ?? "",
           timeout: timeout,
           weight: weight,
         });
@@ -485,4 +551,46 @@ function readPositiveWeight(
     return null;
   }
   return value;
+}
+
+// Reads the optional top-level instruction templates: a mapping of template
+// names to instruction texts. A missing or null 'instructions' key reports
+// 'not set' (null); a non-mapping value or an empty/blank template always
+// produces a validation error so typos fail fast at startup.
+function readInstructions(
+  root: Record<string, unknown>,
+  errors: string[],
+): Record<string, string> | null {
+  const value = root.instructions;
+  if (value === undefined || value === null) {
+    return null;
+  }
+  if (typeof value !== "object" || Array.isArray(value)) {
+    errors.push(
+      "'instructions' must be a mapping of template names to instruction texts",
+    );
+    return null;
+  }
+  const templates: Record<string, string> = {};
+  for (const [name, content] of Object.entries(value as Record<string, unknown>)) {
+    if (typeof content !== "string" || content.trim().length === 0) {
+      errors.push(`'instructions.${name}' must be a non-empty string`);
+      continue;
+    }
+    templates[name] = content.trim();
+  }
+  return Object.keys(templates).length > 0 ? templates : null;
+}
+
+// An action instruction that exactly matches a template name resolves to
+// the template content; any other value is used verbatim as an inline
+// instruction (backward compatible).
+function resolveInstruction(
+  instruction: string | null,
+  templates: Record<string, string> | null,
+): string | null {
+  if (instruction === null || templates === null) {
+    return instruction;
+  }
+  return templates[instruction] ?? instruction;
 }

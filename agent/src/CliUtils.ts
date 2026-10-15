@@ -19,11 +19,32 @@ export interface RunCliOptions extends ExecFileOptionsWithStringEncoding {
   // stdin is the shell-free way to feed secret values (e.g. the GPG
   // passphrase) to argument-array commands.
   input?: string;
+  // Aborting the run: when the signal aborts, the command is killed (the
+  // whole process group when killProcessGroup is set, the direct child
+  // otherwise) and the promise rejects with a CliAbortedError. An already
+  // aborted signal rejects the promise without spawning the command.
+  abortSignal?: AbortSignal;
 }
 
-// Grace period between the SIGTERM and the SIGKILL sent to a timed-out
+// Grace period between the SIGTERM and the SIGKILL sent to an aborted
 // process group, so a SIGTERM-trapping CLI can still shut down cleanly.
 export const PROCESS_GROUP_KILL_GRACE_MS = 10000;
+
+/**
+ * Error rejecting an aborted CLI run (user-requested abort through an
+ * AbortSignal). Carrying a dedicated name lets the callers tell an abort
+ * apart from a timeout or a CLI failure without unwrapping causes.
+ */
+export class CliAbortedError extends Error {
+  constructor(message: string = "Command aborted") {
+    super(message);
+    this.name = "CliAbortedError";
+  }
+}
+
+export function isCliAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === "CliAbortedError";
+}
 
 // Process groups of the detached CLI runs currently alive: registered when
 // the run starts, deregistered when its execFile callback settles. The
@@ -77,6 +98,10 @@ export function runCli(
   args: string[],
   options: RunCliOptions,
 ): Promise<{ stdout: string; stderr: string }> {
+  // An already aborted signal rejects without spawning the command.
+  if (options.abortSignal?.aborted) {
+    return Promise.reject(new CliAbortedError());
+  }
   if (
     options.killProcessGroup === true &&
     process.platform !== "win32" &&
@@ -89,9 +114,14 @@ export function runCli(
   delete execOptions.killProcessGroup;
   const input = execOptions.input;
   delete execOptions.input;
+  const abortSignal = execOptions.abortSignal;
+  delete execOptions.abortSignal;
   return new Promise((resolve, reject) => {
+    let aborted = false;
     const child = execFile(command, args, execOptions, (error, stdout, stderr) => {
-      if (error) {
+      if (aborted) {
+        reject(new CliAbortedError());
+      } else if (error) {
         reject(attachCliOutput(error, stdout, stderr));
       } else {
         resolve({ stdout: stdout, stderr: stderr });
@@ -99,6 +129,16 @@ export function runCli(
     });
     if (input !== undefined) {
       writeToStdin(child, input);
+    }
+    if (abortSignal) {
+      abortSignal.addEventListener(
+        "abort",
+        () => {
+          aborted = true;
+          child.kill("SIGTERM");
+        },
+        { once: true },
+      );
     }
   });
 }
@@ -142,8 +182,10 @@ function runCliWithProcessGroupKill(
 ): Promise<{ stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
     let timedOut = false;
+    let aborted = false;
     let terminateTimer: NodeJS.Timeout | undefined;
     let killTimer: NodeJS.Timeout | undefined;
+    let abortKillTimer: NodeJS.Timeout | undefined;
 
     const clearTimers = () => {
       if (terminateTimer) {
@@ -154,6 +196,10 @@ function runCliWithProcessGroupKill(
         clearTimeout(killTimer);
         killTimer = undefined;
       }
+      if (abortKillTimer) {
+        clearTimeout(abortKillTimer);
+        abortKillTimer = undefined;
+      }
     };
 
     const execOptions = { ...options };
@@ -163,6 +209,8 @@ function runCliWithProcessGroupKill(
     delete execOptions.timeout;
     const input = execOptions.input;
     delete execOptions.input;
+    const abortSignal = execOptions.abortSignal;
+    delete execOptions.abortSignal;
     // 'detached' is accepted by execFile at runtime (the options are
     // forwarded to spawn) but is missing from its TypeScript overloads.
     // The callback reads the pid through a holder: it can fire
@@ -179,7 +227,9 @@ function runCliWithProcessGroupKill(
         if (typeof pid === "number") {
           liveProcessGroups.delete(pid);
         }
-        if (timedOut) {
+        if (aborted) {
+          reject(new CliAbortedError());
+        } else if (timedOut) {
           // Preserve the killed-by-timeout semantics of execFile's built-in
           // timeout so callers keep reporting a timeout error.
           const timeoutError = (error ??
@@ -213,6 +263,24 @@ function runCliWithProcessGroupKill(
         killTimer.unref();
       }, options.timeout);
       terminateTimer.unref();
+      // The abort kills the whole process group too (SIGTERM, then SIGKILL
+      // after the grace period), so the CLI children cannot survive the
+      // user-requested cancellation either.
+      abortSignal?.addEventListener(
+        "abort",
+        () => {
+          if (settled) {
+            return;
+          }
+          aborted = true;
+          signalProcessGroup(pgid, "SIGTERM");
+          abortKillTimer = setTimeout(() => {
+            signalProcessGroup(pgid, "SIGKILL");
+          }, PROCESS_GROUP_KILL_GRACE_MS);
+          abortKillTimer.unref();
+        },
+        { once: true },
+      );
     }
   });
 }
@@ -284,4 +352,35 @@ function stripCommandFailedHeader(message: string): string {
     return lines.slice(1).join("\n");
   }
   return message;
+}
+
+/**
+ * Extracts the tail of the CLI output captured by a failed run, walking the
+ * error cause chain (the wrapping layers keep the exec error as their
+ * cause). Returns the captured stderr then stdout, truncated to its last
+ * 'maxChars' characters, or null when no output was captured. Used to
+ * salvage the latest CLI state into the failure comment posted on a task.
+ */
+export function extractErrorOutputTail(
+  error: unknown,
+  maxChars = 1000,
+): string | null {
+  let current = error;
+  for (let depth = 0; current instanceof Error && depth < 5; depth++) {
+    const execError = current as ExecFileError;
+    const output = [execError.stderr, execError.stdout]
+      .filter(
+        (value) => typeof value === "string" && value.trim().length > 0,
+      )
+      .map((value) => (value as string).trim())
+      .join("\n")
+      .trim();
+    if (output.length > 0) {
+      return output.length > maxChars
+        ? `...${output.slice(-maxChars)}`
+        : output;
+    }
+    current = (current as Error).cause;
+  }
+  return null;
 }

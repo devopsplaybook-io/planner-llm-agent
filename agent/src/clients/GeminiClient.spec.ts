@@ -121,7 +121,9 @@ describe("GeminiClient", () => {
       path.join(os.tmpdir(), "gemini-spec", "task-1-Agent.md"),
     );
 
-    expect(summary).toBe("Done\n\n---\nModel: gemini-2.5-pro");
+    expect(summary).toBe(
+      "Done\n\n---\nModel: gemini-2.5-pro · Duration: 0s",
+    );
     const args = promptArgs();
     expect(args.slice(-6)).toEqual([
       "--model",
@@ -148,7 +150,9 @@ describe("GeminiClient", () => {
       path.join(os.tmpdir(), "gemini-spec", "task-1-Agent.md"),
     );
 
-    expect(summary).toBe("Implemented the feature");
+    expect(summary).toBe(
+      "Implemented the feature\n\n---\nModel: auto · Duration: 0s",
+    );
   });
 
   it("should append no usage to the footer (not reported by the CLI)", async () => {
@@ -166,7 +170,9 @@ describe("GeminiClient", () => {
       path.join(os.tmpdir(), "gemini-spec", "task-1-Agent.md"),
     );
 
-    expect(summary).toBe("Done");
+    expect(summary).toBe(
+      "Done\n\n---\nModel: auto · Duration: 0s",
+    );
     expect(await client.listModels()).toBeNull();
     expect(mockLogger.warn).not.toHaveBeenCalled();
   });

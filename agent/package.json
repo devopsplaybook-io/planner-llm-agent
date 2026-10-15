@@ -1,6 +1,6 @@
 {
   "name": "agent",
-  "version": "0.25.1",
+  "version": "0.26.0",
   "description": "LLM agent that connects to a Planner instance and executes assigned tasks",
   "author": "",
   "license": "MIT",
@@ -9,6 +9,7 @@
     "build": "tsc && tsc -p tsconfig.spec.json --noEmit",
     "lint": "oxlint src",
     "test": "jest --coverage",
+    "check-config": "tsx ./src/checkConfig.ts",
     "////": "-----------------------------------------------------------------",
     "dev": "tsx watch ./src/App.ts"
   },

@@ -10,11 +10,14 @@ const logger = OTelLogger().createModuleLogger("cli-agent");
 // then actions default.timeout; missing values fall back to the global
 // TASK_TIMEOUT configuration). The cwd is the per-task working directory
 // (each task runs in its own directory so parallel tasks never share one).
+// Aborting the signal kills the CLI execution (the whole process group):
+// used by the per-task cancel (see the Agent status_abort handling).
 export interface TaskOptions {
   model?: string;
   instruction?: string;
   timeoutSeconds?: number;
   cwd?: string;
+  abortSignal?: AbortSignal;
 }
 
 // Options of a standalone prompt: the model overrides the actions default

@@ -5,8 +5,9 @@ import { Agent } from "./Agent";
 import { AgentActionsConfig } from "./AgentActions";
 import { Config } from "./Config";
 import { FinalizationStore } from "./FinalizationStore";
+import { CliAbortedError } from "./CliUtils";
 import { createCliAgent } from "./clients/CliAgentRegistry";
-import type { CliAgentClient } from "./clients/CliAgent";
+import type { CliAgentClient, TaskOptions } from "./clients/CliAgent";
 import { PlannerClient } from "./PlannerClient";
 
 jest.mock("./PlannerClient", () => ({
@@ -194,6 +195,7 @@ describe("Agent", () => {
       name: "Test User",
     });
     mockPlanner.listAssignedTasks.mockResolvedValue([]);
+    mockPlanner.addTaskComment.mockResolvedValue(undefined);
     // Default getTask: mirrors the task as the last poll saw it, so the
     // new-comment check of every processed task sees no new comments.
     // Overridden per test when a new-comment scenario is exercised.
@@ -3541,6 +3543,429 @@ describe("Agent", () => {
     const record = store.get("task-1")!;
     expect(record.summary).toBe("Adjusted summary");
     expect(record.contentVersion).toBe("2026-10-15T01:00:00.000Z");
+    agent.stop();
+  });
+
+  it("should move a picked task to the configured in-progress status", async () => {
+    mockPlanner.listProjects.mockResolvedValue([
+      { id: "p1", name: "Web", description: "", statuses: ["To Do", "In Progress", "Done"] },
+    ]);
+    mockPlanner.listAssignedTasks.mockResolvedValue([
+      {
+        id: "task-1",
+        projectId: "p1",
+        title: "Implement feature",
+        status: "To Do",
+        description: "Add a feature",
+        comments: [],
+        attachments: [],
+      },
+    ]);
+    mockQoder.performTask.mockResolvedValue("Feature implemented");
+
+    const actions: AgentActionsConfig = {
+      defaultModel: "",
+      defaultTimeout: null,
+      actions: [
+        {
+          project: "Web",
+          statusStart: "To Do",
+          statusEnd: "Done",
+          statusInProgress: "In Progress",
+          model: "",
+          instruction: "",
+          timeout: null,
+          weight: null,
+        },
+      ],
+    };
+    const agent = createAgent(actions);
+    agent.start();
+    await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length >= 2);
+
+    expect(mockPlanner.updateTaskStatus.mock.calls.map((call) => call[1])).toEqual([
+      "In Progress",
+      "Done",
+    ]);
+    agent.stop();
+  });
+
+  it("should use the default in-progress status when the action has none", async () => {
+    mockPlanner.listAssignedTasks.mockResolvedValue([
+      {
+        id: "task-1",
+        title: "Implement feature",
+        status: "To Do",
+        description: "Add a feature",
+        comments: [],
+        attachments: [],
+      },
+    ]);
+    mockQoder.performTask.mockResolvedValue("Feature implemented");
+
+    const actions: AgentActionsConfig = {
+      defaultStatusInProgress: "In Progress",
+      defaultModel: "",
+      defaultTimeout: null,
+      actions: [
+        {
+          project: "",
+          statusStart: "To Do",
+          statusEnd: "Done",
+          model: "",
+          instruction: "",
+          timeout: null,
+          weight: null,
+        },
+      ],
+    };
+    const agent = createAgent(actions);
+    agent.start();
+    await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length >= 2);
+
+    expect(mockPlanner.updateTaskStatus.mock.calls.map((call) => call[1])).toEqual([
+      "In Progress",
+      "Done",
+    ]);
+    agent.stop();
+  });
+
+  it("should keep processing a task whose in-progress status is missing from the project catalog", async () => {
+    mockPlanner.listProjects.mockResolvedValue([
+      { id: "p1", name: "Web", description: "", statuses: ["To Do", "Done"] },
+    ]);
+    mockPlanner.listAssignedTasks.mockResolvedValue([
+      {
+        id: "task-1",
+        projectId: "p1",
+        title: "Implement feature",
+        status: "To Do",
+        description: "Add a feature",
+        comments: [],
+        attachments: [],
+      },
+    ]);
+    mockQoder.performTask.mockResolvedValue("Feature implemented");
+
+    const actions: AgentActionsConfig = {
+      defaultModel: "",
+      defaultTimeout: null,
+      actions: [
+        {
+          project: "Web",
+          statusStart: "To Do",
+          statusEnd: "Done",
+          statusInProgress: "In Progress",
+          model: "",
+          instruction: "",
+          timeout: null,
+          weight: null,
+        },
+      ],
+    };
+    const agent = createAgent(actions);
+    agent.start();
+    await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
+
+    expect(console.log).toHaveBeenCalledWith(
+      expect.stringContaining(
+        "the status does not exist in project 'Web'",
+      ),
+    );
+    expect(mockPlanner.updateTaskStatus).toHaveBeenCalledTimes(1);
+    expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith("task-1", "Done");
+    agent.stop();
+  });
+
+  it("should not fail the task when the in-progress transition fails", async () => {
+    mockPlanner.listAssignedTasks.mockResolvedValue([
+      {
+        id: "task-1",
+        title: "Implement feature",
+        status: "To Do",
+        description: "Add a feature",
+        comments: [],
+        attachments: [],
+      },
+    ]);
+    mockPlanner.updateTaskStatus.mockRejectedValueOnce(
+      new Error("Planner is down"),
+    );
+    mockQoder.performTask.mockResolvedValue("Feature implemented");
+
+    const actions: AgentActionsConfig = {
+      defaultStatusInProgress: "In Progress",
+      defaultModel: "",
+      defaultTimeout: null,
+      actions: [
+        {
+          project: "",
+          statusStart: "To Do",
+          statusEnd: "Done",
+          model: "",
+          instruction: "",
+          timeout: null,
+          weight: null,
+        },
+      ],
+    };
+    const agent = createAgent(actions);
+    agent.start();
+    await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length >= 2);
+
+    expect(console.log).toHaveBeenCalledWith(
+      expect.stringContaining(
+        "Failed to move task 'Implement feature' (task-1) to the in-progress status 'In Progress' (continuing)",
+      ),
+    );
+    expect(mockQoder.performTask).toHaveBeenCalledTimes(1);
+    expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith("task-1", "Done");
+    agent.stop();
+  });
+
+  it("should mention the resolved model in the start notification", async () => {
+    config.AGENT_NAME = "test-agent";
+    mockPlanner.listAssignedTasks.mockResolvedValue([
+      {
+        id: "task-1",
+        title: "Implement feature",
+        status: "To Do",
+        description: "Add a feature",
+        comments: [],
+        attachments: [],
+      },
+    ]);
+    mockQoder.performTask.mockResolvedValue("Feature implemented");
+
+    const actions: AgentActionsConfig = {
+      defaultModel: "task-model",
+      defaultTimeout: null,
+      actions: [
+        {
+          project: "",
+          statusStart: "To Do",
+          statusEnd: "Done",
+          model: "",
+          instruction: "",
+          timeout: null,
+          weight: null,
+        },
+      ],
+    };
+    const agent = createAgent(actions);
+    agent.start();
+    await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
+
+    expect(mockPlanner.addTaskComment).toHaveBeenCalledWith(
+      "task-1",
+      "Agent 'test-agent' started working on this task (model task-model).",
+    );
+    agent.stop();
+  });
+
+  it("should post progress comments while a long task runs", async () => {
+    config.TASK_PROGRESS_COMMENT_INTERVAL = 1;
+    mockPlanner.listAssignedTasks.mockResolvedValue([
+      {
+        id: "task-1",
+        title: "Implement feature",
+        status: "To Do",
+        description: "Add a feature",
+        comments: [],
+        attachments: [],
+      },
+    ]);
+    let resolveTask: (value: string) => void = () => undefined;
+    mockQoder.performTask.mockImplementation(
+      () =>
+        new Promise<string>((resolve) => {
+          resolveTask = resolve;
+        }),
+    );
+
+    const agent = createAgent();
+    agent.start();
+    await waitFor(() => mockQoder.performTask.mock.calls.length === 1);
+    await waitFor(() =>
+      mockPlanner.addTaskComment.mock.calls.some((call) =>
+        String(call[1]).startsWith("Still working on this task (elapsed"),
+      ),
+      5000,
+    );
+
+    const progressComment = mockPlanner.addTaskComment.mock.calls
+      .map((call) => call[1] as string)
+      .find((text) => text.startsWith("Still working on this task (elapsed"));
+    expect(progressComment).toMatch(/elapsed \d+s\)\.$/);
+    expect(mockPlanner.updateTaskStatus).not.toHaveBeenCalled();
+
+    resolveTask("Feature implemented");
+    await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
+    expect(mockPlanner.addTaskComment).toHaveBeenCalledWith(
+      "task-1",
+      "Feature implemented",
+    );
+    agent.stop();
+  });
+
+  it("should abort a running task when its status moves to the abort status", async () => {
+    config.TASK_POLLING_INTERVAL = 1;
+    const store = new FinalizationStore({ retryBaseMs: 60000 });
+    const tasks = [
+      {
+        id: "task-1",
+        title: "Implement feature",
+        status: "To Do",
+        description: "Add a feature",
+        comments: [] as unknown[],
+        attachments: [] as unknown[],
+      },
+    ];
+    mockPlanner.listAssignedTasks.mockImplementation(async () =>
+      tasks.map((task) => ({ ...task })),
+    );
+    mockQoder.performTask.mockImplementation(
+      (_task: unknown, _notesFile: string, options?: TaskOptions) =>
+        new Promise<string>((_resolve, reject) => {
+          options?.abortSignal?.addEventListener(
+            "abort",
+            () => reject(new CliAbortedError("Qoder task execution aborted")),
+            { once: true },
+          );
+        }),
+    );
+
+    const actions: AgentActionsConfig = {
+      defaultStatusAbort: "Aborted",
+      defaultModel: "",
+      defaultTimeout: null,
+      actions: [
+        {
+          project: "",
+          statusStart: "To Do",
+          statusEnd: "Done",
+          model: "",
+          instruction: "",
+          timeout: null,
+          weight: null,
+        },
+      ],
+    };
+    const agent = createAgent(actions, store);
+    agent.start();
+    await waitFor(() => mockQoder.performTask.mock.calls.length === 1);
+
+    // The user cancels the task by moving it to the abort status on Planner.
+    tasks[0].status = "Aborted";
+    await waitFor(
+      () =>
+        mockPlanner.addTaskComment.mock.calls.some((call) =>
+          String(call[1]).includes("Task aborted at user request"),
+        ),
+      10000,
+    );
+
+    expect(mockPlanner.addTaskComment).toHaveBeenCalledWith(
+      "task-1",
+      expect.stringContaining("the task status was moved to 'Aborted' on Planner"),
+    );
+    // The user-set status is kept: no end status, no error status, no
+    // finalization record (the CLI work is never re-run either way).
+    expect(mockPlanner.updateTaskStatus).not.toHaveBeenCalled();
+    expect(store.has("task-1")).toBe(false);
+    agent.stop();
+  });
+
+  it("should salvage the partial summary and CLI output into the failure comment", async () => {
+    mockPlanner.listAssignedTasks.mockResolvedValue([
+      {
+        id: "task-1",
+        title: "Implement feature",
+        status: "To Do",
+        description: "Add a feature",
+        comments: [],
+        attachments: [],
+      },
+    ]);
+    fse.outputFileSync(
+      path.join(dataDir, "tasks", "task-1-Agent-Summary.md"),
+      "## Partial progress\n- Implemented the first module",
+    );
+    mockQoder.performTask.mockRejectedValue(
+      Object.assign(new Error("Qoder task execution failed:\nboom"), {
+        stdout: "Step 2 started",
+        stderr: "Error: boom\n    at run (cli.js:1)",
+      }),
+    );
+
+    const agent = createAgent();
+    agent.start();
+    await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
+
+    const failureComment = mockPlanner.addTaskComment.mock.calls
+      .map((call) => call[1] as string)
+      .find((text) => text.includes("Task processing failed:"));
+    expect(failureComment).toContain("Partial summary written before the failure:");
+    expect(failureComment).toContain("Implemented the first module");
+    expect(failureComment).toContain("Last CLI output:");
+    expect(failureComment).toContain("Error: boom");
+    agent.stop();
+  });
+
+  it("should expose the live scheduling state for the agent note", async () => {
+    config.TASK_POLLING_INTERVAL = 1;
+    mockPlanner.listProjects.mockResolvedValue([
+      { id: "p1", name: "Web", description: "" },
+    ]);
+    mockPlannerTasks([
+      {
+        id: "task-1",
+        projectId: "p1",
+        title: "First task",
+        status: "To Do",
+        description: "",
+        comments: [],
+        attachments: [],
+      },
+      {
+        id: "task-2",
+        projectId: "p1",
+        title: "Second task",
+        status: "To Do",
+        description: "",
+        comments: [],
+        attachments: [],
+      },
+    ]);
+    let resolveFirst: (value: string) => void = () => undefined;
+    mockQoder.performTask
+      .mockImplementationOnce(
+        () =>
+          new Promise<string>((resolve) => {
+            resolveFirst = resolve;
+          }),
+      )
+      .mockResolvedValue("Second task done");
+
+    const agent = createAgent();
+    agent.start();
+    await waitFor(() => mockQoder.performTask.mock.calls.length === 1);
+
+    const state = agent.getSchedulingState();
+    expect(state.running).toHaveLength(1);
+    expect(state.running[0]).toMatchObject({
+      title: "First task",
+      project: "Web",
+    });
+    expect(state.running[0].elapsed).toMatch(/^\d+s$/);
+    expect(state.queuedCount).toBe(1);
+    expect(state.queuedTitles).toEqual(["Second task"]);
+
+    resolveFirst("First task done");
+    // The second task is picked by a later poll, which also drains the queue.
+    await waitFor(() => mockQoder.performTask.mock.calls.length === 2);
+    await waitFor(() => agent.getSchedulingState().running.length === 0);
+    expect(agent.getSchedulingState().queuedCount).toBe(0);
     agent.stop();
   });
 });

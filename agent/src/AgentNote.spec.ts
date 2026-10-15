@@ -2,7 +2,7 @@ import * as fse from "fs-extra";
 import * as os from "os";
 import * as path from "path";
 import { AgentActionsConfig } from "./AgentActions";
-import { AgentNote } from "./AgentNote";
+import { AgentNote, AgentSchedulingSnapshot } from "./AgentNote";
 import { Config } from "./Config";
 import { PlannerClient, PlannerProject } from "./PlannerClient";
 import type { CliAgentClient } from "./clients/CliAgent";
@@ -410,6 +410,93 @@ describe("AgentNote", () => {
         "Project any project, status 'To Do' -> 'Done', default model",
       );
       expect(prompt).toContain("Default model: auto (CLI default)");
+    });
+  });
+
+  describe("scheduling facts", () => {
+    const promptWithProvider = async (
+      provider: (() => AgentSchedulingSnapshot | null) | null,
+    ): Promise<string> => {
+      planner.listProjects.mockResolvedValue([project]);
+      planner.listNotes.mockResolvedValue([]);
+      qoder.runPrompt.mockResolvedValue("content");
+      planner.createNote.mockResolvedValue({ id: "n1" });
+      const note = new AgentNote(
+        config,
+        planner as unknown as PlannerClient,
+        qoder as unknown as CliAgentClient,
+        null,
+        provider,
+      );
+      await note.update();
+      return qoder.runPrompt.mock.calls[0][0] as string;
+    };
+
+    it("should include the live scheduling facts in the generation prompt", async () => {
+      const prompt = await promptWithProvider(() => ({
+        running: [
+          {
+            title: "Implement feature",
+            project: "Web",
+            elapsed: "12m",
+            model: "task-model",
+          },
+        ],
+        queuedCount: 6,
+        queuedTitles: [
+          "Second task",
+          "Third task",
+          "Fourth task",
+          "Fifth task",
+          "Sixth task",
+          "Seventh task",
+        ],
+      }));
+
+      expect(prompt).toContain(
+        "Currently running tasks: 'Implement feature' (12m, task-model)",
+      );
+      expect(prompt).toContain(
+        "Queued tasks: 6 (Second task | Third task | Fourth task | Fifth task | Sixth task)",
+      );
+      expect(prompt).not.toContain("Seventh task");
+    });
+
+    it("should report none when the agent is idle", async () => {
+      const prompt = await promptWithProvider(() => ({
+        running: [],
+        queuedCount: 0,
+        queuedTitles: [],
+      }));
+
+      expect(prompt).toContain("Currently running tasks: none");
+      expect(prompt).toContain("Queued tasks: none");
+    });
+
+    it("should omit the model of a running task without one", async () => {
+      const prompt = await promptWithProvider(() => ({
+        running: [
+          {
+            title: "Implement feature",
+            project: "Web",
+            elapsed: "45s",
+            model: "",
+          },
+        ],
+        queuedCount: 0,
+        queuedTitles: [],
+      }));
+
+      expect(prompt).toContain(
+        "Currently running tasks: 'Implement feature' (45s)",
+      );
+    });
+
+    it("should omit the scheduling facts without a provider", async () => {
+      const prompt = await promptWithProvider(null);
+
+      expect(prompt).not.toContain("Currently running tasks");
+      expect(prompt).not.toContain("Queued tasks");
     });
   });
 });

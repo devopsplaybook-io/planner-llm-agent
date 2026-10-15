@@ -4,7 +4,7 @@ import * as path from "path";
 import type { AgentActionsConfig } from "./AgentActions";
 import { Config } from "./Config";
 import { BaseCliAgent, extractTaskModel, resolveModel } from "./clients/BaseCliAgent";
-import { runCli } from "./CliUtils";
+import { CliAbortedError, runCli } from "./CliUtils";
 import type { RunCliOptions } from "./CliUtils";
 import type { PlannerTask } from "./PlannerClient";
 import type { PromptOptions, TaskOptions } from "./clients/CliAgent";
@@ -52,6 +52,9 @@ jest.mock("./OTelContext", () => {
 });
 
 jest.mock("./CliUtils", () => ({
+  // The real module provides CliAbortedError/isCliAbortError (used by the
+  // abort handling of runAgentCli); only the CLI invocations are mocked.
+  ...jest.requireActual("./CliUtils"),
   runCli: jest.fn(),
   extractErrorDetail: jest.fn(() => "error detail"),
 }));
@@ -210,7 +213,7 @@ describe("BaseCliAgent", () => {
       const options: TaskOptions = { cwd: taskDir, timeoutSeconds: 60 };
       const summary = await agent.performTask(buildTask(), notesFile, options);
 
-      expect(summary).toBe("CLI reply");
+      expect(summary).toBe("CLI reply\n\n---\nModel: auto · Duration: 0s");
       const { args, options: runOptions } = lastCall();
       expect(runOptions.cwd).toBe(taskDir);
       expect(args[3]).toContain(`Working directory: ${taskDir}`);
@@ -263,6 +266,28 @@ describe("BaseCliAgent", () => {
 
       const { args } = lastCall();
       expect(args[3]).not.toContain("Available skills");
+    });
+
+    it("rethrows a CLI abort as CliAbortedError with the display name", async () => {
+      MockedRunCli.mockRejectedValue(new CliAbortedError());
+
+      await expect(
+        agent.performTask(buildTask(), path.join(dataDir, "tasks", "task-1-Agent.md")),
+      ).rejects.toThrow("Test CLI task execution aborted");
+      await expect(
+        agent.performTask(buildTask(), path.join(dataDir, "tasks", "task-1-Agent.md")),
+      ).rejects.toBeInstanceOf(CliAbortedError);
+    });
+
+    it("passes the abort signal of the task to the CLI invocation", async () => {
+      const controller = new AbortController();
+
+      await agent.performTask(buildTask(), path.join(dataDir, "tasks", "task-1-Agent.md"), {
+        abortSignal: controller.signal,
+      });
+
+      const { options } = lastCall();
+      expect(options.abortSignal).toBe(controller.signal);
     });
   });
 
