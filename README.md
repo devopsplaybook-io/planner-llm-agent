@@ -32,6 +32,7 @@ Configuration values are resolved with the following priority:
 | `TASK_MAX_PARALLEL`     | `1`                           | Weighted capacity budget of the parallel scheduling (decimals allowed, e.g. `1.9`; at most ceil(budget) CLI processes run concurrently; see [Parallel scheduling](#parallel-scheduling)) |
 | `TASK_SMART_SCHEDULING` | `true`                        | Weighted, conflict-aware scheduling when `true`; `false` restores the historical count-based parallelism |
 | `TASK_CONFLICT_MODE`    | `repo`                        | Automatic conflict keys derived from the task content: `repo`, `project` or `none` (see [Parallel scheduling](#parallel-scheduling)) |
+| `TASK_ADJUSTMENT_MAX_ROUNDS` | `2`                      | Maximum number of adjustment passes re-running the CLI when new comments arrive on a task while a step runs (see [New comment check](#new-comment-check)); `0` only detects and logs them |
 | `AGENT_UTILITY_MODEL`   | (empty)                       | Fast/cheap model (on the configured CLI) pre-evaluating the weight and repositories of hint-less tasks; empty disables it (zero LLM calls) |
 | `AGENT_EVALUATION_TIMEOUT` | `30`                       | Maximum duration in seconds of one scheduling round's utility-model evaluations (see [Utility model](#utility-model-optional)) |
 | `TASK_TIMEOUT`          | `3600`                        | Maximum duration of a task execution in seconds (fallback when the actions configuration defines no timeout) |
@@ -235,6 +236,10 @@ The agent polls Planner immediately at startup, then again after every completed
 ### Project-scoped task fetch
 
 When every action of the agent is bound to a project pattern, the poll fetches only the tasks of the matching projects (`/api/tasks?projectIds=...`) instead of the full task list across all projects, which cuts the payload of every poll. The fetch falls back to the unscoped list when no project matches the patterns. Note that the local task-folder cleanup uses the same (scoped) list: folders of tasks outside the agent's project scope are treated as no longer assigned and are cleaned up.
+
+### New comment check
+
+A task run can last a long time, and comments posted on the task while the CLI agent works are missed by the brief built at poll time. After the CLI run of a step completes and before the task is finalized (summary comment, end status), the agent re-fetches the task from Planner and compares the comment ids with the ones the brief was built from: comments authored by the agent itself (its start comment, for example) are ignored. When new human comments exist, the task brief is refreshed with them and the CLI agent runs once more with a directive listing the new messages, so it can take them into account, adjust the delivered work if needed and update its summary — which becomes the final one. At most `TASK_ADJUSTMENT_MAX_ROUNDS` adjustment passes run per step (default `2`); comments arriving after the budget is exhausted are logged and the task finalizes with the last summary, and `0` only detects and logs the new comments. A failing Planner read never discards the completed run: the task then finalizes as-is.
 
 ### Working directory and instances
 

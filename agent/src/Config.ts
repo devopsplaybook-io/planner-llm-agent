@@ -31,6 +31,7 @@ export class Config {
   public TASK_TIMEOUT: number;
   public TASK_SMART_SCHEDULING: boolean;
   public TASK_CONFLICT_MODE: string;
+  public TASK_ADJUSTMENT_MAX_ROUNDS: number;
   public AGENT_UTILITY_MODEL: string;
   public AGENT_EVALUATION_TIMEOUT: number;
   public AGENT_NOTE_PROJECT: string;
@@ -102,6 +103,9 @@ export class Config {
     this.TASK_TIMEOUT = 3600;
     this.TASK_SMART_SCHEDULING = true;
     this.TASK_CONFLICT_MODE = "repo";
+    // Bound of the adjustment passes re-running the CLI when new comments
+    // arrived on a task while a step ran (0 = detection only).
+    this.TASK_ADJUSTMENT_MAX_ROUNDS = 2;
     this.AGENT_UTILITY_MODEL = "";
     // Bound of one scheduling round's utility-model evaluations (seconds).
     this.AGENT_EVALUATION_TIMEOUT = 30;
@@ -182,6 +186,11 @@ export class Config {
     }
     if (config.TASK_CONFLICT_MODE) {
       this.TASK_CONFLICT_MODE = config.TASK_CONFLICT_MODE as string;
+    }
+    // The kill switch (0) is a valid configured value.
+    if (config.TASK_ADJUSTMENT_MAX_ROUNDS !== undefined) {
+      this.TASK_ADJUSTMENT_MAX_ROUNDS =
+        config.TASK_ADJUSTMENT_MAX_ROUNDS as number;
     }
     if (config.AGENT_UTILITY_MODEL !== undefined) {
       this.AGENT_UTILITY_MODEL = (config.AGENT_UTILITY_MODEL ?? "") as string;
@@ -322,6 +331,11 @@ export class Config {
     }
     if (process.env.TASK_CONFLICT_MODE) {
       this.TASK_CONFLICT_MODE = process.env.TASK_CONFLICT_MODE;
+    }
+    if (process.env.TASK_ADJUSTMENT_MAX_ROUNDS) {
+      this.TASK_ADJUSTMENT_MAX_ROUNDS = parseInt(
+        process.env.TASK_ADJUSTMENT_MAX_ROUNDS,
+      );
     }
     if (process.env.AGENT_UTILITY_MODEL !== undefined) {
       this.AGENT_UTILITY_MODEL = process.env.AGENT_UTILITY_MODEL ?? "";
@@ -489,6 +503,15 @@ export class Config {
     if (!TASK_CONFLICT_MODES.includes(this.TASK_CONFLICT_MODE as ConflictMode)) {
       errors.push(
         `TASK_CONFLICT_MODE must be one of ${TASK_CONFLICT_MODES.join(", ")} (current value: '${this.TASK_CONFLICT_MODE}')`,
+      );
+    }
+
+    if (
+      !Number.isInteger(this.TASK_ADJUSTMENT_MAX_ROUNDS) ||
+      this.TASK_ADJUSTMENT_MAX_ROUNDS < 0
+    ) {
+      errors.push(
+        `TASK_ADJUSTMENT_MAX_ROUNDS must be a non-negative integer (current value: '${this.TASK_ADJUSTMENT_MAX_ROUNDS}')`,
       );
     }
 

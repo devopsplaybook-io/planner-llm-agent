@@ -127,58 +127,81 @@ export class PlannerClient {
               (assignee: PlannerTaskJson) => assignee?.userId === user.id,
             ),
         )
-        .map((task) => ({
-          id: String(task.id),
-          projectId: String(task.projectId ?? ""),
-          title: String(task.title),
-          status: String(task.status),
-          priority:
-            task.priority === undefined || task.priority === null
-              ? "medium"
-              : String(task.priority),
-          description:
-            task.description === undefined || task.description === null
-              ? ""
-              : String(task.description),
-          dateUpdated:
-            task.dateUpdated === undefined || task.dateUpdated === null
-              ? ""
-              : String(task.dateUpdated),
-          comments: Array.isArray(task.comments)
-            ? task.comments.map(
-                (comment: PlannerTaskJson): PlannerTaskComment => ({
-                  id: String(comment.id),
-                  userId: String(comment.userId),
-                  userName: comment.userName
-                    ? String(comment.userName)
-                    : undefined,
-                  text: String(comment.text),
-                  dateCreated: String(comment.dateCreated),
-                }),
-              )
-            : [],
-          attachments: Array.isArray(task.attachments)
-            ? task.attachments.map(
-                (attachment: PlannerTaskJson): PlannerTaskAttachment => ({
-                  id: String(attachment.id),
-                  fileName: String(attachment.fileName),
-                  filePath: String(attachment.filePath),
-                  dateCreated: String(attachment.dateCreated),
-                }),
-              )
-            : [],
-          dependencies: Array.isArray(task.dependencies)
-            ? task.dependencies.map(
-                (dependency: PlannerTaskJson): PlannerTaskDependency => ({
-                  taskId: String(dependency.taskId),
-                  title: dependency.title ? String(dependency.title) : undefined,
-                  status: dependency.status
-                    ? String(dependency.status)
-                    : undefined,
-                }),
-              )
-            : [],
-        }));
+        .map((task) => this.mapTask(task));
+    } catch (error) {
+      span.recordException(error as Error);
+      throw error;
+    } finally {
+      span.end();
+    }
+  }
+
+  // Maps a raw Planner task JSON to the PlannerTask shape, applying the
+  // missing-field defaults (medium priority, empty strings, empty lists)
+  // shared by the list and single-task fetches.
+  private mapTask(task: PlannerTaskJson): PlannerTask {
+    return {
+      id: String(task.id),
+      projectId: String(task.projectId ?? ""),
+      title: String(task.title),
+      status: String(task.status),
+      priority:
+        task.priority === undefined || task.priority === null
+          ? "medium"
+          : String(task.priority),
+      description:
+        task.description === undefined || task.description === null
+          ? ""
+          : String(task.description),
+      dateUpdated:
+        task.dateUpdated === undefined || task.dateUpdated === null
+          ? ""
+          : String(task.dateUpdated),
+      comments: Array.isArray(task.comments)
+        ? task.comments.map(
+            (comment: PlannerTaskJson): PlannerTaskComment => ({
+              id: String(comment.id),
+              userId: String(comment.userId),
+              userName: comment.userName
+                ? String(comment.userName)
+                : undefined,
+              text: String(comment.text),
+              dateCreated: String(comment.dateCreated),
+            }),
+          )
+        : [],
+      attachments: Array.isArray(task.attachments)
+        ? task.attachments.map(
+            (attachment: PlannerTaskJson): PlannerTaskAttachment => ({
+              id: String(attachment.id),
+              fileName: String(attachment.fileName),
+              filePath: String(attachment.filePath),
+              dateCreated: String(attachment.dateCreated),
+            }),
+          )
+        : [],
+      dependencies: Array.isArray(task.dependencies)
+        ? task.dependencies.map(
+            (dependency: PlannerTaskJson): PlannerTaskDependency => ({
+              taskId: String(dependency.taskId),
+              title: dependency.title ? String(dependency.title) : undefined,
+              status: dependency.status
+                ? String(dependency.status)
+                : undefined,
+            }),
+          )
+        : [],
+    };
+  }
+
+  public async getTask(taskId: string): Promise<PlannerTask> {
+    const span = OTelTracer().startSpan("planner-client.get-task");
+    try {
+      const body = await this.request(`/api/tasks/${taskId}`, "GET", span);
+      if (!body?.id) {
+        throw new Error("Planner task response is missing the task id");
+      }
+      return this.mapTask(body);
     } catch (error) {
       span.recordException(error as Error);
       throw error;

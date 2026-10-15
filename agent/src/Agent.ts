@@ -8,13 +8,18 @@ import {
 import { Config } from "./Config";
 import { FinalizationStore } from "./FinalizationStore";
 import { createCliAgent } from "./clients/CliAgentRegistry";
-import { prepareCliAgent, type CliAgentClient } from "./clients/CliAgent";
+import {
+  prepareCliAgent,
+  type CliAgentClient,
+  type TaskOptions,
+} from "./clients/CliAgent";
 import { resolveModel } from "./clients/BaseCliAgent";
 import { OTelLogger, OTelMeter } from "./OTelContext";
 import {
   PlannerClient,
   PlannerProject,
   PlannerTask,
+  PlannerTaskComment,
   PlannerTaskDependency,
 } from "./PlannerClient";
 import {
@@ -45,6 +50,11 @@ const HEARTBEAT_INTERVAL_MS = 30000;
 
 // Maximum length of the failure explanation posted on a task.
 const MAX_FAILURE_EXPLANATION_LENGTH = 1000;
+
+// Directive of an adjustment pass: appended to the action instruction when
+// new comments arrived on the task while the CLI agent was running a step.
+const MAX_ADJUSTMENT_DIRECTIVE =
+  "New comments were posted on this task after your previous run (listed below). They are also included in the Comments section of the task documentation file. Take the new messages into account, adjust the delivered work if needed, and update the summary file accordingly. If no adjustment is needed, update the summary to state that no adjustment was required.";
 
 /**
  * Sanitizes a Planner attachment file name for a safe local write: only the
@@ -99,6 +109,11 @@ export class Agent {
   // Invalid hot-reloaded values are reported once per value.
   private warnedBudgetValue: string | null = null;
   private warnedConflictModeValue: string | null = null;
+  // Planner user id of the agent itself, cached at every poll: the
+  // new-comment check excludes the comments authored by this user (they are
+  // the agent's own start/summary comments). One agent process per agent
+  // identity is an existing assumption, so a per-process cache is safe.
+  private agentUserId: string | null = null;
 
   constructor(
     config: Config,
@@ -259,6 +274,7 @@ export class Agent {
     let outcome: PollOutcome = "idle";
     try {
       const user = await this.planner.getCurrentUser();
+      this.agentUserId = user.id;
       const actions = this.getActions();
       // The projects are loaded lazily, once per poll: the project-bound
       // actions match on the project names, and the task brief includes the
@@ -732,7 +748,7 @@ export class Agent {
       // default timeout; when neither is configured the global TASK_TIMEOUT
       // (which defaults to 1 hour) applies (see BaseCliAgent.performTask).
       const cliAgent = await this.getCliAgent(selectedAgent);
-      const summary = await cliAgent.performTask(task, notesFile, {
+      const taskOptions: TaskOptions = {
         model: defaultModel,
         instruction: action.instruction,
         timeoutSeconds:
@@ -740,15 +756,29 @@ export class Agent {
           this.agentActions?.defaultTimeout ??
           this.config.TASK_TIMEOUT,
         cwd: taskDir,
-      });
-      // The CLI work is done: from here on only the Planner finalization
-      // remains, and a failure of it must never re-run the CLI — the record
-      // keeps the task out of the candidates and drives the idempotent
-      // retries (see retryDueFinalizations).
+      };
+      const summary = await cliAgent.performTask(task, notesFile, taskOptions);
+      // The CLI run of the step is done: before finalizing, check whether
+      // new comments were posted on the task while it ran and give the CLI
+      // agent a bounded number of adjustment passes to take them into
+      // account.
+      const { summary: finalSummary, contentVersion } =
+        await this.adjustForNewComments(
+          task,
+          project,
+          cliAgent,
+          notesFile,
+          taskOptions,
+          summary,
+        );
+      // The CLI work is done for good: from here on only the Planner
+      // finalization remains, and a failure of it must never re-run the
+      // CLI — the record keeps the task out of the candidates and drives
+      // the idempotent retries (see retryDueFinalizations).
       this.finalizationStore.record(task.id, {
         title: task.title,
-        contentVersion: task.dateUpdated,
-        summary,
+        contentVersion,
+        summary: finalSummary,
         statusEnd: action.statusEnd,
       });
       await this.finalizeCompletedTask(task.id);
@@ -796,6 +826,110 @@ export class Agent {
       }
     } finally {
       this.processingTasks.delete(task.id);
+    }
+  }
+
+  // Re-fetches the task after the CLI run of a step and detects the comments
+  // posted since the brief was built (comment ids unknown to the brief-time
+  // snapshot, excluding the agent's own comments). When some exist, the task
+  // brief is refreshed with them and the CLI agent runs again with a
+  // directive listing the new messages, at most
+  // TASK_ADJUSTMENT_MAX_ROUNDS times. Returns the summary of the last
+  // successful run and the freshest observed task content version. A failed
+  // Planner read never discards the completed run (the task finalizes
+  // as-is); a failed adjustment run propagates to the processTask error
+  // handling.
+  private async adjustForNewComments(
+    task: PlannerTask,
+    project: PlannerProject | null,
+    cliAgent: CliAgentClient,
+    notesFile: string,
+    taskOptions: TaskOptions,
+    initialSummary: string,
+  ): Promise<{ summary: string; contentVersion: string }> {
+    let summary = initialSummary;
+    let contentVersion = task.dateUpdated;
+    const knownCommentIds = new Set(task.comments.map((comment) => comment.id));
+    const maxRounds = this.maxAdjustmentRounds();
+    let roundsUsed = 0;
+    for (;;) {
+      let freshTask: PlannerTask;
+      try {
+        freshTask = await this.planner.getTask(task.id);
+      } catch (error) {
+        logger.warn(
+          `Failed to check task '${task.title}' (${task.id}) for new comments (finalizing with the current summary): ${(error as Error).message}`,
+        );
+        return { summary, contentVersion };
+      }
+      contentVersion = freshTask.dateUpdated;
+      const unknownComments = freshTask.comments.filter(
+        (comment) => !knownCommentIds.has(comment.id),
+      );
+      if (unknownComments.length === 0) {
+        return { summary, contentVersion };
+      }
+      const agentUserId = await this.resolveAgentUserId();
+      if (agentUserId === null) {
+        return { summary, contentVersion };
+      }
+      const newComments = unknownComments.filter(
+        (comment) => comment.userId !== agentUserId,
+      );
+      if (newComments.length === 0) {
+        // Only the agent's own comments arrived: nothing to adjust.
+        return { summary, contentVersion };
+      }
+      if (roundsUsed >= maxRounds) {
+        logger.warn(
+          `Task '${task.title}' (${task.id}) received ${newComments.length} new comment(s) after the adjustment budget of ${maxRounds} round(s) was used up: finalizing with the current summary`,
+        );
+        return { summary, contentVersion };
+      }
+      roundsUsed++;
+      for (const comment of freshTask.comments) {
+        knownCommentIds.add(comment.id);
+      }
+      logger.info(
+        `Task '${task.title}' (${task.id}) received ${newComments.length} new comment(s) while the step ran: adjustment round ${roundsUsed}/${maxRounds}`,
+      );
+      await this.writeTaskNotes(freshTask, notesFile, project);
+      summary = await cliAgent.performTask(freshTask, notesFile, {
+        ...taskOptions,
+        instruction: buildAdjustmentInstruction(
+          taskOptions.instruction,
+          newComments,
+        ),
+      });
+    }
+  }
+
+  // Defensive read of the adjustment budget: validate() runs at startup
+  // only, so a hot-reloaded invalid value falls back to the default (2)
+  // instead of allowing an unbounded adjustment loop.
+  private maxAdjustmentRounds(): number {
+    const value = this.config.TASK_ADJUSTMENT_MAX_ROUNDS;
+    return Number.isInteger(value) && value >= 0 ? value : 2;
+  }
+
+  // The agent user id is cached at every poll; the fallback covers a check
+  // running before the first successful poll (or after its user fetch
+  // failed). Returns null when the Planner user cannot be resolved: the
+  // caller then skips the check, since the agent's own comments could not
+  // be told apart from the human ones.
+  private async resolveAgentUserId(): Promise<string | null> {
+    if (this.agentUserId) {
+      return this.agentUserId;
+    }
+    try {
+      const user = await this.planner.getCurrentUser();
+      this.agentUserId = user.id;
+      return user.id;
+    } catch (error) {
+      logger.warn(
+        `Failed to resolve the agent user for the new-comment check (finalizing with the current summary): ${(error as Error).message}`,
+      );
+      return null;
     }
   }
 
@@ -1152,6 +1286,28 @@ function dependencyBrief(
     return [];
   }
   return ["## Dependencies", "", dependencyLines(dependencies), ""];
+}
+
+// The instruction of an adjustment pass: the action instruction (when set)
+// followed by the new-comment directive and the new comments themselves.
+function buildAdjustmentInstruction(
+  instruction: string | undefined,
+  newComments: PlannerTaskComment[],
+): string {
+  const parts: string[] = [];
+  if (instruction && instruction.trim().length > 0) {
+    parts.push(instruction);
+  }
+  parts.push(
+    [
+      MAX_ADJUSTMENT_DIRECTIVE,
+      ...newComments.map(
+        (comment) =>
+          `- **${comment.userName || comment.userId}** (${comment.dateCreated}): ${comment.text}`,
+      ),
+    ].join("\n"),
+  );
+  return parts.join("\n\n");
 }
 
 // The comment posted on a task that failed to process: the explanation of
