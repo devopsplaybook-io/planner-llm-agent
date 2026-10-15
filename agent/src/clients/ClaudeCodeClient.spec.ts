@@ -211,7 +211,9 @@ describe("ClaudeCodeClient", () => {
       path.join(os.tmpdir(), "claude-code-spec", "task-1-Agent.md"),
     );
 
-    expect(summary).toBe("Done\n\n---\nModel: claude-sonnet-4-5");
+    expect(summary).toBe(
+        "Done\n\n---\nModel: claude-sonnet-4-5 · Duration: 0s",
+      );
     const args = promptArgs();
     expect(args.slice(-6)).toEqual([
       "--model",
@@ -243,7 +245,9 @@ describe("ClaudeCodeClient", () => {
       path.join(os.tmpdir(), "claude-code-spec", "task-1-Agent.md"),
     );
 
-    expect(summary).toBe("Done\n\n---\nModel: auto · Claude cost: $0.42");
+    expect(summary).toBe(
+        "Done\n\n---\nModel: auto · Claude cost: $0.42 · Duration: 0s",
+      );
   });
 
   it("should fall back to the json result field when no summary file is written", async () => {
@@ -271,7 +275,9 @@ describe("ClaudeCodeClient", () => {
       path.join(os.tmpdir(), "claude-code-spec", "task-1-Agent.md"),
     );
 
-    expect(summary).toBe("Implemented the feature");
+    expect(summary).toBe(
+      "Implemented the feature\n\n---\nModel: auto · Duration: 0s",
+    );
   });
 
   it("should not run a model listing (validation is skipped without a warning)", async () => {
@@ -289,7 +295,9 @@ describe("ClaudeCodeClient", () => {
       path.join(os.tmpdir(), "claude-code-spec", "task-1-Agent.md"),
     );
 
-    expect(summary).toBe("Done\n\n---\nModel: claude-opus-4-1");
+    expect(summary).toBe(
+        "Done\n\n---\nModel: claude-opus-4-1 · Duration: 0s",
+      );
     expect(mockExecFile).toHaveBeenCalledTimes(1);
     expect(await client.listModels()).toBeNull();
     expect(mockLogger.warn).not.toHaveBeenCalled();

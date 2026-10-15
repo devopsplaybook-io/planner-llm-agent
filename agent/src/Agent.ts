@@ -6,6 +6,7 @@ import {
   matchProjectPattern,
 } from "./AgentActions";
 import { Config } from "./Config";
+import type { AgentSchedulingSnapshot } from "./AgentNote";
 import { FinalizationStore } from "./FinalizationStore";
 import { createCliAgent } from "./clients/CliAgentRegistry";
 import {
@@ -14,6 +15,10 @@ import {
   type TaskOptions,
 } from "./clients/CliAgent";
 import { resolveModel } from "./clients/BaseCliAgent";
+import {
+  extractErrorOutputTail,
+  isCliAbortError,
+} from "./CliUtils";
 import { OTelLogger, OTelMeter } from "./OTelContext";
 import {
   PlannerClient,
@@ -50,6 +55,11 @@ const HEARTBEAT_INTERVAL_MS = 30000;
 
 // Maximum length of the failure explanation posted on a task.
 const MAX_FAILURE_EXPLANATION_LENGTH = 1000;
+
+// Maximum lengths of the partial work salvaged into a failure comment (the
+// partial task summary written by the CLI and the tail of the CLI output).
+const MAX_SALVAGED_SUMMARY_LENGTH = 2000;
+const MAX_SALVAGED_OUTPUT_LENGTH = 1000;
 
 // Directive of an adjustment pass: appended to the action instruction when
 // new comments arrived on the task while the CLI agent was running a step.
@@ -106,6 +116,14 @@ export class Agent {
   // Ready tasks waiting to be admitted by the scheduler: refreshed on every
   // completed poll and reported by the queue gauge (see initQueueMetrics).
   private queuedTasks = 0;
+  // Titles of the queued tasks at the last poll (same lifecycle as the
+  // queue gauge count): reported by the agent note with the count.
+  private queuedTaskTitles: string[] = [];
+  // Abort controllers of the tasks being processed, keyed by task id: the
+  // poll signals a controller when the task status on Planner changed to
+  // the action abort status (see abortRequestedTasks), which kills the CLI
+  // process group of the task.
+  private abortControllers = new Map<string, AbortController>();
   // Invalid hot-reloaded values are reported once per value.
   private warnedBudgetValue: string | null = null;
   private warnedConflictModeValue: string | null = null;
@@ -304,8 +322,10 @@ export class Agent {
       // finalized: drop them.
       this.finalizationStore.prune(new Set(tasks.map((task) => task.id)));
       this.logRunningTasks();
+      this.abortRequestedTasks(tasks);
       if (actions.length === 0 || tasks.length === 0) {
         this.queuedTasks = 0;
+        this.queuedTaskTitles = [];
         return outcome;
       }
       // The project-bound actions match on the project names: the projects
@@ -349,6 +369,7 @@ export class Agent {
       }
       if (candidates.length === 0 && dependencyDeferrals.length === 0) {
         this.queuedTasks = 0;
+        this.queuedTaskTitles = [];
         return outcome;
       }
       // Queue order: higher priorities first; within the same priority the
@@ -468,8 +489,7 @@ export class Agent {
       picks: selection.picks,
       deferrals: [...dependencyDeferrals, ...selection.deferrals],
     });
-    this.queuedTasks =
-      candidates.length + dependencyDeferrals.length - selection.picks.length;
+    this.recordQueueState(candidates, dependencyDeferrals, selection.picks);
     if (selection.picks.length === 0) {
       return;
     }
@@ -496,8 +516,17 @@ export class Agent {
     );
     // The kill-switch path keeps its historical silence about the scheduling
     // rounds; the dependency-gated tasks are only counted in the queue gauge.
-    this.queuedTasks =
-      candidates.length + dependencyDeferrals.length - tasksToProcess.length;
+    this.recordQueueState(
+      candidates,
+      dependencyDeferrals,
+      tasksToProcess.map(({ task, action }) => ({
+        task,
+        action,
+        projectName: "",
+        weight: DEFAULT_TASK_WEIGHT,
+        conflictKeys: [],
+      })),
+    );
     if (tasksToProcess.length === 0) {
       return;
     }
@@ -510,6 +539,24 @@ export class Agent {
     }));
     this.registerPicks(picks);
     void this.processPicks(picks, loadProjects);
+  }
+
+  // Records the queue gauge count and the queued titles after a scheduling
+  // round: every candidate (dependency-gated ones included) that the round
+  // did not pick stays queued behind the capacity budget.
+  private recordQueueState(
+    candidates: SchedulerPickless[],
+    dependencyDeferrals: SchedulerDeferral[],
+    picks: SchedulerPick[],
+  ): void {
+    const pickedIds = new Set(picks.map((pick) => pick.task.id));
+    this.queuedTaskTitles = [
+      ...candidates
+        .filter((candidate) => !pickedIds.has(candidate.task.id))
+        .map((candidate) => candidate.task.title),
+      ...dependencyDeferrals.map((deferral) => deferral.task.title),
+    ];
+    this.queuedTasks = this.queuedTaskTitles.length;
   }
 
   // Registers the picked tasks into the in-flight map synchronously,
@@ -528,6 +575,8 @@ export class Agent {
         conflictKeys: pick.conflictKeys,
         startedAt,
         model: this.resolveTaskModel(pick.task, pick.action),
+        statusAbort:
+          pick.action.statusAbort ?? this.agentActions?.defaultStatusAbort,
       });
     }
   }
@@ -634,6 +683,33 @@ export class Agent {
     );
   }
 
+  // Cancels the running tasks whose status on Planner changed to their
+  // action abort status (per-task cancel): signaling the abort controller
+  // kills the CLI process group, and the processing then posts the abort
+  // comment instead of the failure handling. Detection latency is bounded
+  // by the polling interval (polls keep the base interval while tasks run).
+  // A task with no abort controller has no CLI execution in flight (already
+  // finalizing): nothing to kill.
+  private abortRequestedTasks(tasks: PlannerTask[]): void {
+    for (const runningTask of this.processingTasks.values()) {
+      if (!runningTask.statusAbort) {
+        continue;
+      }
+      const abortController = this.abortControllers.get(runningTask.taskId);
+      if (!abortController || abortController.signal.aborted) {
+        continue;
+      }
+      const current = tasks.find((task) => task.id === runningTask.taskId);
+      if (!current || current.status !== runningTask.statusAbort) {
+        continue;
+      }
+      logger.info(
+        `Task '${runningTask.title}' (${runningTask.taskId}) moved to the abort status '${runningTask.statusAbort}' on Planner: aborting the CLI execution`,
+      );
+      abortController.abort();
+    }
+  }
+
   // One scheduling-round line per poll when something was picked or
   // deferred (with the deferral reason), nothing otherwise.
   private logSchedulingRound(selection: SchedulerSelection): void {
@@ -723,18 +799,14 @@ export class Agent {
     logger.info(
       `Processing task '${task.title}' (${task.id}) in status '${task.status}'`,
     );
-    await this.postStartComment(task);
+    const abortController = new AbortController();
+    this.abortControllers.set(task.id, abortController);
+    const startedAt = Date.now();
     try {
-      const notesFile = this.getTaskNotesFile(task.id);
-      await this.writeTaskNotes(task, notesFile, project);
-      // Each task runs in its own working directory so parallel tasks never
-      // share one and cannot collide on the filesystem (the directory is
-      // also stated in the task prompt; see BaseCliAgent.buildTaskPrompt).
-      const taskDir = this.getTaskDir(task.id);
-      await fse.ensureDir(taskDir);
       // The model resolves to the action model, then the actions default
       // model; the task description still overrides both (see
-      // BaseCliAgent.resolveModel).
+      // BaseCliAgent.resolveModel). It is resolved before the start
+      // comment so the notification can display it.
       const currentDefaultAgent =
         this.agentActions?.defaultAgent || this.config.AGENT_CLI;
       const selectedAgent = action.agent || currentDefaultAgent;
@@ -744,6 +816,19 @@ export class Agent {
           ? this.agentActions?.defaultModel
           : "") ||
         "";
+      const resolvedModel = resolveModel(task, defaultModel)?.model ?? "";
+      await this.postStartComment(task, resolvedModel);
+      // Show the task as being processed on Planner (optional
+      // status_in_progress): best-effort, a failed or skipped transition
+      // never fails the task processing.
+      await this.moveTaskToInProgress(task, project, action);
+      const notesFile = this.getTaskNotesFile(task.id);
+      await this.writeTaskNotes(task, notesFile, project);
+      // Each task runs in its own working directory so parallel tasks never
+      // share one and cannot collide on the filesystem (the directory is
+      // also stated in the task prompt; see BaseCliAgent.buildTaskPrompt).
+      const taskDir = this.getTaskDir(task.id);
+      await fse.ensureDir(taskDir);
       // The timeout resolves to the action timeout, then the actions
       // default timeout; when neither is configured the global TASK_TIMEOUT
       // (which defaults to 1 hour) applies (see BaseCliAgent.performTask).
@@ -756,8 +841,18 @@ export class Agent {
           this.agentActions?.defaultTimeout ??
           this.config.TASK_TIMEOUT,
         cwd: taskDir,
+        abortSignal: abortController.signal,
       };
-      const summary = await cliAgent.performTask(task, notesFile, taskOptions);
+      const stopProgressHeartbeat = this.startProgressHeartbeat(
+        task,
+        startedAt,
+      );
+      let summary: string;
+      try {
+        summary = await cliAgent.performTask(task, notesFile, taskOptions);
+      } finally {
+        stopProgressHeartbeat();
+      }
       // The CLI run of the step is done: before finalizing, check whether
       // new comments were posted on the task while it ran and give the CLI
       // agent a bounded number of adjustment passes to take them into
@@ -788,6 +883,14 @@ export class Agent {
       );
     } catch (error) {
       const message = (error as Error).message;
+      if (isCliAbortError(error)) {
+        // A user requested the abort by moving the task to the action abort
+        // status on Planner: the CLI process group was killed by the abort
+        // signal. The task keeps the status the user set: no error status,
+        // no end status, no finalization.
+        await this.finalizeAbortedTask(task, action);
+        return;
+      }
       if (this.finalizationStore.has(task.id)) {
         // The CLI execution succeeded; only the Planner finalization failed.
         // The retry is scheduled with an exponential backoff.
@@ -804,7 +907,8 @@ export class Agent {
       // A failing task must not block the agent by staying in the start
       // status forever: it is moved to the resolved error status (the action
       // status_error, then the actions default status_error, then the end
-      // status) with an explanation.
+      // status) with an explanation, salvaging the partial work of the CLI
+      // run (partial summary file and output tail) when any exists.
       const errorStatus =
         action.statusError ??
         this.agentActions?.defaultStatusError ??
@@ -812,7 +916,12 @@ export class Agent {
       try {
         await this.planner.addTaskComment(
           task.id,
-          buildFailureComment(message, errorStatus),
+          buildFailureComment(
+            message,
+            errorStatus,
+            await this.readSalvagedSummary(task.id),
+            extractErrorOutputTail(error, MAX_SALVAGED_OUTPUT_LENGTH),
+          ),
         );
         await this.planner.updateTaskStatus(task.id, errorStatus);
         logger.info(
@@ -825,6 +934,7 @@ export class Agent {
         );
       }
     } finally {
+      this.abortControllers.delete(task.id);
       this.processingTasks.delete(task.id);
     }
   }
@@ -987,20 +1097,163 @@ export class Agent {
     return cliAgent;
   }
 
-  // Notifies the user that the agent started working on the task.
-  // Best-effort: a notification failure is logged but must not fail the
-  // task processing.
-  private async postStartComment(task: PlannerTask): Promise<void> {
+  // Notifies the user that the agent started working on the task, with the
+  // resolved model when one is configured. Best-effort: a notification
+  // failure is logged but must not fail the task processing.
+  private async postStartComment(
+    task: PlannerTask,
+    model: string,
+  ): Promise<void> {
     try {
+      const modelSuffix = model.length > 0 ? ` (model ${model})` : "";
       await this.planner.addTaskComment(
         task.id,
-        `Agent '${this.config.AGENT_NAME}' started working on this task.`,
+        `Agent '${this.config.AGENT_NAME}' started working on this task${modelSuffix}.`,
       );
     } catch (error) {
       logger.error(
         `Failed to post the start notification for task '${task.title}' (${task.id}): ${(error as Error).message}`,
       );
     }
+  }
+
+  // Moves the task to the resolved in-progress status (the action
+  // status_in_progress, then the actions default.status_in_progress) before
+  // the CLI run, so the processing state is visible on Planner. Optional
+  // and best-effort: without a configured status, when it equals the start
+  // status, when the project status catalog is known and does not contain
+  // it, or when the transition fails, the task keeps its current status
+  // and the processing continues.
+  private async moveTaskToInProgress(
+    task: PlannerTask,
+    project: PlannerProject | null,
+    action: AgentAction,
+  ): Promise<void> {
+    const statusInProgress =
+      action.statusInProgress ?? this.agentActions?.defaultStatusInProgress;
+    if (!statusInProgress || statusInProgress === task.status) {
+      return;
+    }
+    if (
+      project?.statuses &&
+      project.statuses.length > 0 &&
+      !project.statuses.includes(statusInProgress)
+    ) {
+      logger.warn(
+        `Task '${task.title}' (${task.id}) not moved to the in-progress status '${statusInProgress}': the status does not exist in project '${project.name}'`,
+      );
+      return;
+    }
+    try {
+      await this.planner.updateTaskStatus(task.id, statusInProgress);
+      logger.info(
+        `Task '${task.title}' (${task.id}) moved to the in-progress status '${statusInProgress}'`,
+      );
+    } catch (error) {
+      logger.warn(
+        `Failed to move task '${task.title}' (${task.id}) to the in-progress status '${statusInProgress}' (continuing): ${(error as Error).message}`,
+      );
+    }
+  }
+
+  // Periodic "still working" comments for long runs
+  // (TASK_PROGRESS_COMMENT_INTERVAL seconds, 0 disables): a task running
+  // longer than the interval gets one heartbeat comment per interval
+  // instead of total silence between the start and summary comments. The
+  // comments are best-effort and return the stop function; they are posted
+  // by the agent user, so the new-comment adjustment check ignores them.
+  private startProgressHeartbeat(
+    task: PlannerTask,
+    startedAt: number,
+  ): () => void {
+    const intervalSeconds = this.progressCommentIntervalSeconds();
+    if (intervalSeconds <= 0) {
+      return () => undefined;
+    }
+    const timer = setInterval(() => {
+      const elapsed = formatElapsed(Date.now() - startedAt);
+      void this.planner
+        .addTaskComment(task.id, `Still working on this task (elapsed ${elapsed}).`)
+        .catch((error: Error) => {
+          logger.error(
+            `Failed to post the progress comment for task '${task.title}' (${task.id}): ${error.message}`,
+          );
+        });
+    }, intervalSeconds * 1000);
+    timer.unref();
+    return () => clearInterval(timer);
+  }
+
+  // Defensive read of the progress-comment interval: validate() runs at
+  // startup only, so a hot-reloaded invalid value disables the heartbeats.
+  private progressCommentIntervalSeconds(): number {
+    const value = this.config.TASK_PROGRESS_COMMENT_INTERVAL;
+    return Number.isInteger(value) && value > 0 ? value : 0;
+  }
+
+  // Finalizes a task aborted at user request (its status was moved to the
+  // action abort status on Planner while the CLI ran): posts a short abort
+  // comment and cleans the local task folder when the abort status is the
+  // cleanup status — otherwise the next polls clean it up when the task
+  // reaches TASK_STATUS_CLEANUP. The task keeps the status the user set.
+  private async finalizeAbortedTask(
+    task: PlannerTask,
+    action: AgentAction,
+  ): Promise<void> {
+    const abortStatus =
+      action.statusAbort ?? this.agentActions?.defaultStatusAbort;
+    logger.info(
+      `Task '${task.title}' (${task.id}) aborted at user request (abort status '${abortStatus ?? "unknown"}' on Planner)`,
+    );
+    try {
+      await this.planner.addTaskComment(
+        task.id,
+        buildAbortComment(abortStatus),
+      );
+    } catch (error) {
+      logger.error(
+        `Failed to post the abort comment for task '${task.title}' (${task.id}): ${(error as Error).message}`,
+      );
+    }
+    if (abortStatus) {
+      await this.cleanupTaskFolderIfNeeded(task.id, abortStatus);
+    }
+  }
+
+  // Reads the partial task summary file left by a failed CLI run, for the
+  // failure comment salvage (null when the CLI wrote nothing usable).
+  private async readSalvagedSummary(taskId: string): Promise<string | null> {
+    try {
+      const summaryFile = this.getTaskSummaryFile(taskId);
+      if (!(await fse.pathExists(summaryFile))) {
+        return null;
+      }
+      const content = (await fse.readFile(summaryFile, "utf8")).trim();
+      if (content.length === 0) {
+        return null;
+      }
+      return content.length > MAX_SALVAGED_SUMMARY_LENGTH
+        ? `...${content.slice(-MAX_SALVAGED_SUMMARY_LENGTH)}`
+        : content;
+    } catch {
+      return null;
+    }
+  }
+
+  // Live scheduling snapshot for the agent note: the tasks currently being
+  // processed (title, project, elapsed time, model) and the queue behind
+  // the capacity budget (count and titles) as of the last poll.
+  public getSchedulingState(): AgentSchedulingSnapshot {
+    return {
+      running: [...this.processingTasks.values()].map((runningTask) => ({
+        title: runningTask.title,
+        project: runningTask.projectName,
+        elapsed: formatElapsed(Date.now() - runningTask.startedAt),
+        model: runningTask.model,
+      })),
+      queuedCount: this.queuedTasks,
+      queuedTitles: [...this.queuedTaskTitles],
+    };
   }
 
   private getTaskNotesFile(taskId: string): string {
@@ -1311,16 +1564,42 @@ function buildAdjustmentInstruction(
 }
 
 // The comment posted on a task that failed to process: the explanation of
-// the error, kept concise, and the resulting status change.
-function buildFailureComment(message: string, endStatus: string): string {
+// the error, kept concise, the partial work salvaged from the failed CLI
+// run (partial summary and output tail) when any exists, and the resulting
+// status change.
+function buildFailureComment(
+  message: string,
+  endStatus: string,
+  salvagedSummary: string | null = null,
+  salvagedOutput: string | null = null,
+): string {
   const explanation =
     message.length > MAX_FAILURE_EXPLANATION_LENGTH
       ? `${message.slice(0, MAX_FAILURE_EXPLANATION_LENGTH)}...`
       : message;
-  return [
-    "Task processing failed:",
-    explanation,
+  const sections = ["Task processing failed:", explanation];
+  if (salvagedSummary) {
+    sections.push(
+      "",
+      "Partial summary written before the failure:",
+      salvagedSummary,
+    );
+  }
+  if (salvagedOutput) {
+    sections.push("", "Last CLI output:", salvagedOutput);
+  }
+  sections.push(
     "",
     `The task was moved to '${endStatus}' so it does not block the agent. Check the agent logs for more details.`,
-  ].join("\n");
+  );
+  return sections.join("\n");
+}
+
+// The comment posted on a task aborted at user request: the abort status
+// detected on Planner and the fact that no summary was produced. The task
+// keeps the status the user set.
+function buildAbortComment(abortStatus: string | undefined): string {
+  return `Task aborted at user request: the task status was moved to '${
+    abortStatus ?? "the abort status"
+  }' on Planner while the agent was working on it. The CLI execution was stopped and no summary was produced; the task keeps this status.`;
 }

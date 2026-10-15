@@ -11,14 +11,35 @@ const logger = OTelLogger().createModuleLogger("agent-note");
 
 const MAX_SKILLS_LISTED = 20;
 const MAX_RECENT_TASKS = 10;
+const MAX_QUEUED_TITLES_SHOWN = 5;
 const MAX_INSTRUCTION_SHOWN = 100;
 const NOTE_TITLE_PREFIX = "Planner LLM Agent: ";
+
+/**
+ * Live scheduling state of the agent, snapshotted by the provider wired at
+ * construction (see Agent.getSchedulingState) when the note is generated:
+ * the tasks currently being processed and the queue behind the capacity
+ * budget.
+ */
+export interface AgentSchedulingSnapshot {
+  running: {
+    title: string;
+    project: string;
+    elapsed: string;
+    model: string;
+  }[];
+  queuedCount: number;
+  queuedTitles: string[];
+}
 
 export class AgentNote {
   private config: Config;
   private planner: PlannerClient;
   private cliAgent: CliAgentClient;
   private agentActions: AgentActionsConfig | null;
+  // Provider of the live scheduling state (running tasks, queue), called
+  // when the note content is generated; null keeps the note without it.
+  private schedulingState: (() => AgentSchedulingSnapshot | null) | null;
   private updating = false;
 
   constructor(
@@ -26,11 +47,13 @@ export class AgentNote {
     planner: PlannerClient,
     cliAgent: CliAgentClient,
     agentActions: AgentActionsConfig | null,
+    schedulingState: (() => AgentSchedulingSnapshot | null) | null = null,
   ) {
     this.config = config;
     this.planner = planner;
     this.cliAgent = cliAgent;
     this.agentActions = agentActions;
+    this.schedulingState = schedulingState;
   }
 
   // The note title is user-friendly and contains the agent name.
@@ -182,8 +205,38 @@ export class AgentNote {
       `- Skills available: ${skills.length > 0 ? skills.join(", ") : "none"}`,
       `- Tasks executed so far: ${tasks.count}`,
       `- Recent tasks: ${tasks.recent.length > 0 ? tasks.recent.join(" | ") : "none"}`,
+      ...this.schedulingFacts(),
       `- ${usageSummary}`,
     ];
+  }
+
+  // Live scheduling facts (the tasks being processed with their elapsed
+  // time, the queue behind the capacity budget): omitted when no provider
+  // is wired.
+  private schedulingFacts(): string[] {
+    const state = this.schedulingState?.() ?? null;
+    if (state === null) {
+      return [];
+    }
+    const running =
+      state.running.length > 0
+        ? state.running
+            .map((task) => {
+              const parts = [task.elapsed, task.model].filter(
+                (part) => part.length > 0,
+              );
+              return `'${task.title}' (${parts.join(", ")})`;
+            })
+            .join(" | ")
+        : "none";
+    const queuedTitles = state.queuedTitles.slice(0, MAX_QUEUED_TITLES_SHOWN);
+    const queued =
+      state.queuedCount > 0
+        ? `${state.queuedCount}${
+            queuedTitles.length > 0 ? ` (${queuedTitles.join(" | ")})` : ""
+          }`
+        : "none";
+    return [`- Currently running tasks: ${running}`, `- Queued tasks: ${queued}`];
   }
 
   // The agent actions configuration describes which tasks the agent

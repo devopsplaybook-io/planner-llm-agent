@@ -350,7 +350,9 @@ describe("QoderClient", () => {
       notesFile,
     );
 
-    expect(summary).toBe("Implemented the feature");
+    expect(summary).toBe(
+      "Implemented the feature\n\n---\nModel: auto · Duration: 0s",
+    );
     expect(mockExecFile).toHaveBeenCalledTimes(1);
     const [command, args, options] = mockExecFile.mock.calls[0];
     expect(command).toBe("qoder");
@@ -560,7 +562,9 @@ describe("QoderClient", () => {
       path.join(os.tmpdir(), "qoder-spec", "task-1-Agent.md"),
     );
 
-    expect(summary).toBe("Implemented the feature");
+    expect(summary).toBe(
+      "Implemented the feature\n\n---\nModel: auto · Duration: 0s",
+    );
   });
 
   it("should run the task with the model requested in the task description", async () => {
@@ -894,7 +898,9 @@ describe("QoderClient", () => {
       path.join(os.tmpdir(), "qoder-spec", "task-1-Agent.md"),
     );
 
-    expect(summary).toBe("Done\n\n---\nModel: claude-opus-4-1");
+    expect(summary).toBe(
+      "Done\n\n---\nModel: claude-opus-4-1 · Duration: 0s",
+    );
     expect(mockLogger.warn).not.toHaveBeenCalled();
   });
 
@@ -990,7 +996,7 @@ describe("QoderClient", () => {
     );
 
     expect(summary).toBe(
-      "Done\n\n---\nModel: claude-opus-4-1 · Qoder credits used: 16.35",
+      "Done\n\n---\nModel: claude-opus-4-1 · Qoder credits used: 16.35 · Duration: 0s",
     );
     expect(
       await fse.readJson(path.join(dataDir, "qoder-credits.json")),
@@ -1029,7 +1035,7 @@ describe("QoderClient", () => {
     );
 
     expect(summary).toBe(
-      "Done\n\n---\nModel: auto · Qoder credits used: 16.35",
+      "Done\n\n---\nModel: auto · Qoder credits used: 16.35 · Duration: 0s",
     );
     // Without any configured model the CLI runs with its own default,
     // so no --model argument is passed at all.
@@ -1105,7 +1111,7 @@ describe("QoderClient", () => {
     );
 
     expect(summary).toBe(
-      "Documented eight prioritized skill recommendations in the task's Agent Notes.",
+      "Documented eight prioritized skill recommendations in the task's Agent Notes.\n\n---\nModel: auto · Duration: 0s",
     );
   });
 
@@ -1140,7 +1146,9 @@ describe("QoderClient", () => {
       path.join(os.tmpdir(), "qoder-spec", "task-1-Agent.md"),
     );
 
-    expect(summary).toBe("Implemented the feature");
+    expect(summary).toBe(
+      "Implemented the feature\n\n---\nModel: auto · Duration: 0s",
+    );
   });
 
   it("should fall back to plain stdout when the output is not json", async () => {
@@ -1169,7 +1177,9 @@ describe("QoderClient", () => {
       path.join(os.tmpdir(), "qoder-spec", "task-1-Agent.md"),
     );
 
-    expect(summary).toBe("Implemented the feature");
+    expect(summary).toBe(
+      "Implemented the feature\n\n---\nModel: auto · Duration: 0s",
+    );
   });
 
   it("should return a fallback summary when qoder returns no output", async () => {
@@ -1198,7 +1208,9 @@ describe("QoderClient", () => {
       "/tmp/qoder-spec/task-1-Agent.md",
     );
 
-    expect(summary).toBe("Task executed (no output returned by Qoder)");
+    expect(summary).toBe(
+      "Task executed (no output returned by Qoder)\n\n---\nModel: auto · Duration: 0s",
+    );
   });
 
   it("should include the CLI output when task execution fails", async () => {

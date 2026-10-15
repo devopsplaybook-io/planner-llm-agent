@@ -1,7 +1,9 @@
 import { execFile } from "child_process";
 import {
+  CliAbortedError,
   ExecFileError,
   extractErrorDetail,
+  extractErrorOutputTail,
   PROCESS_GROUP_KILL_GRACE_MS,
   runCli,
   terminateLiveProcessGroups,
@@ -201,6 +203,84 @@ describe("CliUtils", () => {
     await expect(promise).rejects.toMatchObject({
       stdout: "out",
       stderr: "Error: boom\n",
+    });
+  });
+
+  describe("abort signal", () => {
+    it("should reject without spawning when the signal is already aborted", async () => {
+      const controller = new AbortController();
+      controller.abort();
+
+      await expect(
+        runCli("cli", ["arg"], {
+          encoding: "utf8",
+          abortSignal: controller.signal,
+        }),
+      ).rejects.toBeInstanceOf(CliAbortedError);
+      expect(mockExecFile).not.toHaveBeenCalled();
+    });
+
+    it("should kill the process group and reject with CliAbortedError when aborted mid-run", async () => {
+      const controller = new AbortController();
+      const promise = runCli("cli", ["arg"], {
+        timeout: 60000,
+        encoding: "utf8",
+        killProcessGroup: true,
+        abortSignal: controller.signal,
+      });
+
+      controller.abort();
+      expect(killSpy).toHaveBeenCalledWith(-FAKE_PID, "SIGTERM");
+
+      jest.advanceTimersByTime(PROCESS_GROUP_KILL_GRACE_MS);
+      expect(killSpy).toHaveBeenLastCalledWith(-FAKE_PID, "SIGKILL");
+
+      execCallback(null, "out", "");
+      await expect(promise).rejects.toBeInstanceOf(CliAbortedError);
+    });
+
+    it("should kill the child and reject with CliAbortedError without the process-group kill", async () => {
+      const childKill = jest.fn();
+      mockExecFile.mockImplementationOnce(
+        (
+          _command: string,
+          _args: string[],
+          _options: unknown,
+          callback: ExecCallback,
+        ) => {
+          execCallback = callback;
+          return { pid: FAKE_PID, kill: childKill };
+        },
+      );
+
+      const controller = new AbortController();
+      const promise = runCli("cli", ["arg"], {
+        encoding: "utf8",
+        abortSignal: controller.signal,
+      });
+
+      controller.abort();
+      expect(childKill).toHaveBeenCalledWith("SIGTERM");
+
+      execCallback(null, "out", "");
+      await expect(promise).rejects.toBeInstanceOf(CliAbortedError);
+    });
+
+    it("should still resolve when the command settles before the abort fires", async () => {
+      const controller = new AbortController();
+      const promise = runCli("cli", ["arg"], {
+        timeout: 60000,
+        encoding: "utf8",
+        killProcessGroup: true,
+        abortSignal: controller.signal,
+      });
+
+      execCallback(null, "out", "");
+      controller.abort();
+
+      await expect(promise).resolves.toEqual({ stdout: "out", stderr: "" });
+      jest.advanceTimersByTime(PROCESS_GROUP_KILL_GRACE_MS);
+      expect(killSpy).not.toHaveBeenCalled();
     });
   });
 
@@ -428,6 +508,47 @@ describe("CliUtils", () => {
       expect(extractErrorDetail(failure("Command failed: cli", { code: 1 }))).toBe(
         "the CLI exited with code 1 and produced no error output",
       );
+    });
+  });
+
+  describe("extractErrorOutputTail", () => {
+    it("should return null for an error without captured output", () => {
+      expect(extractErrorOutputTail(new Error("boom"))).toBeNull();
+      expect(extractErrorOutputTail("not an error")).toBeNull();
+    });
+
+    it("should return the stderr then stdout captured on the error", () => {
+      const error = Object.assign(new Error("Command failed"), {
+        stdout: "partial stdout",
+        stderr: "Error: boom\n",
+      });
+      expect(extractErrorOutputTail(error)).toBe("Error: boom\npartial stdout");
+    });
+
+    it("should walk the cause chain to find the captured output", () => {
+      const execError = Object.assign(new Error("Command failed"), {
+        stdout: "deep stdout",
+      });
+      const wrapper = new Error("Qoder task execution failed", {
+        cause: execError,
+      });
+      expect(extractErrorOutputTail(wrapper)).toBe("deep stdout");
+    });
+
+    it("should skip empty output and continue down the cause chain", () => {
+      const execError = Object.assign(new Error("Command failed"), {
+        stderr: "deep stderr",
+      });
+      const empty = new Error("no output", { cause: execError });
+      const wrapper = new Error("wrapped", { cause: empty });
+      expect(extractErrorOutputTail(wrapper)).toBe("deep stderr");
+    });
+
+    it("should truncate the output to its last maxChars characters", () => {
+      const error = Object.assign(new Error("Command failed"), {
+        stdout: "x".repeat(30),
+      });
+      expect(extractErrorOutputTail(error, 10)).toBe(`...${"x".repeat(10)}`);
     });
   });
 });

@@ -140,6 +140,154 @@ describe("AgentActions", () => {
       );
     });
 
+    it("should parse the default and per-action in-progress and abort statuses", () => {
+      const config = parseAgentActions(
+        [
+          "default:",
+          "  status_in_progress: In Progress",
+          "  status_abort: Aborted",
+          "actions:",
+          "  - project: Web",
+          "    status_start: To Do",
+          "    status_end: Done",
+          "    status_in_progress: Working",
+          "    status_abort: Cancelled",
+          "  - project: Backend",
+          "    status_start: To Do",
+          "    status_end: Done",
+        ].join("\n"),
+      );
+      expect(config.defaultStatusInProgress).toBe("In Progress");
+      expect(config.defaultStatusAbort).toBe("Aborted");
+      expect(config.actions[0].statusInProgress).toBe("Working");
+      expect(config.actions[0].statusAbort).toBe("Cancelled");
+      expect(config.actions[1].statusInProgress).toBeUndefined();
+      expect(config.actions[1].statusAbort).toBeUndefined();
+    });
+
+    it("should trim the configured in-progress and abort statuses", () => {
+      const config = parseAgentActions(
+        [
+          "default:",
+          '  status_in_progress: "  In Progress  "',
+          '  status_abort: " Aborted "',
+          "actions:",
+          "  - project: Web",
+          "    status_start: To Do",
+          "    status_end: Done",
+          '    status_in_progress: " Working "',
+        ].join("\n"),
+      );
+      expect(config.defaultStatusInProgress).toBe("In Progress");
+      expect(config.defaultStatusAbort).toBe("Aborted");
+      expect(config.actions[0].statusInProgress).toBe("Working");
+    });
+
+    it("should reject an empty or non-string default status_in_progress and status_abort", () => {
+      const failure = (field: string, value: string): (() => unknown) => () =>
+        parseAgentActions(
+          ["default:", `  ${field}: ${value}`, "actions: []"].join("\n"),
+        );
+      for (const field of ["status_in_progress", "status_abort"]) {
+        expect(failure(field, '""')).toThrow(
+          new RegExp(`'default\\.${field}' must be a non-empty string`),
+        );
+        expect(failure(field, "42")).toThrow(
+          new RegExp(`'default\\.${field}' must be a non-empty string`),
+        );
+      }
+    });
+
+    it("should reject an empty or non-string action status_in_progress and status_abort", () => {
+      const failure = (field: string, value: string): (() => unknown) => () =>
+        parseAgentActions(
+          [
+            "actions:",
+            "  - project: Web",
+            "    status_start: To Do",
+            "    status_end: Done",
+            `    ${field}: ${value}`,
+          ].join("\n"),
+        );
+      for (const field of ["status_in_progress", "status_abort"]) {
+        expect(failure(field, '""')).toThrow(
+          new RegExp(`'actions\\[0\\]\\.${field}' must be a non-empty string`),
+        );
+        expect(failure(field, "42")).toThrow(
+          new RegExp(`'actions\\[0\\]\\.${field}' must be a non-empty string`),
+        );
+      }
+    });
+
+    it("should resolve an action instruction referencing a template", () => {
+      const config = parseAgentActions(
+        [
+          "instructions:",
+          "  plan: Follow the implementation plan of the task",
+          "  review: Review the delivered work only",
+          "actions:",
+          "  - project: Web",
+          "    status_start: To Do",
+          "    status_end: Done",
+          "    instruction: plan",
+          "  - project: Backend",
+          "    status_start: To Do",
+          "    status_end: Done",
+          "    instruction: review",
+        ].join("\n"),
+      );
+      expect(config.actions[0].instruction).toBe(
+        "Follow the implementation plan of the task",
+      );
+      expect(config.actions[1].instruction).toBe(
+        "Review the delivered work only",
+      );
+    });
+
+    it("should keep an inline instruction when no template matches", () => {
+      const config = parseAgentActions(
+        [
+          "instructions:",
+          "  plan: Follow the implementation plan of the task",
+          "actions:",
+          "  - project: Web",
+          "    status_start: To Do",
+          "    status_end: Done",
+          "    instruction: Follow the guidelines",
+        ].join("\n"),
+      );
+      expect(config.actions[0].instruction).toBe("Follow the guidelines");
+    });
+
+    it("should resolve the instructions without any action referencing them", () => {
+      const config = parseAgentActions(
+        [
+          "instructions:",
+          "  plan: Follow the implementation plan of the task",
+          "actions: []",
+        ].join("\n"),
+      );
+      expect(config.instructions).toEqual({
+        plan: "Follow the implementation plan of the task",
+      });
+    });
+
+    it("should reject an invalid instructions mapping", () => {
+      expect(() =>
+        parseAgentActions(["instructions: nope", "actions: []"].join("\n")),
+      ).toThrow(/'instructions' must be a mapping/);
+      expect(() =>
+        parseAgentActions(
+          ["instructions:", '  empty: ""', "actions: []"].join("\n"),
+        ),
+      ).toThrow(/'instructions\.empty' must be a non-empty string/);
+      expect(() =>
+        parseAgentActions(
+          ["instructions:", "  plan: 42", "actions: []"].join("\n"),
+        ),
+      ).toThrow(/'instructions\.plan' must be a non-empty string/);
+    });
+
     it("should parse a minimal configuration without defaults", () => {
       const config = parseAgentActions(
         [

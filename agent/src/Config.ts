@@ -32,6 +32,9 @@ export class Config {
   public TASK_SMART_SCHEDULING: boolean;
   public TASK_CONFLICT_MODE: string;
   public TASK_ADJUSTMENT_MAX_ROUNDS: number;
+  // Periodic "still working" comment on tasks running longer than this
+  // many seconds; 0 disables the progress comments.
+  public TASK_PROGRESS_COMMENT_INTERVAL: number;
   public AGENT_UTILITY_MODEL: string;
   public AGENT_EVALUATION_TIMEOUT: number;
   public AGENT_NOTE_PROJECT: string;
@@ -106,6 +109,8 @@ export class Config {
     // Bound of the adjustment passes re-running the CLI when new comments
     // arrived on a task while a step ran (0 = detection only).
     this.TASK_ADJUSTMENT_MAX_ROUNDS = 2;
+    // Progress heartbeats are opt-in: 0 posts no periodic comment.
+    this.TASK_PROGRESS_COMMENT_INTERVAL = 0;
     this.AGENT_UTILITY_MODEL = "";
     // Bound of one scheduling round's utility-model evaluations (seconds).
     this.AGENT_EVALUATION_TIMEOUT = 30;
@@ -191,6 +196,10 @@ export class Config {
     if (config.TASK_ADJUSTMENT_MAX_ROUNDS !== undefined) {
       this.TASK_ADJUSTMENT_MAX_ROUNDS =
         config.TASK_ADJUSTMENT_MAX_ROUNDS as number;
+    }
+    if (config.TASK_PROGRESS_COMMENT_INTERVAL !== undefined) {
+      this.TASK_PROGRESS_COMMENT_INTERVAL =
+        config.TASK_PROGRESS_COMMENT_INTERVAL as number;
     }
     if (config.AGENT_UTILITY_MODEL !== undefined) {
       this.AGENT_UTILITY_MODEL = (config.AGENT_UTILITY_MODEL ?? "") as string;
@@ -335,6 +344,11 @@ export class Config {
     if (process.env.TASK_ADJUSTMENT_MAX_ROUNDS) {
       this.TASK_ADJUSTMENT_MAX_ROUNDS = parseInt(
         process.env.TASK_ADJUSTMENT_MAX_ROUNDS,
+      );
+    }
+    if (process.env.TASK_PROGRESS_COMMENT_INTERVAL) {
+      this.TASK_PROGRESS_COMMENT_INTERVAL = parseInt(
+        process.env.TASK_PROGRESS_COMMENT_INTERVAL,
       );
     }
     if (process.env.AGENT_UTILITY_MODEL !== undefined) {
@@ -512,6 +526,15 @@ export class Config {
     ) {
       errors.push(
         `TASK_ADJUSTMENT_MAX_ROUNDS must be a non-negative integer (current value: '${this.TASK_ADJUSTMENT_MAX_ROUNDS}')`,
+      );
+    }
+
+    if (
+      !Number.isInteger(this.TASK_PROGRESS_COMMENT_INTERVAL) ||
+      this.TASK_PROGRESS_COMMENT_INTERVAL < 0
+    ) {
+      errors.push(
+        `TASK_PROGRESS_COMMENT_INTERVAL must be a non-negative integer (current value: '${this.TASK_PROGRESS_COMMENT_INTERVAL}')`,
       );
     }
 

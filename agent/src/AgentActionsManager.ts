@@ -183,7 +183,10 @@ export class AgentActionsManager {
     this.config.defaultAgent = defaultAgent;
     this.config.defaultModel = parsed.defaultModel;
     this.config.defaultStatusError = parsed.defaultStatusError;
+    this.config.defaultStatusInProgress = parsed.defaultStatusInProgress;
+    this.config.defaultStatusAbort = parsed.defaultStatusAbort;
     this.config.defaultTimeout = parsed.defaultTimeout;
+    this.config.instructions = parsed.instructions;
     this.config.actions = parsed.actions.map((action) => ({
       ...action,
       agent: (action.agent || defaultAgent).trim().toLowerCase(),

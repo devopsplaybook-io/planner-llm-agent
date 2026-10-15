@@ -207,6 +207,9 @@ Promise.resolve().then(async () => {
     new PlannerClient(config),
     cliAgents.get(agentActionsManager.config.defaultAgent || config.AGENT_CLI)!,
     agentActionsManager.config,
+    // Live scheduling state for the note facts: the tasks being processed
+    // and the queue behind the capacity budget, read at generation time.
+    () => agent.getSchedulingState(),
   );
   if (agentNote.isEnabled()) {
     const updateAgentNote = () => {

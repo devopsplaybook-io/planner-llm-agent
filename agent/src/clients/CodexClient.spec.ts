@@ -139,7 +139,7 @@ describe("CodexClient", () => {
     );
 
     expect(summary).toBe(
-      "Implemented the feature\n\n---\nModel: gpt-5-codex",
+      "Implemented the feature\n\n---\nModel: gpt-5-codex · Duration: 0s",
     );
     const { args } = promptCall();
     // Everything before the trailing '--output-last-message <file> <prompt>'.
@@ -195,7 +195,9 @@ describe("CodexClient", () => {
       path.join(os.tmpdir(), "codex-spec", "task-1-Agent.md"),
     );
 
-    expect(summary).toBe("Implemented the feature");
+    expect(summary).toBe(
+      "Implemented the feature\n\n---\nModel: auto · Duration: 0s",
+    );
   });
 
   it("should isolate concurrent runs so each captures its own reply", async () => {
@@ -238,7 +240,10 @@ describe("CodexClient", () => {
       ),
     ]);
 
-    expect(summaries.sort()).toEqual(["Reply of run 1", "Reply of run 2"]);
+    expect(summaries.sort()).toEqual([
+      "Reply of run 1\n\n---\nModel: auto · Duration: 0s",
+      "Reply of run 2\n\n---\nModel: auto · Duration: 0s",
+    ]);
   });
 
   it("should use a unique reply file per run and remove it when the run settles", async () => {
@@ -265,7 +270,9 @@ describe("CodexClient", () => {
       task(),
       path.join(os.tmpdir(), "codex-spec", "task-1-Agent.md"),
     );
-    expect(summary).toBe("Reply of this run");
+    expect(summary).toBe(
+      "Reply of this run\n\n---\nModel: auto · Duration: 0s",
+    );
 
     // The reply file is removed after the run settles.
     await waitFor(() => !fse.pathExistsSync(replyFiles[0]));
@@ -276,7 +283,9 @@ describe("CodexClient", () => {
       task(),
       path.join(os.tmpdir(), "codex-spec", "task-1-Agent.md"),
     );
-    expect(summary2).toBe("Reply of this run");
+    expect(summary2).toBe(
+      "Reply of this run\n\n---\nModel: auto · Duration: 0s",
+    );
     expect(replyFiles[1]).not.toBe(replyFiles[0]);
     await waitFor(() => !fse.pathExistsSync(replyFiles[1]));
   });

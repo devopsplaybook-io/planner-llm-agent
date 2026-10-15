@@ -4,7 +4,7 @@ import type { AgentActionsConfig } from "../AgentActions";
 import { getAgentConfigContentPath, listAgentSkills } from "../AgentConfigRepository";
 import { AgentSessionMetrics } from "../AgentSessionMetrics";
 import { Config, githubTokenEnvName } from "../Config";
-import { ExecFileError, extractErrorDetail, runCli, RunCliOptions } from "../CliUtils";
+import { CliAbortedError, ExecFileError, extractErrorDetail, isCliAbortError, runCli, RunCliOptions } from "../CliUtils";
 import { OTelLogger, OTelTracer } from "../OTelContext";
 import type { PlannerTask } from "../PlannerClient";
 import { CliAgentClient, PromptOptions, TaskOptions } from "./CliAgent";
@@ -256,6 +256,7 @@ export abstract class BaseCliAgent implements CliAgentClient {
             cwd: workingDir,
             maxBuffer: MAX_BUFFER_BYTES,
             killProcessGroup: true,
+            abortSignal: options?.abortSignal,
           },
           "task execution",
         );
@@ -318,15 +319,26 @@ export abstract class BaseCliAgent implements CliAgentClient {
             `${this.displayName} stderr: ${result.stderr.trim().slice(0, 500)}`,
           );
         }
-        const emptyFooter = this.buildFooter(model, usageBefore, usageAfter);
+        const emptyFooter = this.buildFooter(
+          model,
+          usageBefore,
+          usageAfter,
+          Date.now() - sessionStartedAt,
+        );
+        const noOutputMessage = `Task executed (no output returned by ${this.displayName})`;
         return emptyFooter.length > 0
-          ? emptyFooter
-          : `Task executed (no output returned by ${this.displayName})`;
+          ? `${noOutputMessage}\n\n${emptyFooter}`
+          : noOutputMessage;
       }
       logger.info(
         `${this.displayName} summary captured from ${source} (${summary.length} chars)`,
       );
-      const footer = this.buildFooter(model, usageBefore, usageAfter);
+      const footer = this.buildFooter(
+        model,
+        usageBefore,
+        usageAfter,
+        Date.now() - sessionStartedAt,
+      );
       return footer.length > 0 ? `${summary}\n\n${footer}` : summary;
     } finally {
       if (args !== null) {
@@ -442,6 +454,11 @@ export abstract class BaseCliAgent implements CliAgentClient {
     try {
       return await runCli(this.cliCommand(), args, options);
     } catch (error) {
+      // A user-requested abort keeps its dedicated error type: the caller
+      // (Agent) tells an abort apart from a timeout or a CLI failure.
+      if (isCliAbortError(error)) {
+        throw new CliAbortedError(`${this.displayName} ${action} aborted`);
+      }
       const execError = error as ExecFileError;
       if (execError.code === "ENOENT") {
         throw new Error(
@@ -462,20 +479,25 @@ export abstract class BaseCliAgent implements CliAgentClient {
     }
   }
 
-  // The footer appended to every task comment displays the model used and
-  // the usage metric before and after the task execution.
+  // The footer appended to every task comment displays the model used, the
+  // usage metric before and after the task execution and the elapsed
+  // duration of the run.
   protected buildFooter(
     model: { model: string; source: string } | null,
     usageBefore: number | null,
     usageAfter: number | null,
+    durationMs: number | null = null,
   ): string {
     const usage = this.usageFooter(usageBefore, usageAfter);
-    if (model === null && usage === null) {
+    if (model === null && usage === null && durationMs === null) {
       return "";
     }
     const parts = [`Model: ${model !== null ? model.model : "auto"}`];
     if (usage !== null) {
       parts.push(usage);
+    }
+    if (durationMs !== null) {
+      parts.push(`Duration: ${formatDuration(durationMs)}`);
     }
     return `---\n${parts.join(" · ")}`;
   }
@@ -589,6 +611,19 @@ export function extractTaskModel(description: string): string | null {
 
 function formatUsageValue(usage: number | null): string {
   return usage !== null ? usage.toFixed(2) : "unknown";
+}
+
+// Compact elapsed-time rendering for the report footer (23m, 1h05m).
+function formatDuration(durationMs: number): string {
+  const seconds = Math.max(0, Math.round(durationMs / 1000));
+  if (seconds < 60) {
+    return `${seconds}s`;
+  }
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) {
+    return `${minutes}m`;
+  }
+  return `${Math.floor(minutes / 60)}h${String(minutes % 60).padStart(2, "0")}m`;
 }
 
 function formatCliOutput(result: { stdout: string; stderr: string }): string {

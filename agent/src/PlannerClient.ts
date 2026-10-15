@@ -51,6 +51,10 @@ export interface PlannerProject {
   id: string;
   name: string;
   description: string;
+  // Status catalog of the project, when the server reports one (older
+  // deploys omit it): used to degrade gracefully when a configured status
+  // (e.g. status_in_progress) does not exist in the project.
+  statuses?: string[];
 }
 
 export interface PlannerNote {
@@ -294,6 +298,9 @@ export class PlannerClient {
             project.description === undefined || project.description === null
               ? ""
               : String(project.description),
+          statuses: Array.isArray(project.statuses)
+            ? project.statuses.map((status: unknown) => String(status))
+            : undefined,
         }));
     } catch (error) {
       span.recordException(error as Error);

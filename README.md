@@ -33,6 +33,7 @@ Configuration values are resolved with the following priority:
 | `TASK_SMART_SCHEDULING` | `true`                        | Weighted, conflict-aware scheduling when `true`; `false` restores the historical count-based parallelism |
 | `TASK_CONFLICT_MODE`    | `repo`                        | Automatic conflict keys derived from the task content: `repo`, `project` or `none` (see [Parallel scheduling](#parallel-scheduling)) |
 | `TASK_ADJUSTMENT_MAX_ROUNDS` | `2`                      | Maximum number of adjustment passes re-running the CLI when new comments arrive on a task while a step runs (see [New comment check](#new-comment-check)); `0` only detects and logs them |
+| `TASK_PROGRESS_COMMENT_INTERVAL` | `0`                  | Seconds between periodic "still working" comments posted on a running task; `0` disables the heartbeats |
 | `AGENT_UTILITY_MODEL`   | (empty)                       | Fast/cheap model (on the configured CLI) pre-evaluating the weight and repositories of hint-less tasks; empty disables it (zero LLM calls) |
 | `AGENT_EVALUATION_TIMEOUT` | `30`                       | Maximum duration in seconds of one scheduling round's utility-model evaluations (see [Utility model](#utility-model-optional)) |
 | `TASK_TIMEOUT`          | `3600`                        | Maximum duration of a task execution in seconds (fallback when the actions configuration defines no timeout) |
@@ -83,14 +84,16 @@ When the actions configuration sets a `default.model`, the startup authenticatio
 
 ### Task execution report
 
-Every task comment posted to Planner ends with a footer that displays the model used and the usage metric reported by the CLI for the task execution:
+Every task comment posted to Planner ends with a footer that displays the model used, the usage metric reported by the CLI for the task execution and the elapsed duration of the run:
 
 ```
 ---
-Model: claude-sonnet-4-5 · Qoder credits used: 3.81
+Model: claude-sonnet-4-5 · Qoder credits: 12.00 -> 15.81 · Duration: 23m
 ```
 
-The usage metric depends on the selected CLI: the Qoder credits consumed by the run (`total_credits`, persisted in `<DATA_DIR>/qoder-credits.json`) or the cost of the Claude Code run (`total_cost_usd`). Both are per-run values, not account balances. CLIs that report no metric (Copilot CLI, Codex, Gemini CLI) only display the model in the footer. The model is displayed as `auto` when no model is configured for the task.
+The usage metric is displayed as `before -> after` (the values persisted around the run) and depends on the selected CLI: the Qoder credits consumed by the run (`total_credits`, persisted in `<DATA_DIR>/qoder-credits.json`) or the cost of the Claude Code run (`total_cost_usd`). Both are per-run values, not account balances. CLIs that report no metric (Copilot CLI, Codex, Gemini CLI) only display the model and the duration in the footer. The model is displayed as `auto` when no model is configured for the task.
+
+When a task fails, the failure comment salvages what the CLI run left behind: the partial summary file written by the CLI (when any) and the tail of its captured output, so the state of the interrupted work is visible on Planner without digging through the agent logs.
 
 ### Git and GitHub
 
@@ -258,40 +261,52 @@ Setting `TASK_SMART_SCHEDULING=false` restores the historical behavior exactly: 
 The actions of the agent are defined in a YAML file (path `AGENT_ACTIONS_FILE`, default `/etc/planner/llm-agent.yaml`). Each action binds a Planner project pattern and a start status to an optional model, an optional instruction, an optional timeout and an end status:
 
 ```yaml
+instructions:
+  plan: Analyze the task and post an implementation plan as the task summary. Do not modify any code.
+  deliver: Implement the task, keep the "Agent Notes" section updated and open a PR when the work is ready for review.
 default:
   agent: qoder
   model: DeepSeek-Flash
   timeout: 3600
   status_error: Review
+  status_in_progress: In Progress
+  status_abort: Aborted
 actions:
   - project: Web
     status_start: To Do
     status_end: In Review
     status_error: Blocked
+    status_in_progress: In Progress
+    status_abort: Cancelled
     agent: copilot-cli
     model: gpt-6-luna
-    instruction: Follow the repository coding guidelines and open a PR when the task is done.
+    instruction: deliver
     timeout: 1800
     weight: 0.75
   - project: Project*
     status_start: Blocked
     status_end: Done
+    status_abort: Aborted
     priority: low
   - status_start: In Progress
     status_end: Done
+    instruction: plan
 ```
 
 For every poll, the agent checks if an assigned task matches the project pattern and the start status of an action. Matching tasks are processed with the action model and instruction (on top of the task information) and moved to the action end status once processed; a processing failure moves the task to the resolved `status_error` instead (see below).
 
-- `status_start` and `status_end` are required; `project`, `agent`, `model`, `instruction`, `timeout`, `weight`, `status_error` and `priority` are optional. `project` matches any project when missing, null or empty; otherwise it is a case-sensitive glob pattern where `*` matches any sequence of characters (e.g. `Project*` matches `Projects` and `Projects - Planner`). Overlapping patterns are allowed: the first matching action in the list processes the task, and a task whose project cannot be resolved never matches a project-bound action.
+- `status_start` and `status_end` are required; `project`, `agent`, `model`, `instruction`, `timeout`, `weight`, `status_error`, `status_in_progress`, `status_abort` and `priority` are optional. `project` matches any project when missing, null or empty; otherwise it is a case-sensitive glob pattern where `*` matches any sequence of characters (e.g. `Project*` matches `Projects` and `Projects - Planner`). Overlapping patterns are allowed: the first matching action in the list processes the task, and a task whose project cannot be resolved never matches a project-bound action.
 - `default.agent` selects the CLI agent used by default; when omitted, `AGENT_CLI` is used (Qoder by default). An action-level `agent` overrides it. Supported values are `qoder`, `claude-code`, `copilot-cli`, `codex` and `gemini-cli`. Every distinct configured agent is validated and its authentication is checked at startup when `AGENT_AUTH_CHECK` is enabled. `default.model` applies to the default agent; set `model` on an action that uses another agent when it needs a specific model.
 - `weight` is the scheduling weight of the tasks handled by the action (a number greater than 0 and at most 1, e.g. `0.5` for a batch of small routine tasks); an `agent-weight:` line in the task description still takes precedence (see [Parallel scheduling](#parallel-scheduling)).
 - `priority` overrides the queue priority of the tasks handled by the action: `high`, `medium` or `low` (case-insensitive; validated at startup like the other fields). When unset, the task's own Planner priority applies. It only changes the order in which ready tasks are picked (see [Parallel scheduling](#parallel-scheduling)); a task is still processed by the first matching action.
 - `default.model` is the fallback model for actions without their own model, and `default.timeout` is the fallback timeout for actions without their own timeout. A model id must be accepted by the selected CLI (`gpt-6-luna` and not the display name `GPT-6 Luna`, for example): a bad id fails the task immediately with the CLI error.
 - The task timeout is resolved per task with the following priority: the `timeout` of the matching action, then `default.timeout`, then the global `TASK_TIMEOUT` configuration (default `3600` = 1 hour). It must be a positive integer in seconds.
 - `status_error` is the status a failed task is moved to (a CLI error, a task timeout, a preparation failure): it is resolved per task with the following priority: the `status_error` of the matching action, then `default.status_error`, then the action `status_end` (the historical behavior). A successfully processed task is always moved to the `status_end`. The resolved status must be one of the statuses of the target project on Planner.
+- `status_in_progress` is the status a task is moved to while the agent works on it, so its processing state is visible on Planner. Resolved like `status_error` (action, then `default.status_in_progress`); when neither is set, no transition happens (the historical behavior). The transition is best-effort: when the project status catalog is known and does not contain the status, or when the transition fails, a warning is logged and the task keeps its current status while the processing continues.
+- `status_abort` enables per-task cancellation (see [Cancelling a running task](#cancelling-a-running-task)). Resolved like `status_error` (action, then `default.status_abort`); when neither is set, no task of the action can be cancelled.
+- The optional top-level `instructions` mapping defines named instruction templates: an action `instruction` value that exactly matches a template name resolves to the template content, so several actions can share one long instruction without repeating it. Any other value is used verbatim as an inline instruction, so existing configurations keep working. Template contents are validated at startup (a non-string or empty template fails fast).
 - When the task timeout expires, the whole CLI process group is killed (SIGTERM, then SIGKILL after a 10 seconds grace period), so processes spawned by the coding-agent CLI (shells, `git`, `npm test`, dev servers) cannot survive the timeout. The task then fails and is moved to the resolved `status_error` with an explanation.
-- When the agent starts working on a task, it posts a one-line comment on the task (`Agent '<AGENT_NAME>' started working on this task.`) to notify the user. This notification is best-effort: a failure to post it does not fail the task.
+- When the agent starts working on a task, it posts a one-line comment on the task (`Agent '<AGENT_NAME>' started working on this task (model <model>).` — the model part only when a model is configured for the task) to notify the user. This notification is best-effort: a failure to post it does not fail the task. While a task runs, a periodic "still working" comment with the elapsed time can be posted on it when `TASK_PROGRESS_COMMENT_INTERVAL` is set (disabled by default): one comment per interval instead of total silence between the start notification and the summary.
 - The format is checked at startup: when the file exists but is invalid (bad YAML, missing or empty required fields, non-string projects, invalid timeouts, weights or priorities, unknown fields, duplicate project pattern and start status), the agent exits immediately with the list of problems.
 - When the file does not exist, the agent starts with no action and processes no task (a warning is logged at startup).
 - `TASK_STATUS_CLEANUP` still governs the deletion of the local task folder, whatever end status the task reached.
@@ -308,6 +323,21 @@ Example for a local test with a temporary actions file:
 ```sh
 AGENT_ACTIONS_FILE=/tmp/llm-agent.yaml npm run dev
 ```
+
+### Cancelling a running task
+
+When an action (or `default.status_abort`) defines a `status_abort` status, the user can cancel a task while the agent works on it by moving the task to that status on Planner. On the next poll (the polls keep the base `TASK_POLLING_INTERVAL` cadence while tasks run, so the detection latency is bounded by the polling interval — about one minute with the default), the agent kills the whole CLI process group of the task (SIGTERM, then SIGKILL after a 10 seconds grace period, so processes spawned by the CLI cannot survive the cancellation), posts a short comment explaining that the task was aborted at user request and no summary was produced, and lets the task keep the status the user set: no end status, no error status, no finalization. The local task folder is cleaned up when the abort status is the `TASK_STATUS_CLEANUP` status, otherwise on a later poll once the task reaches it.
+
+### Validating the configuration
+
+The actions file is validated at startup (an invalid file stops the agent), and it can also be checked without running the agent:
+
+```sh
+npm run check-config                     # from a source checkout
+node dist/checkConfig.js                 # inside the container (compiled)
+```
+
+The command loads the actions file (`AGENT_ACTIONS_FILE`, default `/etc/planner/llm-agent.yaml`), prints the parsed configuration (the defaults, the instruction templates and every action with its resolved model, timeout, statuses and instruction) and exits `0` when the configuration is valid, `1` with the list of problems otherwise. A missing file is reported as valid (the agent then runs without any action).
 
 ## Agent config repository
 
@@ -342,6 +372,7 @@ The note content is generated by the LLM from facts collected by the agent:
 - Capabilities: the skills available from the agent config repository
 - Git and GitHub integration: authentication and commit signing setup, including the organizations with dedicated tokens
 - Activity: the number of tasks executed and the titles of the most recent ones
+- Live scheduling state: the tasks currently being processed (title, elapsed time, model) and the queue behind the capacity budget (count and titles)
 - Account status: the usage metric reported by the CLI (Qoder credits used by the last run, cost of the last Claude Code run, ...)
 
 The note is updated when the agent starts (so a configuration change is picked up on every restart) and then every `AGENT_NOTE_INTERVAL` seconds (86400 = daily by default, set `3600` for hourly updates). A failed update is logged and retried on the next interval; it never stops the agent.
@@ -361,6 +392,7 @@ Example configuration (hourly updates):
 npm run build   # compile TypeScript
 npm run lint    # oxlint
 npm test        # jest
+npm run check-config   # validate the agent actions file and print the resolved actions
 npm run dev     # run locally against a Planner instance
 ```
 

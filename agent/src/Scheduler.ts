@@ -28,6 +28,11 @@ export interface RunningTask {
   conflictKeys: string[];
   startedAt: number;
   model: string;
+  // Resolved abort status of the action (action status_abort, then the
+  // actions default status_abort): when a user moves the running task to
+  // this status on Planner, the poll cancels it (undefined = not
+  // cancellable).
+  statusAbort?: string;
 }
 
 // A ready (task, action) pair with the resolved project name (empty when
