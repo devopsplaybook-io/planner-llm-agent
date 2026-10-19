@@ -1,7 +1,8 @@
 import * as fse from "fs-extra";
 import * as path from "path";
 import type { AgentActionsConfig } from "../AgentActions";
-import { getAgentConfigContentPath, listAgentSkills } from "../AgentConfigRepository";
+import { getAgentConfigContentPath } from "../AgentConfigRepository";
+import { getCoreSkillsPath, listAvailableSkills, listCoreSkills } from "../CoreSkills";
 import { AgentSessionMetrics } from "../AgentSessionMetrics";
 import { Config, githubTokenEnvName } from "../Config";
 import { CliAbortedError, ExecFileError, extractErrorDetail, isCliAbortError, runCli, RunCliOptions } from "../CliUtils";
@@ -554,9 +555,17 @@ export abstract class BaseCliAgent implements CliAgentClient {
         `Agent configuration (skills, configuration files and other resources) is synced locally at: ${getAgentConfigContentPath(this.config)}. Use it whenever it is relevant to the task.`,
       );
     }
+    // The core skills ship with the agent image and are available even when
+    // no agent config repository is configured.
+    if ((await listCoreSkills(this.config)).length > 0) {
+      promptLines.push(
+        `Core skills (shipped with the agent image) are available at: ${getCoreSkillsPath(this.config)}.`,
+      );
+    }
     // Listing the skills makes them visible to every CLI, including the
-    // ones that do not discover the synced repository on their own.
-    const skills = await listAgentSkills(this.config);
+    // ones that do not discover the synced repository or the image skills
+    // on their own.
+    const skills = await listAvailableSkills(this.config);
     if (skills.length > 0) {
       promptLines.push(
         `Available skills (read the SKILL.md of the relevant one before starting): ${skills

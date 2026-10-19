@@ -125,6 +125,7 @@ COPY --from=builder /opt/src/agent/node_modules /opt/app/planner-llm-agent/node_
 COPY --from=builder /opt/src/agent/dist /opt/app/planner-llm-agent/dist
 COPY agent/config.json /opt/app/planner-llm-agent/config.json
 COPY package.json /opt/app/planner-llm-agent/package.json
+COPY agent/skills /opt/app/planner-llm-agent/skills
 
 # Run as a dedicated non-root user (uid/gid 10001). /data is chowned here for
 # plain bind mounts; on Kubernetes the securityContext (runAsUser 10001,

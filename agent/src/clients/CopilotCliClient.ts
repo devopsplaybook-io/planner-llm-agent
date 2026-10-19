@@ -1,4 +1,5 @@
 import { getAgentSkillsPath } from "../AgentConfigRepository";
+import { getCoreSkillsPath } from "../CoreSkills";
 import { ExecFileError, extractErrorDetail, runCli } from "../CliUtils";
 import { OTelLogger } from "../OTelContext";
 import { BaseCliAgent } from "./BaseCliAgent";
@@ -63,25 +64,29 @@ export class CopilotCliClient extends BaseCliAgent {
     return "Copilot usage";
   }
 
-  // Registers the synced skills directory with the Copilot CLI: unlike the
-  // other CLIs it does not discover the agent-config repository on its own,
-  // so without this registration the model never sees the synced skills.
+  // Registers the skills directories with the Copilot CLI: unlike the other
+  // CLIs it does not discover the agent image skills or the agent-config
+  // repository on its own, so without this registration the model never
+  // sees the skills. The core skills directory is always registered and the
+  // synced directory joins it when a config repository is configured.
   // Best-effort: a failure is logged and the agent keeps running.
   public async prepare(): Promise<void> {
-    if (this.config.AGENT_CONFIG_REPOSITORY.trim().length === 0) {
-      return;
+    const skillsDirs = [getCoreSkillsPath(this.config)];
+    if (this.config.AGENT_CONFIG_REPOSITORY.trim().length > 0) {
+      skillsDirs.push(getAgentSkillsPath(this.config));
     }
-    const skillsDir = getAgentSkillsPath(this.config);
-    try {
-      await runCli(this.cliCommand(), ["skill", "add", skillsDir], {
-        timeout: SKILL_ADD_TIMEOUT_MS,
-        windowsHide: true,
-      });
-      logger.info(`Copilot skills directory registered: ${skillsDir}`);
-    } catch (error) {
-      logger.warn(
-        `Copilot skills directory registration failed (the skills stay usable through the task prompt): ${extractErrorDetail(error as ExecFileError)}`,
-      );
+    for (const skillsDir of skillsDirs) {
+      try {
+        await runCli(this.cliCommand(), ["skill", "add", skillsDir], {
+          timeout: SKILL_ADD_TIMEOUT_MS,
+          windowsHide: true,
+        });
+        logger.info(`Copilot skills directory registered: ${skillsDir}`);
+      } catch (error) {
+        logger.warn(
+          `Copilot skills directory registration failed (the skills stay usable through the task prompt): ${extractErrorDetail(error as ExecFileError)}`,
+        );
+      }
     }
   }
 }

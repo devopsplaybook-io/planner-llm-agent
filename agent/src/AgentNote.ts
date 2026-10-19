@@ -2,6 +2,7 @@ import * as fse from "fs-extra";
 import * as path from "path";
 import { AgentActionsConfig } from "./AgentActions";
 import { getAgentConfigContentPath } from "./AgentConfigRepository";
+import { listCoreSkills } from "./CoreSkills";
 import { Config, githubTokenEnvName } from "./Config";
 import { OTelLogger, OTelTracer } from "./OTelContext";
 import { PlannerClient, PlannerNote, PlannerProject } from "./PlannerClient";
@@ -9,7 +10,7 @@ import type { CliAgentClient } from "./clients/CliAgent";
 
 const logger = OTelLogger().createModuleLogger("agent-note");
 
-const MAX_SKILLS_LISTED = 20;
+const MAX_SKILLS_LISTED = 30;
 const MAX_RECENT_TASKS = 10;
 const MAX_QUEUED_TITLES_SHOWN = 5;
 const MAX_INSTRUCTION_SHOWN = 100;
@@ -270,18 +271,26 @@ export class AgentNote {
     ];
   }
 
-  // Top-level entries of the synced agent config content (skills and other
-  // resources the agent can use).
+  // The skills the agent can use (the core skills shipped with the image
+  // merged with the top-level entries of the synced agent config content:
+  // skills and other resources), deduplicated, sorted and capped.
   private async listSkills(): Promise<string[]> {
     const contentPath = getAgentConfigContentPath(this.config);
-    if (!(await fse.pathExists(contentPath))) {
-      return [];
-    }
-    const entries = await fse.readdir(contentPath);
-    return entries
-      .filter((entry) => !entry.startsWith("."))
-      .sort()
-      .slice(0, MAX_SKILLS_LISTED);
+    const [coreSkills, entries] = await Promise.all([
+      listCoreSkills(this.config),
+      (async () => {
+        if (!(await fse.pathExists(contentPath))) {
+          return [] as string[];
+        }
+        return fse.readdir(contentPath);
+      })(),
+    ]);
+    const names = new Set<string>(
+      [...entries, ...coreSkills.map((skill) => skill.name)].filter(
+        (entry) => !entry.startsWith("."),
+      ),
+    );
+    return [...names].sort().slice(0, MAX_SKILLS_LISTED);
   }
 
   // Task documentation files kept in DATA_DIR: their names and the task

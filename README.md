@@ -60,7 +60,7 @@ The command of each CLI is configurable, and the container ships every supported
 
 Only Qoder supports a model listing; for the other CLIs the model validation is skipped. Some CLIs do not report a usage metric (credits or cost): the task report footer then only displays the model, without warning.
 
-The Copilot CLI runs with `--output-format text --silent` (only the final reply is captured) and, when the agent config repository is configured, the agent registers its skills directory at startup (`copilot skill add <AGENT_CONFIG_CONTENT_PATH>/skills`): Copilot does not discover the synced repository on its own, so without this registration the model would not see the synced skills. The registration is idempotent and best-effort — a failure is logged and the tasks keep running with the skills listed in the task prompt.
+The Copilot CLI runs with `--output-format text --silent` (only the final reply is captured) and the agent registers its skills directories at startup: the core skills directory shipped with the image is always registered and, when the agent config repository is configured, the synced skills directory joins it (`copilot skill add <path>`). Copilot does not discover the image skills or the synced repository on its own, so without this registration the model would not see the skills. The registration is idempotent and best-effort — a failure is logged and the tasks keep running with the skills listed in the task prompt.
 
 ### Model selection
 
@@ -142,6 +142,7 @@ When no default token is configured and exactly one organization token exists, t
 | `AGENT_CONFIG_BRANCH`        | `main`  | Branch to sync                                                      |
 | `AGENT_CONFIG_FOLDER`        | (empty) | Only sync this folder of the repository (sparse checkout)           |
 | `AGENT_CONFIG_SYNC_INTERVAL` | `300`   | Seconds between refreshes of the local copy                         |
+| `CORE_SKILLS_PATH`           | (empty) | Core skills directory override (empty resolves to the skills directory shipped with the image, next to the compiled code) |
 
 ### Agent note
 
@@ -339,16 +340,29 @@ node dist/checkConfig.js                 # inside the container (compiled)
 
 The command loads the actions file (`AGENT_ACTIONS_FILE`, default `/etc/planner/llm-agent.yaml`), prints the parsed configuration (the defaults, the instruction templates and every action with its resolved model, timeout, statuses and instruction) and exits `0` when the configuration is valid, `1` with the list of problems otherwise. A missing file is reported as valid (the agent then runs without any action).
 
+## Core skills
+
+The agent image ships a set of core skills that are always available to tasks, with no agent config repository required. They live in the image at `/opt/app/planner-llm-agent/skills` (one directory per skill, each with its `SKILL.md`) and cover the domains every deployment needs:
+
+- `planner-tasks` — Planner tasks through the Planner API: read, search, create, update, comments, labels, dependencies, attachments, and the follow-up task recipe.
+- `planner-notes` — Planner notes: list, read, create, update, comments, labels, attachments.
+- `planner-projects` — Planner reference data: resolve projects, their statuses and human assignee ids.
+- `planner-templates` — Planner task templates: CRUD, automation schedules, instance creation.
+- `github-pull-request` — basic Git/GitHub workflow: branch, commit, push, open and update a pull request, merge conventions.
+- `github-checks` — GitHub Actions checks: watch, diagnose failures, rerun policies.
+
+Every task prompt lists the available skills (core and synced, with a one-line description each) and states where the core skills live, so the LLM can read the relevant `SKILL.md` before starting. A skill synced from the agent config repository with the same name **overrides** the core skill of that name — a deployment can customize a core skill without rebuilding the image. The directory can be relocated with `CORE_SKILLS_PATH` (useful in development setups where the skills folder does not sit next to the compiled code).
+
 ## Agent config repository
 
-Skills, configuration files and other resources the agent should use are defined in a dedicated Git repository (the _agent config repository_). The agent clones it at startup, keeps a local copy under `/data/agent-config` (`/data/agent-config/<folder>` when `AGENT_CONFIG_FOLDER` is set) and refreshes it every `AGENT_CONFIG_SYNC_INTERVAL` seconds.
+Skills, configuration files and other resources the agent should use are defined in a dedicated Git repository (the _agent config repository_). The agent clones it at startup, keeps a local copy under `/data/agent-config` (`/data/agent-config/<folder>` when `AGENT_CONFIG_FOLDER` is set) and refreshes it every `AGENT_CONFIG_SYNC_INTERVAL` seconds. The core skills shipped with the image (see [Core skills](#core-skills)) are available on top of it.
 
 - The startup clone fails fast: the agent does not start when the repository cannot be cloned.
 - A failed periodic refresh keeps the last synced copy and only logs an error.
 - The working tree is forced to match the remote branch on every refresh, so the local copy is always a faithful mirror of the repository.
 - Authentication uses the Git and GitHub settings above (GitHub token or SSH key); public repositories need no authentication.
 - Every task prompt tells the agent where the configuration is synced, so skills and resources are directly usable during task execution.
-- Every task prompt also lists the available skills (the `skills/<name>/SKILL.md` entries of the repository, with a one-line description each), so the LLM knows which skill to read before starting. The Copilot CLI does not discover the synced repository on its own: at startup the agent additionally registers the skills directory with `copilot skill add`, which makes the CLI expose the skills to the model in every run (best-effort, see [CLI agent](#cli-agent)).
+- Every task prompt also lists the available skills — the core skills shipped with the image plus the `skills/<name>/SKILL.md` entries of the repository (a synced skill with the same name wins), with a one-line description each — so the LLM knows which skill to read before starting. The Copilot CLI does not discover the image skills or the synced repository on its own: at startup the agent registers both skills directories with `copilot skill add`, which makes the CLI expose the skills to the model in every run (best-effort, see [CLI agent](#cli-agent)).
 
 Example:
 
@@ -369,7 +383,7 @@ The note content is generated by the LLM from facts collected by the agent:
 
 - Agent identity: name, version, current date and session uptime
 - Mission: the agent actions configuration (projects, statuses, models and instructions) and the effective default model
-- Capabilities: the skills available from the agent config repository
+- Capabilities: the skills available to tasks (the core skills shipped with the image plus the agent config repository content)
 - Git and GitHub integration: authentication and commit signing setup, including the organizations with dedicated tokens
 - Activity: the number of tasks executed and the titles of the most recent ones
 - Live scheduling state: the tasks currently being processed (title, elapsed time, model) and the queue behind the capacity budget (count and titles)

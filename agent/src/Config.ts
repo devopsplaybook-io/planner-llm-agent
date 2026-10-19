@@ -67,6 +67,9 @@ export class Config {
   public AGENT_CONFIG_BRANCH: string;
   public AGENT_CONFIG_FOLDER: string;
   public AGENT_CONFIG_SYNC_INTERVAL: number;
+  // Core skills shipped with the agent image (empty resolves to the skills
+  // directory sitting next to the compiled code)
+  public CORE_SKILLS_PATH: string;
 
   // OpenTelemetry
   public OPENTELEMETRY_COLLECTOR_HTTP_TRACES: string;
@@ -139,6 +142,7 @@ export class Config {
     this.AGENT_CONFIG_BRANCH = "main";
     this.AGENT_CONFIG_FOLDER = "";
     this.AGENT_CONFIG_SYNC_INTERVAL = 300;
+    this.CORE_SKILLS_PATH = "";
 
     this.OPENTELEMETRY_COLLECTOR_HTTP_TRACES = "";
     this.OPENTELEMETRY_COLLECTOR_HTTP_METRICS = "";
@@ -275,6 +279,9 @@ export class Config {
     if (config.AGENT_CONFIG_SYNC_INTERVAL) {
       this.AGENT_CONFIG_SYNC_INTERVAL =
         config.AGENT_CONFIG_SYNC_INTERVAL as number;
+    }
+    if (config.CORE_SKILLS_PATH !== undefined) {
+      this.CORE_SKILLS_PATH = (config.CORE_SKILLS_PATH ?? "") as string;
     }
 
     if (config.OPENTELEMETRY_COLLECTOR_HTTP_TRACES) {
@@ -426,6 +433,9 @@ export class Config {
       this.AGENT_CONFIG_SYNC_INTERVAL = parseInt(
         process.env.AGENT_CONFIG_SYNC_INTERVAL,
       );
+    }
+    if (process.env.CORE_SKILLS_PATH !== undefined) {
+      this.CORE_SKILLS_PATH = process.env.CORE_SKILLS_PATH ?? "";
     }
     if (process.env.OPENTELEMETRY_COLLECTOR_HTTP_TRACES) {
       this.OPENTELEMETRY_COLLECTOR_HTTP_TRACES =
