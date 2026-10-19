@@ -219,6 +219,15 @@ describe("BaseCliAgent", () => {
       expect(args[3]).toContain(`Working directory: ${taskDir}`);
     });
 
+    it("states the no-implied-follow-up rule in the task prompt", async () => {
+      const notesFile = path.join(dataDir, "tasks", "task-1-Agent.md");
+      await agent.performTask(buildTask(), notesFile);
+
+      const { args } = lastCall();
+      expect(args[3]).toContain("Nothing of this session survives after it ends");
+      expect(args[3]).toContain("suggestion to create a follow-up Planner task");
+    });
+
     it("falls back to the notes file directory as working directory", async () => {
       const notesFile = path.join(dataDir, "tasks", "task-1-Agent.md");
       await agent.performTask(buildTask(), notesFile);

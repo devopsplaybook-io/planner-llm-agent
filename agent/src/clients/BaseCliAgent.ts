@@ -568,6 +568,7 @@ export abstract class BaseCliAgent implements CliAgentClient {
       "1. Perform the task described in the documentation file.",
       '2. Keep the "Agent Notes" section of the documentation file updated with what you did and learned, so future runs know the state of the task.',
       `3. Write a concise summary of what has been done to the file: ${summaryFile}. The summary will be posted as a comment on the task.`,
+      "4. Nothing of this session survives after it ends: never state or imply that something will be checked, watched, merged or finished later or in the background. If a follow-up check or action would be needed after this run, do not promise it — instead comment on the task a suggestion to create a follow-up Planner task for it (the planner-tasks skill explains how).",
     );
     return promptLines.join("\n");
   }
