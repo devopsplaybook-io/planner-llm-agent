@@ -350,28 +350,34 @@ describe("Agent", () => {
   it("should poll for tasks immediately and at the configured interval", async () => {
     jest.useFakeTimers();
     // A poll that is still running makes the next tick skip (single-flight
-    // guard): let the real I/O of each poll complete before advancing to
-    // the next interval.
+    // guard): wait until each poll is recorded (real sleeps — the condition
+    // must be observed outside the fake clock) and let its tail settle
+    // before advancing to the next interval, so a loaded runner cannot skip
+    // a tick.
     const realSetTimeout = jest.requireActual("timers").setTimeout;
-    const flushPoll = async (): Promise<void> => {
+    const waitUntilPolled = async (expected: number): Promise<void> => {
+      for (
+        let i = 0;
+        i < 200 && mockPlanner.getCurrentUser.mock.calls.length < expected;
+        i++
+      ) {
+        await new Promise((resolve) => realSetTimeout(resolve, 5));
+      }
       await new Promise((resolve) => realSetTimeout(resolve, 5));
+      expect(mockPlanner.getCurrentUser).toHaveBeenCalledTimes(expected);
     };
     const agent = createAgent();
     agent.start();
-    expect(mockPlanner.getCurrentUser).toHaveBeenCalledTimes(1); // initial poll
-    await flushPoll();
+    await waitUntilPolled(1); // initial poll
 
     await jest.advanceTimersByTimeAsync(5000);
-    await flushPoll();
-    expect(mockPlanner.getCurrentUser).toHaveBeenCalledTimes(2);
+    await waitUntilPolled(2);
 
     await jest.advanceTimersByTimeAsync(5000);
-    await flushPoll();
-    expect(mockPlanner.getCurrentUser).toHaveBeenCalledTimes(3);
+    await waitUntilPolled(3);
 
     await jest.advanceTimersByTimeAsync(5000);
-    await flushPoll();
-    expect(mockPlanner.getCurrentUser).toHaveBeenCalledTimes(4); // initial + 3 polls
+    await waitUntilPolled(4); // initial + 3 polls
     agent.stop();
   });
 
@@ -4306,24 +4312,29 @@ describe("Agent", () => {
       config.TASK_POLLING_INTERVAL = 1;
       config.TASK_POLLING_MAX_INTERVAL = 8;
       const realSetTimeout = jest.requireActual("timers").setTimeout;
-      const flushPoll = async (): Promise<void> => {
+      const waitUntilPolled = async (expected: number): Promise<void> => {
+        for (
+          let i = 0;
+          i < 200 && mockPlanner.getCurrentUser.mock.calls.length < expected;
+          i++
+        ) {
+          await new Promise((resolve) => realSetTimeout(resolve, 5));
+        }
         await new Promise((resolve) => realSetTimeout(resolve, 5));
+        expect(mockPlanner.getCurrentUser).toHaveBeenCalledTimes(expected);
       };
       const agent = createAgent(commentsActions());
       agent.start();
-      await flushPoll(); // poll 1: idle
-      expect(mockPlanner.getCurrentUser).toHaveBeenCalledTimes(1);
+      await waitUntilPolled(1); // poll 1: idle
 
       // Without a comment-triggered action the idle backoff would double
       // here: the comments mode caps the backoff at the base interval so a
       // user comment is answered within one base interval.
       await jest.advanceTimersByTimeAsync(1000);
-      await flushPoll();
-      expect(mockPlanner.getCurrentUser).toHaveBeenCalledTimes(2);
+      await waitUntilPolled(2);
 
       await jest.advanceTimersByTimeAsync(1000);
-      await flushPoll();
-      expect(mockPlanner.getCurrentUser).toHaveBeenCalledTimes(3);
+      await waitUntilPolled(3);
       agent.stop();
     });
 
