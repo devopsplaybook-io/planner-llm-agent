@@ -23,7 +23,8 @@ function firstLine(text: string): string {
 function describeAction(action: {
   project: string;
   statusStart: string;
-  statusEnd: string;
+  statusEnd: string | null;
+  trigger: "status" | "comments";
   statusError?: string;
   statusInProgress?: string;
   statusAbort?: string;
@@ -36,18 +37,26 @@ function describeAction(action: {
 }): string[] {
   const project =
     action.project.length > 0 ? `'${action.project}'` : "(any project)";
+  // The mode is visible in the action line itself: a comments action never
+  // moves the task, so the end status is replaced by the mode description.
+  const target =
+    action.trigger === "comments"
+      ? "(comments: no status change, re-runs on new user comments)"
+      : action.statusEnd;
+  const details = [
+    ...(action.trigger === "comments" ? ["trigger: comments"] : []),
+    `agent: ${action.agent ?? "(default)"}`,
+    `model: ${action.model.length > 0 ? action.model : "(default)"}`,
+    `timeout: ${action.timeout !== null ? `${action.timeout}s` : "(default)"}`,
+    `weight: ${action.weight !== null ? String(action.weight) : "auto"}`,
+    `priority: ${action.priority ?? "(task)"}`,
+    `status_error: ${action.statusError ?? "(default)"}`,
+    `status_in_progress: ${action.statusInProgress ?? "(none)"}`,
+    `status_abort: ${action.statusAbort ?? "(none)"}`,
+  ];
   const lines = [
-    `${project}: ${action.statusStart} -> ${action.statusEnd}`,
-    [
-      `agent: ${action.agent ?? "(default)"}`,
-      `model: ${action.model.length > 0 ? action.model : "(default)"}`,
-      `timeout: ${action.timeout !== null ? `${action.timeout}s` : "(default)"}`,
-      `weight: ${action.weight !== null ? String(action.weight) : "auto"}`,
-      `priority: ${action.priority ?? "(task)"}`,
-      `status_error: ${action.statusError ?? "(default)"}`,
-      `status_in_progress: ${action.statusInProgress ?? "(none)"}`,
-      `status_abort: ${action.statusAbort ?? "(none)"}`,
-    ].join(" | "),
+    `${project}: ${action.statusStart} -> ${target}`,
+    details.join(" | "),
   ];
   if (action.instruction.trim().length > 0) {
     lines.push(`  instruction: ${firstLine(action.instruction)}`);

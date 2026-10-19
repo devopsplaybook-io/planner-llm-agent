@@ -266,7 +266,11 @@ export class AgentNote {
           instruction.length > 0
             ? `, instruction: ${truncate(instruction)}`
             : "";
-        return `  - Project ${project}, status '${action.statusStart}' -> '${action.statusEnd}', ${model}${instructionPart}`;
+        const target =
+          action.statusEnd === null
+            ? "(comments: no status change, re-runs on new user comments)"
+            : `'${action.statusEnd}'`;
+        return `  - Project ${project}, status '${action.statusStart}' -> ${target}, ${model}${instructionPart}`;
       }),
     ];
   }
