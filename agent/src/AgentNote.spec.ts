@@ -42,6 +42,9 @@ describe("AgentNote", () => {
     config.AGENT_NAME = "test-agent";
     config.AGENT_NOTE_PROJECT = "Agent Workspace";
     config.AGENT_NOTE_INTERVAL = 3600;
+    // Hermetic core skills: an empty fixture directory (the default would
+    // resolve to the repository's agent/skills directory).
+    config.CORE_SKILLS_PATH = path.join(tmpRoot, "core-skills");
 
     planner = {
       listProjects: jest.fn(),
@@ -285,6 +288,31 @@ describe("AgentNote", () => {
         "Agent actions: not configured (no task will be processed)",
       );
       expect(prompt).toContain("Default model: auto (CLI default)");
+    });
+
+    it("should list the core skills together with the synced ones in the facts", async () => {
+      await fse.outputFile(
+        path.join(config.CORE_SKILLS_PATH, "planner-tasks", "SKILL.md"),
+        [
+          "---",
+          "name: planner-tasks",
+          'description: "Planner tasks."',
+          "---",
+        ].join("\n"),
+      );
+      const agentConfigDir = path.join(config.DATA_DIR, "agent-config");
+      await fse.ensureDir(agentConfigDir);
+      await fse.writeFile(path.join(agentConfigDir, "git-workflow"), "");
+
+      planner.listProjects.mockResolvedValue([project]);
+      planner.listNotes.mockResolvedValue([]);
+      qoder.runPrompt.mockResolvedValue("content");
+      planner.createNote.mockResolvedValue({ id: "n1" });
+
+      await agentNote.update();
+
+      const prompt = qoder.runPrompt.mock.calls[0][0] as string;
+      expect(prompt).toContain("Skills available: git-workflow, planner-tasks");
     });
   });
 

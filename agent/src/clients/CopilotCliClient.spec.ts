@@ -54,6 +54,13 @@ describe("CopilotCliClient", () => {
     config = new Config();
     config.COPILOT_CLI = "copilot";
     config.DATA_DIR = path.join(os.tmpdir(), "copilot-cli-spec", "data");
+    // Hermetic core skills: an empty fixture directory (the default would
+    // resolve to the repository's agent/skills directory).
+    config.CORE_SKILLS_PATH = path.join(
+      os.tmpdir(),
+      "copilot-cli-spec",
+      "core-skills",
+    );
     client = new CopilotCliClient(config);
     mockExecFile.mockReset();
     mockLogger.info.mockClear();
@@ -216,9 +223,37 @@ describe("CopilotCliClient", () => {
   });
 
   describe("prepare", () => {
-    it("should register the synced skills directory with the CLI", async () => {
+    it("should register the core skills directory and the synced skills directory with the CLI", async () => {
       config.AGENT_CONFIG_REPOSITORY =
         "https://github.com/acme/agent-config.git";
+      mockExecFile.mockImplementation(
+        (
+          _command: string,
+          _args: string[],
+          _options: unknown,
+          callback: (error: Error | null, stdout: string, stderr: string) => void,
+        ) => callback(null, "Added custom skill directory", ""),
+      );
+
+      await expect(client.prepare()).resolves.toBeUndefined();
+
+      expect(mockExecFile).toHaveBeenCalledTimes(2);
+      const [coreCommand, coreArgs] = mockExecFile.mock.calls[0];
+      const [syncedCommand, syncedArgs] = mockExecFile.mock.calls[1];
+      expect(coreCommand).toBe("copilot");
+      expect(coreArgs).toEqual(["skill", "add", config.CORE_SKILLS_PATH]);
+      expect(syncedCommand).toBe("copilot");
+      expect(syncedArgs).toEqual([
+        "skill",
+        "add",
+        path.join(config.DATA_DIR, "agent-config", "skills"),
+      ]);
+      expect(mockLogger.info).toHaveBeenCalledWith(
+        expect.stringContaining("Copilot skills directory registered"),
+      );
+    });
+
+    it("should register only the core skills directory when no agent config repository is configured", async () => {
       mockExecFile.mockImplementation(
         (
           _command: string,
@@ -233,20 +268,7 @@ describe("CopilotCliClient", () => {
       expect(mockExecFile).toHaveBeenCalledTimes(1);
       const [command, args] = mockExecFile.mock.calls[0];
       expect(command).toBe("copilot");
-      expect(args).toEqual([
-        "skill",
-        "add",
-        path.join(config.DATA_DIR, "agent-config", "skills"),
-      ]);
-      expect(mockLogger.info).toHaveBeenCalledWith(
-        expect.stringContaining("Copilot skills directory registered"),
-      );
-    });
-
-    it("should do nothing when no agent config repository is configured", async () => {
-      await expect(client.prepare()).resolves.toBeUndefined();
-
-      expect(mockExecFile).not.toHaveBeenCalled();
+      expect(args).toEqual(["skill", "add", config.CORE_SKILLS_PATH]);
     });
 
     it("should stay non-fatal when the registration fails", async () => {
@@ -269,6 +291,8 @@ describe("CopilotCliClient", () => {
       );
 
       await expect(client.prepare()).resolves.toBeUndefined();
+      // Both directories were attempted despite the first failure.
+      expect(mockExecFile).toHaveBeenCalledTimes(2);
       expect(mockLogger.warn).toHaveBeenCalledWith(
         expect.stringContaining("Copilot skills directory registration failed"),
       );

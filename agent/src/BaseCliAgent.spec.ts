@@ -145,6 +145,9 @@ describe("BaseCliAgent", () => {
     dataDir = path.join(os.tmpdir(), `base-cli-agent-spec-${Date.now()}`);
     const config = new Config();
     config.DATA_DIR = dataDir;
+    // Hermetic core skills: an empty fixture directory (the default would
+    // resolve to the repository's agent/skills directory).
+    config.CORE_SKILLS_PATH = path.join(dataDir, "core-skills");
     agent = new TestCliAgent(config, agentActions);
   });
 
@@ -239,6 +242,7 @@ describe("BaseCliAgent", () => {
     it("lists the synced skills in the task prompt", async () => {
       const config = new Config();
       config.DATA_DIR = dataDir;
+      config.CORE_SKILLS_PATH = path.join(dataDir, "core-skills");
       config.AGENT_CONFIG_REPOSITORY =
         "https://github.com/acme/agent-config.git";
       agent = new TestCliAgent(config, agentActions);
@@ -263,9 +267,10 @@ describe("BaseCliAgent", () => {
       );
     });
 
-    it("omits the skills list when no skill is synced", async () => {
+    it("omits the skills list when no skill is available", async () => {
       const config = new Config();
       config.DATA_DIR = dataDir;
+      config.CORE_SKILLS_PATH = path.join(dataDir, "core-skills");
       config.AGENT_CONFIG_REPOSITORY =
         "https://github.com/acme/agent-config.git";
       agent = new TestCliAgent(config, agentActions);
@@ -275,6 +280,68 @@ describe("BaseCliAgent", () => {
 
       const { args } = lastCall();
       expect(args[3]).not.toContain("Available skills");
+      expect(args[3]).not.toContain("Core skills");
+    });
+
+    it("lists the core skills and their location when no config repository is configured", async () => {
+      const config = new Config();
+      config.DATA_DIR = dataDir;
+      const coreSkillsPath = path.join(dataDir, "core-skills");
+      config.CORE_SKILLS_PATH = coreSkillsPath;
+      agent = new TestCliAgent(config, agentActions);
+      fse.outputFileSync(
+        path.join(coreSkillsPath, "my-core-skill", "SKILL.md"),
+        [
+          "---",
+          "name: my-core-skill",
+          'description: "Use when testing the core prompt."',
+          "---",
+        ].join("\n"),
+      );
+
+      const notesFile = path.join(dataDir, "tasks", "task-1-Agent.md");
+      await agent.performTask(buildTask(), notesFile);
+
+      const { args } = lastCall();
+      expect(args[3]).toContain(
+        `Core skills (shipped with the agent image) are available at: ${coreSkillsPath}.`,
+      );
+      expect(args[3]).toContain("'my-core-skill — Use when testing the core prompt.'");
+    });
+
+    it("lets a synced skill override the core skill with the same name in the task prompt", async () => {
+      const config = new Config();
+      config.DATA_DIR = dataDir;
+      const coreSkillsPath = path.join(dataDir, "core-skills");
+      config.CORE_SKILLS_PATH = coreSkillsPath;
+      config.AGENT_CONFIG_REPOSITORY =
+        "https://github.com/acme/agent-config.git";
+      agent = new TestCliAgent(config, agentActions);
+      fse.outputFileSync(
+        path.join(coreSkillsPath, "shared", "SKILL.md"),
+        [
+          "---",
+          "name: shared",
+          'description: "Core description."',
+          "---",
+        ].join("\n"),
+      );
+      fse.outputFileSync(
+        path.join(dataDir, "agent-config", "skills", "shared", "SKILL.md"),
+        [
+          "---",
+          "name: shared",
+          'description: "Synced description."',
+          "---",
+        ].join("\n"),
+      );
+
+      const notesFile = path.join(dataDir, "tasks", "task-1-Agent.md");
+      await agent.performTask(buildTask(), notesFile);
+
+      const { args } = lastCall();
+      expect(args[3]).toContain("'shared — Synced description.'");
+      expect(args[3]).not.toContain("Core description.");
     });
 
     it("rethrows a CLI abort as CliAbortedError with the display name", async () => {

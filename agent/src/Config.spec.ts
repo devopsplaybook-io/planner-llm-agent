@@ -50,6 +50,7 @@ describe("Config", () => {
       expect(config.OPENTELEMETRY_COLLECTOR_HTTP_METRICS).toBe("");
       expect(config.OPENTELEMETRY_COLLECTOR_HTTP_LOGS).toBe("");
       expect(config.OPENTELEMETRY_COLLECT_AUTHORIZATION_HEADER).toBe("");
+      expect(config.CORE_SKILLS_PATH).toBe("");
     });
 
     it("should respect environment variables in constructor", () => {
@@ -277,6 +278,23 @@ describe("Config", () => {
       await config.reload();
       expect(config.AGENT_NAME).toBe("planner-llm-agent");
       expect(config.TASK_POLLING_INTERVAL).toBe(60);
+    });
+
+    it("should load the core skills path from the config file and environment", async () => {
+      const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-config-"));
+      const configFile = path.join(tmpDir, "config.json");
+      await fs.writeJson(configFile, {
+        CORE_SKILLS_PATH: "/file/skills",
+      });
+      process.env.CONFIG_FILE = configFile;
+      process.env.CORE_SKILLS_PATH = "/env/skills";
+
+      const config = new Config();
+      await config.reload();
+      // The environment wins over the config file.
+      expect(config.CORE_SKILLS_PATH).toBe("/env/skills");
+
+      await fs.remove(tmpDir);
     });
   });
 
