@@ -39,6 +39,7 @@ const buildAction = (overrides: Partial<AgentAction> = {}): AgentAction => ({
   project: "",
   statusStart: "To Do",
   statusEnd: "Done",
+  trigger: "status",
   model: "",
   instruction: "",
   timeout: null,

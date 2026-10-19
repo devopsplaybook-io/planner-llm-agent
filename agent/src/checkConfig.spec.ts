@@ -94,4 +94,55 @@ describe("checkConfig", () => {
       logSpy.mock.calls.map((call) => String(call[0])).join("\n"),
     ).toContain("File not found");
   });
+
+  it("shows the mode of both action kinds and validates a mixed configuration", async () => {
+    const filePath = path.join(tmpDir, "llm-agent.yaml");
+    await fse.outputFile(
+      filePath,
+      [
+        "actions:",
+        "  - project: Web",
+        "    status_start: To Do",
+        "    status_end: Done",
+        "  - project: Projects/Ideation",
+        "    trigger: comments",
+        "    status_start: Plan",
+        "    instruction: plan",
+      ].join("\n"),
+    );
+
+    await expect(run(filePath)).resolves.toBe(0);
+    const logs = logSpy.mock.calls.map((call) => String(call[0])).join("\n");
+    expect(logs).toContain("'Web': To Do -> Done");
+    expect(logs).toContain(
+      "'Projects/Ideation': Plan -> (comments: no status change, re-runs on new user comments)",
+    );
+    expect(logs).toContain("trigger: comments");
+    expect(errorSpy).not.toHaveBeenCalled();
+  });
+
+  it("exits 1 when a comments action competes with a pipeline action", async () => {
+    const filePath = path.join(tmpDir, "llm-agent.yaml");
+    await fse.outputFile(
+      filePath,
+      [
+        "actions:",
+        "  - project: Web",
+        "    trigger: comments",
+        "    status_start: To Do",
+        "  - project: 'W*'",
+        "    status_start: To Do",
+        "    status_end: Done",
+      ].join("\n"),
+    );
+
+    await expect(run(filePath)).resolves.toBe(1);
+    const errors = errorSpy.mock.calls
+      .map((call) => String(call[0]))
+      .join("\n");
+    expect(errors).toContain("Invalid agent actions configuration:");
+    expect(errors).toContain(
+      "actions[0] (trigger: comments) competes with actions[1] (status pipeline)",
+    );
+  });
 });

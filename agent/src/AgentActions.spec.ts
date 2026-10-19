@@ -6,6 +6,7 @@ import {
   loadAgentActions,
   matchProjectPattern,
   parseAgentActions,
+  projectPatternsMayOverlap,
 } from "./AgentActions";
 
 describe("AgentActions", () => {
@@ -37,6 +38,7 @@ describe("AgentActions", () => {
             project: "Web",
             statusStart: "To Do",
             statusEnd: "In Review",
+            trigger: "status",
             model: "action-model",
             instruction: "Follow the guidelines",
             timeout: 1800,
@@ -46,6 +48,7 @@ describe("AgentActions", () => {
             project: "Backend",
             statusStart: "To Do",
             statusEnd: "Done",
+            trigger: "status",
             model: "",
             instruction: "",
             timeout: null,
@@ -306,6 +309,7 @@ describe("AgentActions", () => {
             project: "Web",
             statusStart: "To Do",
             statusEnd: "Done",
+            trigger: "status",
             model: "",
             instruction: "",
             timeout: null,
@@ -757,6 +761,293 @@ describe("AgentActions", () => {
         ),
       ).toThrow(/actions\[1\] duplicates the project '' and status_start 'To Do'/);
     });
+
+    describe("trigger field", () => {
+      it("should parse a comments action without status_end", () => {
+        const config = parseAgentActions(
+          [
+            "actions:",
+            "  - project: Projects/Ideation",
+            "    status_start: Plan",
+            "    trigger: comments",
+            "    instruction: plan",
+          ].join("\n"),
+        );
+        expect(config.actions).toEqual([
+          {
+            project: "Projects/Ideation",
+            statusStart: "Plan",
+            statusEnd: null,
+            trigger: "comments",
+            instruction: "plan",
+            model: "",
+            timeout: null,
+            weight: null,
+          },
+        ]);
+      });
+
+      it("should default a missing trigger to the status pipeline mode", () => {
+        const config = parseAgentActions(
+          [
+            "actions:",
+            "  - project: Web",
+            "    status_start: To Do",
+            "    status_end: Done",
+          ].join("\n"),
+        );
+        expect(config.actions[0].trigger).toBe("status");
+        expect(config.actions[0].statusEnd).toBe("Done");
+      });
+
+      it("should accept an explicit trigger status like a missing one", () => {
+        const config = parseAgentActions(
+          [
+            "actions:",
+            "  - project: Web",
+            "    trigger: status",
+            "    status_start: To Do",
+            "    status_end: Done",
+          ].join("\n"),
+        );
+        expect(config.actions[0].trigger).toBe("status");
+      });
+
+      it("should accept the trigger value case-insensitively and trimmed", () => {
+        const config = parseAgentActions(
+          [
+            "actions:",
+            "  - project: Web",
+            '    trigger: " Comments "',
+            "    status_start: Plan",
+          ].join("\n"),
+        );
+        expect(config.actions[0].trigger).toBe("comments");
+      });
+
+      it("should reject an invalid trigger value", () => {
+        expect(() =>
+          parseAgentActions(
+            [
+              "actions:",
+              "  - project: Web",
+              "    trigger: webhook",
+              "    status_start: To Do",
+              "    status_end: Done",
+            ].join("\n"),
+          ),
+        ).toThrow(
+          /'actions\[0\]\.trigger' must be 'status' or 'comments' \(current value: 'webhook'\)/,
+        );
+      });
+
+      it("should reject a non-string trigger value", () => {
+        expect(() =>
+          parseAgentActions(
+            [
+              "actions:",
+              "  - project: Web",
+              "    trigger: 42",
+              "    status_start: To Do",
+              "    status_end: Done",
+            ].join("\n"),
+          ),
+        ).toThrow(
+          /'actions\[0\]\.trigger' must be 'status' or 'comments' \(current value: '42'\)/,
+        );
+      });
+
+      it("should still require status_end on a status action", () => {
+        expect(() =>
+          parseAgentActions(
+            [
+              "actions:",
+              "  - project: Web",
+              "    status_start: To Do",
+            ].join("\n"),
+          ),
+        ).toThrow(/'actions\[0\]\.status_end' is required/);
+      });
+
+      it("should reject status_end on a comments action", () => {
+        expect(() =>
+          parseAgentActions(
+            [
+              "actions:",
+              "  - project: Web",
+              "    trigger: comments",
+              "    status_start: Plan",
+              "    status_end: Done",
+            ].join("\n"),
+          ),
+        ).toThrow(
+          /'actions\[0\]\.status_end' must not be set in comments mode/,
+        );
+      });
+
+      it("should reject status_error on a comments action", () => {
+        expect(() =>
+          parseAgentActions(
+            [
+              "actions:",
+              "  - project: Web",
+              "    trigger: comments",
+              "    status_start: Plan",
+              "    status_error: Blocked",
+            ].join("\n"),
+          ),
+        ).toThrow(
+          /'actions\[0\]\.status_error' must not be set in comments mode/,
+        );
+      });
+
+      it("should reject status_in_progress on a comments action", () => {
+        expect(() =>
+          parseAgentActions(
+            [
+              "actions:",
+              "  - project: Web",
+              "    trigger: comments",
+              "    status_start: Plan",
+              "    status_in_progress: Working",
+            ].join("\n"),
+          ),
+        ).toThrow(
+          /'actions\[0\]\.status_in_progress' must not be set in comments mode/,
+        );
+      });
+
+      it("should accept status_abort on a comments action", () => {
+        const config = parseAgentActions(
+          [
+            "actions:",
+            "  - project: Web",
+            "    trigger: comments",
+            "    status_start: Plan",
+            "    status_abort: Cancelled",
+          ].join("\n"),
+        );
+        expect(config.actions[0].statusAbort).toBe("Cancelled");
+        expect(config.actions[0].statusEnd).toBeNull();
+      });
+
+      it("should report every rejected field of a comments action at once", () => {
+        expect(() =>
+          parseAgentActions(
+            [
+              "actions:",
+              "  - project: Web",
+              "    trigger: comments",
+              "    status_start: Plan",
+              "    status_end: Done",
+              "    status_error: Blocked",
+              "    status_in_progress: Working",
+            ].join("\n"),
+          ),
+        ).toThrow(
+          /status_end' must not be set in comments mode[\s\S]*status_error' must not be set in comments mode[\s\S]*status_in_progress' must not be set in comments mode/,
+        );
+      });
+    });
+
+    describe("comments and pipeline competition", () => {
+      it("should reject a comments action competing with a status action on the same start status and identical patterns", () => {
+        expect(() =>
+          parseAgentActions(
+            [
+              "actions:",
+              "  - project: Web",
+              "    trigger: comments",
+              "    status_start: To Do",
+              "  - project: Web",
+              "    status_start: To Do",
+              "    status_end: Done",
+            ].join("\n"),
+          ),
+        ).toThrow(
+          /actions\[0\] \(trigger: comments\) competes with actions\[1\] \(status pipeline\): both match the status_start 'To Do' and overlapping project patterns/,
+        );
+      });
+
+      it("should reject a comments action competing with a wildcard-overlapping status action", () => {
+        expect(() =>
+          parseAgentActions(
+            [
+              "actions:",
+              "  - project: Web",
+              "    trigger: comments",
+              "    status_start: To Do",
+              "  - project: 'W*'",
+              "    status_start: To Do",
+              "    status_end: Done",
+            ].join("\n"),
+          ),
+        ).toThrow(/competes with actions\[1\] \(status pipeline\)/);
+      });
+
+      it("should accept a comments action and a status action with disjoint project patterns", () => {
+        const config = parseAgentActions(
+          [
+            "actions:",
+            "  - project: Web",
+            "    trigger: comments",
+            "    status_start: To Do",
+            "  - project: App",
+            "    status_start: To Do",
+            "    status_end: Done",
+          ].join("\n"),
+        );
+        expect(config.actions).toHaveLength(2);
+      });
+
+      it("should accept a comments action and a status action with different start statuses", () => {
+        const config = parseAgentActions(
+          [
+            "actions:",
+            "  - project: Web",
+            "    trigger: comments",
+            "    status_start: Plan",
+            "  - project: Web",
+            "    status_start: To Do",
+            "    status_end: Done",
+          ].join("\n"),
+        );
+        expect(config.actions).toHaveLength(2);
+      });
+
+      it("should accept two overlapping comments actions (the first matching action wins)", () => {
+        const config = parseAgentActions(
+          [
+            "actions:",
+            "  - project: Web",
+            "    trigger: comments",
+            "    status_start: Plan",
+            "  - project: 'W*'",
+            "    trigger: comments",
+            "    status_start: Plan",
+          ].join("\n"),
+        );
+        expect(config.actions).toHaveLength(2);
+      });
+
+      it("should reject a status action listed before a competing comments action", () => {
+        expect(() =>
+          parseAgentActions(
+            [
+              "actions:",
+              "  - project: 'W*'",
+              "    status_start: To Do",
+              "    status_end: Done",
+              "  - project: Web",
+              "    trigger: comments",
+              "    status_start: To Do",
+            ].join("\n"),
+          ),
+        ).toThrow(
+          /actions\[1\] \(trigger: comments\) competes with actions\[0\] \(status pipeline\)/,
+        );
+      });
+    });
   });
 
   describe("matchProjectPattern", () => {
@@ -845,6 +1136,53 @@ describe("AgentActions", () => {
     });
   });
 
+  describe("projectPatternsMayOverlap", () => {
+    it("should overlap everything with an empty pattern", () => {
+      expect(projectPatternsMayOverlap("", "Web")).toBe(true);
+      expect(projectPatternsMayOverlap("Web", "")).toBe(true);
+      expect(projectPatternsMayOverlap("", "")).toBe(true);
+    });
+
+    it("should overlap identical patterns", () => {
+      expect(projectPatternsMayOverlap("Web", "Web")).toBe(true);
+      expect(projectPatternsMayOverlap("Projects/Ideation", "Projects/Ideation")).toBe(true);
+    });
+
+    it("should overlap a prefix wildcard with the projects it covers", () => {
+      expect(projectPatternsMayOverlap("Project*", "Projects/Ideation")).toBe(true);
+      expect(projectPatternsMayOverlap("Project*", "Projects")).toBe(true);
+      expect(projectPatternsMayOverlap("Project*", "Web")).toBe(false);
+    });
+
+    it("should not overlap disjoint literals", () => {
+      expect(projectPatternsMayOverlap("Web", "App")).toBe(false);
+      expect(projectPatternsMayOverlap("Projects/Ideation", "Projects/Delivery")).toBe(false);
+    });
+
+    it("should overlap crossing star patterns", () => {
+      expect(projectPatternsMayOverlap("ab*", "*b")).toBe(true);
+      expect(projectPatternsMayOverlap("a*", "*a")).toBe(true);
+      expect(projectPatternsMayOverlap("a*b", "aXb")).toBe(true);
+      // A prefixed and a suffixed literal always share their concatenation
+      // (e.g. 'ab' + 'ba' = 'abba').
+      expect(projectPatternsMayOverlap("ab*", "*ba")).toBe(true);
+    });
+
+    it("should overlap two stars", () => {
+      expect(projectPatternsMayOverlap("*", "*")).toBe(true);
+      expect(projectPatternsMayOverlap("*", "Anything")).toBe(true);
+    });
+
+    it("should not overlap disjoint anchors on the same side", () => {
+      expect(projectPatternsMayOverlap("ab*", "ba*")).toBe(false);
+      expect(projectPatternsMayOverlap("*ab", "*cd")).toBe(false);
+    });
+
+    it("should match case-sensitively", () => {
+      expect(projectPatternsMayOverlap("web", "Web")).toBe(false);
+    });
+  });
+
   describe("loadAgentActions", () => {
     let tmpDir: string;
 
@@ -886,6 +1224,7 @@ describe("AgentActions", () => {
             project: "Web",
             statusStart: "To Do",
             statusEnd: "Done",
+            trigger: "status",
             model: "",
             instruction: "Do it well",
             timeout: null,

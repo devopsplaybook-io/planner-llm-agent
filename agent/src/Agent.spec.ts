@@ -1,14 +1,19 @@
 import * as os from "os";
 import * as path from "path";
 import * as fse from "fs-extra";
-import { Agent } from "./Agent";
+import {
+  Agent,
+  commentsPickupPending,
+  hasAgentComment,
+  lastCommentOf,
+} from "./Agent";
 import { AgentActionsConfig } from "./AgentActions";
 import { Config } from "./Config";
 import { FinalizationStore } from "./FinalizationStore";
 import { CliAbortedError } from "./CliUtils";
 import { createCliAgent } from "./clients/CliAgentRegistry";
 import type { CliAgentClient, TaskOptions } from "./clients/CliAgent";
-import { PlannerClient } from "./PlannerClient";
+import { PlannerClient, PlannerTask } from "./PlannerClient";
 
 jest.mock("./PlannerClient", () => ({
   PlannerClient: jest.fn(),
@@ -82,6 +87,7 @@ const WILDCARD_ACTIONS: AgentActionsConfig = {
       project: "",
       statusStart: "To Do",
       statusEnd: "Done",
+      trigger: "status",
       model: "",
       instruction: "",
       timeout: null,
@@ -265,6 +271,7 @@ describe("Agent", () => {
           project: "",
           statusStart: "To Do",
           statusEnd: "Done",
+          trigger: "status",
           agent: "copilot-cli",
           model: "",
           instruction: "",
@@ -315,6 +322,7 @@ describe("Agent", () => {
           project: "",
           statusStart: "To Do",
           statusEnd: "Done",
+          trigger: "status",
           agent: "copilot-cli",
           model: "",
           instruction: "",
@@ -342,28 +350,34 @@ describe("Agent", () => {
   it("should poll for tasks immediately and at the configured interval", async () => {
     jest.useFakeTimers();
     // A poll that is still running makes the next tick skip (single-flight
-    // guard): let the real I/O of each poll complete before advancing to
-    // the next interval.
+    // guard): wait until each poll is recorded (real sleeps — the condition
+    // must be observed outside the fake clock) and let its tail settle
+    // before advancing to the next interval, so a loaded runner cannot skip
+    // a tick.
     const realSetTimeout = jest.requireActual("timers").setTimeout;
-    const flushPoll = async (): Promise<void> => {
+    const waitUntilPolled = async (expected: number): Promise<void> => {
+      for (
+        let i = 0;
+        i < 200 && mockPlanner.getCurrentUser.mock.calls.length < expected;
+        i++
+      ) {
+        await new Promise((resolve) => realSetTimeout(resolve, 5));
+      }
       await new Promise((resolve) => realSetTimeout(resolve, 5));
+      expect(mockPlanner.getCurrentUser).toHaveBeenCalledTimes(expected);
     };
     const agent = createAgent();
     agent.start();
-    expect(mockPlanner.getCurrentUser).toHaveBeenCalledTimes(1); // initial poll
-    await flushPoll();
+    await waitUntilPolled(1); // initial poll
 
     await jest.advanceTimersByTimeAsync(5000);
-    await flushPoll();
-    expect(mockPlanner.getCurrentUser).toHaveBeenCalledTimes(2);
+    await waitUntilPolled(2);
 
     await jest.advanceTimersByTimeAsync(5000);
-    await flushPoll();
-    expect(mockPlanner.getCurrentUser).toHaveBeenCalledTimes(3);
+    await waitUntilPolled(3);
 
     await jest.advanceTimersByTimeAsync(5000);
-    await flushPoll();
-    expect(mockPlanner.getCurrentUser).toHaveBeenCalledTimes(4); // initial + 3 polls
+    await waitUntilPolled(4); // initial + 3 polls
     agent.stop();
   });
 
@@ -439,6 +453,7 @@ describe("Agent", () => {
           project: "Web",
           statusStart: "To Do",
           statusEnd: "Done",
+          trigger: "status",
           model: "",
           instruction: "",
           timeout: null,
@@ -448,6 +463,7 @@ describe("Agent", () => {
           project: "Docs*",
           statusStart: "To Do",
           statusEnd: "Done",
+          trigger: "status",
           model: "",
           instruction: "",
           timeout: null,
@@ -491,6 +507,7 @@ describe("Agent", () => {
           project: "Web",
           statusStart: "To Do",
           statusEnd: "Done",
+          trigger: "status",
           model: "",
           instruction: "",
           timeout: null,
@@ -863,6 +880,7 @@ describe("Agent", () => {
           project: "",
           statusStart: "To Do",
           statusEnd: "Done",
+          trigger: "status",
           statusError: "Blocked",
           model: "",
           instruction: "",
@@ -908,6 +926,7 @@ describe("Agent", () => {
           project: "",
           statusStart: "To Do",
           statusEnd: "Done",
+          trigger: "status",
           model: "",
           instruction: "",
           timeout: null,
@@ -1510,6 +1529,7 @@ describe("Agent", () => {
           project: "Web",
           statusStart: "To Do",
           statusEnd: "In Review",
+          trigger: "status",
           model: "",
           instruction: "",
           timeout: null,
@@ -1565,6 +1585,7 @@ describe("Agent", () => {
           project: "Web",
           statusStart: "To Do",
           statusEnd: "Done",
+          trigger: "status",
           model: "",
           instruction: "",
           timeout: null,
@@ -1615,6 +1636,7 @@ describe("Agent", () => {
           project: "Project*",
           statusStart: "To Do",
           statusEnd: "In Review",
+          trigger: "status",
           model: "",
           instruction: "",
           timeout: null,
@@ -1666,6 +1688,7 @@ describe("Agent", () => {
           project: "Web*",
           statusStart: "To Do",
           statusEnd: "Done",
+          trigger: "status",
           model: "",
           instruction: "",
           timeout: null,
@@ -1706,6 +1729,7 @@ describe("Agent", () => {
           project: "Web",
           statusStart: "To Do",
           statusEnd: "Done",
+          trigger: "status",
           model: "action-model",
           instruction: "Follow the coding guidelines",
           timeout: null,
@@ -1752,6 +1776,7 @@ describe("Agent", () => {
           project: "Web",
           statusStart: "To Do",
           statusEnd: "Done",
+          trigger: "status",
           model: "",
           instruction: "",
           timeout: null,
@@ -1795,6 +1820,7 @@ describe("Agent", () => {
           project: "Web",
           statusStart: "To Do",
           statusEnd: "Done",
+          trigger: "status",
           model: "",
           instruction: "",
           timeout: null,
@@ -1911,6 +1937,7 @@ describe("Agent", () => {
           project: "Web",
           statusStart: "To Do",
           statusEnd: "Done",
+          trigger: "status",
           model: "",
           instruction: "",
           timeout: 1800,
@@ -1954,6 +1981,7 @@ describe("Agent", () => {
           project: "Web",
           statusStart: "To Do",
           statusEnd: "Done",
+          trigger: "status",
           model: "",
           instruction: "",
           timeout: null,
@@ -1998,6 +2026,7 @@ describe("Agent", () => {
           project: "Web",
           statusStart: "To Do",
           statusEnd: "Done",
+          trigger: "status",
           model: "",
           instruction: "",
           timeout: null,
@@ -2275,6 +2304,7 @@ describe("Agent", () => {
           project: "Alpha*",
           statusStart: "To Do",
           statusEnd: "Done",
+          trigger: "status",
           model: "",
           instruction: "",
           timeout: null,
@@ -2285,6 +2315,7 @@ describe("Agent", () => {
           project: "Beta*",
           statusStart: "To Do",
           statusEnd: "Done",
+          trigger: "status",
           model: "",
           instruction: "",
           timeout: null,
@@ -2356,6 +2387,7 @@ describe("Agent", () => {
           project: "Gamma*",
           statusStart: "To Do",
           statusEnd: "Done",
+          trigger: "status",
           model: "",
           instruction: "",
           timeout: null,
@@ -2366,6 +2398,7 @@ describe("Agent", () => {
           project: "Delta*",
           statusStart: "To Do",
           statusEnd: "Done",
+          trigger: "status",
           model: "",
           instruction: "",
           timeout: null,
@@ -2438,6 +2471,7 @@ describe("Agent", () => {
           project: "Epsilon*",
           statusStart: "To Do",
           statusEnd: "Done",
+          trigger: "status",
           model: "",
           instruction: "",
           timeout: null,
@@ -2564,6 +2598,7 @@ describe("Agent", () => {
           project: "",
           statusStart: "To Do",
           statusEnd: "Done",
+          trigger: "status",
           model: "",
           instruction: "",
           timeout: null,
@@ -2603,6 +2638,7 @@ describe("Agent", () => {
         project: "",
         statusStart: "Backlog",
         statusEnd: "Archived",
+        trigger: "status",
         model: "",
         instruction: "",
         timeout: null,
@@ -3055,6 +3091,7 @@ describe("Agent", () => {
             project: "",
             statusStart: "To Do",
             statusEnd: "Done",
+            trigger: "status",
             model: "",
             instruction: "",
             timeout: null,
@@ -3571,6 +3608,7 @@ describe("Agent", () => {
           project: "Web",
           statusStart: "To Do",
           statusEnd: "Done",
+          trigger: "status",
           statusInProgress: "In Progress",
           model: "",
           instruction: "",
@@ -3612,6 +3650,7 @@ describe("Agent", () => {
           project: "",
           statusStart: "To Do",
           statusEnd: "Done",
+          trigger: "status",
           model: "",
           instruction: "",
           timeout: null,
@@ -3655,6 +3694,7 @@ describe("Agent", () => {
           project: "Web",
           statusStart: "To Do",
           statusEnd: "Done",
+          trigger: "status",
           statusInProgress: "In Progress",
           model: "",
           instruction: "",
@@ -3702,6 +3742,7 @@ describe("Agent", () => {
           project: "",
           statusStart: "To Do",
           statusEnd: "Done",
+          trigger: "status",
           model: "",
           instruction: "",
           timeout: null,
@@ -3745,6 +3786,7 @@ describe("Agent", () => {
           project: "",
           statusStart: "To Do",
           statusEnd: "Done",
+          trigger: "status",
           model: "",
           instruction: "",
           timeout: null,
@@ -3844,6 +3886,7 @@ describe("Agent", () => {
           project: "",
           statusStart: "To Do",
           statusEnd: "Done",
+          trigger: "status",
           model: "",
           instruction: "",
           timeout: null,
@@ -3967,5 +4010,439 @@ describe("Agent", () => {
     await waitFor(() => agent.getSchedulingState().running.length === 0);
     expect(agent.getSchedulingState().queuedCount).toBe(0);
     agent.stop();
+  });
+
+  // A comment-triggered action: the task stays in its start status, the
+  // agent never moves it, and every new user comment re-triggers a run.
+  const commentsActions = (): AgentActionsConfig => ({
+    defaultModel: "",
+    defaultTimeout: null,
+    actions: [
+      {
+        project: "",
+        statusStart: "Plan",
+        statusEnd: null,
+        trigger: "comments",
+        model: "",
+        instruction: "",
+        timeout: null,
+        weight: null,
+      },
+    ],
+  });
+
+  describe("comment-triggered actions", () => {
+    it("should process a fresh task with zero comments without changing its status", async () => {
+      mockPlannerTasks([
+        {
+          id: "task-1",
+          title: "Discuss the plan",
+          status: "Plan",
+          description: "Design the conversational flow",
+          comments: [],
+          attachments: [],
+        },
+      ]);
+      mockQoder.performTask.mockResolvedValue("Agent analysis");
+
+      const agent = createAgent(commentsActions());
+      agent.start();
+      await waitFor(() =>
+        mockPlanner.addTaskComment.mock.calls.some(
+          (call) => call[1] === "Agent analysis",
+        ),
+      );
+
+      expect(mockQoder.performTask).toHaveBeenCalledTimes(1);
+      // The summary comment is posted but the task never moves.
+      expect(mockPlanner.updateTaskStatus).not.toHaveBeenCalled();
+      // The task never reaches an end status, so its folder is kept.
+      await expect(
+        fse.pathExists(path.join(dataDir, "tasks", "task-1-Agent.md")),
+      ).resolves.toBe(true);
+      agent.stop();
+    });
+
+    it("should not pick up a task whose last comment is the agent's own reply", async () => {
+      config.TASK_POLLING_INTERVAL = 1;
+      const task = {
+        id: "task-1",
+        title: "Discuss the plan",
+        status: "Plan",
+        description: "Design the conversational flow",
+        comments: [] as unknown[],
+        attachments: [] as unknown[],
+      };
+      mockPlannerTasks([task]);
+      mockQoder.performTask.mockResolvedValue("Agent analysis");
+
+      const agent = createAgent(commentsActions());
+      agent.start();
+      await waitFor(() => mockQoder.performTask.mock.calls.length === 1);
+      await waitFor(() =>
+        mockPlanner.addTaskComment.mock.calls.some(
+          (call) => call[1] === "Agent analysis",
+        ),
+      );
+
+      // The agent's start and summary comments are now on the task: the
+      // conversation waits for the user and the next poll picks nothing.
+      task.comments = [
+        {
+          id: "c-start",
+          userId: "user-1",
+          userName: "Test User",
+          text: "Agent started working on this task",
+          dateCreated: "2026-10-19T12:00:00.000Z",
+        },
+        {
+          id: "c-summary",
+          userId: "user-1",
+          userName: "Test User",
+          text: "Agent analysis",
+          dateCreated: "2026-10-19T12:01:00.000Z",
+        },
+      ];
+      await waitFor(() => mockPlanner.getCurrentUser.mock.calls.length >= 2);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(mockQoder.performTask).toHaveBeenCalledTimes(1);
+
+      // A user reply after the agent's summary re-triggers a run.
+      task.comments = [
+        ...task.comments,
+        {
+          id: "c-user",
+          userId: "user-2",
+          userName: "Alice",
+          text: "Please also cover the failure path",
+          dateCreated: "2026-10-19T12:02:00.000Z",
+        },
+      ];
+      await waitFor(() => mockQoder.performTask.mock.calls.length === 2);
+      expect(mockPlanner.updateTaskStatus).not.toHaveBeenCalled();
+      agent.stop();
+    });
+
+    it("should post only the failure comment when a comment-triggered task fails", async () => {
+      mockPlannerTasks([
+        {
+          id: "task-1",
+          title: "Discuss the plan",
+          status: "Plan",
+          description: "Design the conversational flow",
+          comments: [],
+          attachments: [],
+        },
+      ]);
+      fse.outputFileSync(
+        path.join(dataDir, "tasks", "task-1-Agent-Summary.md"),
+        "## Partial progress",
+      );
+      mockQoder.performTask.mockRejectedValue(new Error("CLI failed"));
+
+      const agent = createAgent(commentsActions());
+      agent.start();
+      await waitFor(() =>
+        mockPlanner.addTaskComment.mock.calls.some((call) =>
+          String(call[1]).includes("Task processing failed:"),
+        ),
+      );
+
+      const failureComment = mockPlanner.addTaskComment.mock.calls
+        .map((call) => call[1] as string)
+        .find((text) => text.includes("Task processing failed:"));
+      expect(failureComment).toContain("Partial summary written before the failure:");
+      expect(failureComment).toContain(
+        "The task keeps its status: post a new comment on the task to trigger a new run.",
+      );
+      expect(mockPlanner.updateTaskStatus).not.toHaveBeenCalled();
+      agent.stop();
+    });
+
+    it("should keep the abort semantics of a comment-triggered task", async () => {
+      config.TASK_POLLING_INTERVAL = 1;
+      const tasks = [
+        {
+          id: "task-1",
+          title: "Discuss the plan",
+          status: "Plan",
+          description: "Design the conversational flow",
+          comments: [] as unknown[],
+          attachments: [] as unknown[],
+        },
+      ];
+      mockPlanner.listAssignedTasks.mockImplementation(async () =>
+        tasks.map((task) => ({ ...task })),
+      );
+      mockQoder.performTask.mockImplementation(
+        (_task: unknown, _notesFile: string, options?: TaskOptions) =>
+          new Promise<string>((_resolve, reject) => {
+            options?.abortSignal?.addEventListener(
+              "abort",
+              () => reject(new CliAbortedError("Qoder task execution aborted")),
+              { once: true },
+            );
+          }),
+      );
+
+      const actions = commentsActions();
+      actions.defaultStatusAbort = "Aborted";
+      const agent = createAgent(actions);
+      agent.start();
+      await waitFor(() => mockQoder.performTask.mock.calls.length === 1);
+
+      // The user cancels the task by moving it to the abort status.
+      tasks[0].status = "Aborted";
+      await waitFor(
+        () =>
+          mockPlanner.addTaskComment.mock.calls.some((call) =>
+            String(call[1]).includes("Task aborted at user request"),
+          ),
+        10000,
+      );
+      expect(mockPlanner.updateTaskStatus).not.toHaveBeenCalled();
+      agent.stop();
+    });
+
+    it("should bound the adjustment rounds of a comment-triggered run by TASK_ADJUSTMENT_MAX_ROUNDS", async () => {
+      config.TASK_ADJUSTMENT_MAX_ROUNDS = 2;
+      mockPlannerTasks([
+        {
+          id: "task-1",
+          title: "Discuss the plan",
+          status: "Plan",
+          description: "Design the conversational flow",
+          comments: [],
+          attachments: [],
+        },
+      ]);
+      // A new human comment every time the task is re-fetched.
+      let fetchRound = 0;
+      mockPlanner.getTask.mockImplementation(async () => {
+        fetchRound++;
+        return {
+          id: "task-1",
+          projectId: "",
+          title: "Discuss the plan",
+          status: "Plan",
+          priority: "medium",
+          description: "Design the conversational flow",
+          dateUpdated: `2026-10-19T0${fetchRound}:00:00.000Z`,
+          comments: [
+            {
+              id: `comment-during-${fetchRound}`,
+              userId: "user-2",
+              userName: "Alice",
+              text: `Message ${fetchRound}`,
+              dateCreated: `2026-10-19T0${fetchRound}:00:00.000Z`,
+            },
+          ],
+          attachments: [],
+          dependencies: [],
+        };
+      });
+      mockQoder.performTask.mockImplementation(async () => {
+        return `Summary after call ${mockQoder.performTask.mock.calls.length}`;
+      });
+
+      const agent = createAgent(commentsActions());
+      agent.start();
+      await waitFor(() =>
+        mockPlanner.addTaskComment.mock.calls.some(
+          (call) => call[1] === "Summary after call 3",
+        ),
+      );
+
+      expect(mockQoder.performTask).toHaveBeenCalledTimes(3);
+      expect(mockPlanner.updateTaskStatus).not.toHaveBeenCalled();
+      agent.stop();
+    });
+
+    it("should post the start comment on the first run of a comment-triggered task only", async () => {
+      config.TASK_POLLING_INTERVAL = 1;
+      const task = {
+        id: "task-1",
+        title: "Discuss the plan",
+        status: "Plan",
+        description: "Design the conversational flow",
+        comments: [] as unknown[],
+        attachments: [] as unknown[],
+      };
+      mockPlannerTasks([task]);
+      mockQoder.performTask.mockResolvedValue("Agent analysis");
+
+      const agent = createAgent(commentsActions());
+      agent.start();
+      await waitFor(() => mockQoder.performTask.mock.calls.length === 1);
+      await waitFor(() =>
+        mockPlanner.addTaskComment.mock.calls.some(
+          (call) => call[1] === "Agent analysis",
+        ),
+      );
+      const startComments = () =>
+        mockPlanner.addTaskComment.mock.calls.filter((call) =>
+          String(call[1]).startsWith("Agent '"),
+        );
+      expect(startComments()).toHaveLength(1);
+
+      // A user reply triggers a second run: no new start comment.
+      task.comments = [
+        {
+          id: "c-agent",
+          userId: "user-1",
+          userName: "Test User",
+          text: "Agent analysis",
+          dateCreated: "2026-10-19T12:01:00.000Z",
+        },
+        {
+          id: "c-user",
+          userId: "user-2",
+          userName: "Alice",
+          text: "One more thing",
+          dateCreated: "2026-10-19T12:02:00.000Z",
+        },
+      ];
+      await waitFor(() => mockQoder.performTask.mock.calls.length === 2);
+      expect(startComments()).toHaveLength(1);
+      agent.stop();
+    });
+
+    it("should keep the polls at the base interval when a comment-triggered action is configured", async () => {
+      jest.useFakeTimers();
+      config.TASK_POLLING_INTERVAL = 1;
+      config.TASK_POLLING_MAX_INTERVAL = 8;
+      const realSetTimeout = jest.requireActual("timers").setTimeout;
+      const waitUntilPolled = async (expected: number): Promise<void> => {
+        for (
+          let i = 0;
+          i < 200 && mockPlanner.getCurrentUser.mock.calls.length < expected;
+          i++
+        ) {
+          await new Promise((resolve) => realSetTimeout(resolve, 5));
+        }
+        await new Promise((resolve) => realSetTimeout(resolve, 5));
+        expect(mockPlanner.getCurrentUser).toHaveBeenCalledTimes(expected);
+      };
+      const agent = createAgent(commentsActions());
+      agent.start();
+      await waitUntilPolled(1); // poll 1: idle
+
+      // Without a comment-triggered action the idle backoff would double
+      // here: the comments mode caps the backoff at the base interval so a
+      // user comment is answered within one base interval.
+      await jest.advanceTimersByTimeAsync(1000);
+      await waitUntilPolled(2);
+
+      await jest.advanceTimersByTimeAsync(1000);
+      await waitUntilPolled(3);
+      agent.stop();
+    });
+
+    describe("comments pickup helpers", () => {
+      const buildTask = (comments: {
+        id?: string;
+        userId: string;
+        text?: string;
+        dateCreated: string;
+      }[]): PlannerTask =>
+        ({
+          id: "task-1",
+          projectId: "p1",
+          title: "Task",
+          status: "Plan",
+          priority: "medium",
+          description: "",
+          dateUpdated: "2026-10-19T00:00:00.000Z",
+          comments: comments.map((comment, index) => ({
+            id: comment.id ?? `c-${index}`,
+            userId: comment.userId,
+            userName: "Someone",
+            text: comment.text ?? "hello",
+            dateCreated: comment.dateCreated,
+          })),
+          attachments: [],
+        }) as PlannerTask;
+
+      const AGENT = "user-1";
+      const USER = "user-2";
+
+      it("lastCommentOf should return the greatest dateCreated with the later index winning ties", () => {
+        expect(lastCommentOf(buildTask([]))).toBeNull();
+        const earlier = {
+          userId: USER,
+          dateCreated: "2026-10-19T12:00:00.000Z",
+        };
+        const later = {
+          userId: AGENT,
+          dateCreated: "2026-10-19T12:05:00.000Z",
+        };
+        expect(lastCommentOf(buildTask([earlier, later]))?.userId).toBe(AGENT);
+        // Equal timestamps: the later array index wins.
+        const sameTime = (userId: string, id: string) => ({
+          id,
+          userId,
+          dateCreated: "2026-10-19T12:00:00.000Z",
+        });
+        expect(
+          lastCommentOf(buildTask([sameTime(AGENT, "a"), sameTime(USER, "b")]))
+            ?.id,
+        ).toBe("b");
+      });
+
+      it("commentsPickupPending should be true for zero comments or a non-agent last comment", () => {
+        expect(commentsPickupPending(buildTask([]), AGENT)).toBe(true);
+        expect(
+          commentsPickupPending(
+            buildTask([{ userId: AGENT, dateCreated: "2026-10-19T12:00:00.000Z" }]),
+            AGENT,
+          ),
+        ).toBe(false);
+        expect(
+          commentsPickupPending(
+            buildTask([
+              { userId: AGENT, dateCreated: "2026-10-19T12:00:00.000Z" },
+              { userId: USER, dateCreated: "2026-10-19T12:01:00.000Z" },
+            ]),
+            AGENT,
+          ),
+        ).toBe(true);
+        expect(
+          commentsPickupPending(
+            buildTask([
+              { userId: USER, dateCreated: "2026-10-19T12:00:00.000Z" },
+              { userId: AGENT, dateCreated: "2026-10-19T12:01:00.000Z" },
+            ]),
+            AGENT,
+          ),
+        ).toBe(false);
+      });
+
+      it("commentsPickupPending should fail safe when the agent user is unknown", () => {
+        expect(commentsPickupPending(buildTask([]), null)).toBe(false);
+        expect(
+          commentsPickupPending(
+            buildTask([{ userId: USER, dateCreated: "2026-10-19T12:00:00.000Z" }]),
+            null,
+          ),
+        ).toBe(false);
+      });
+
+      it("hasAgentComment should detect any agent-authored comment", () => {
+        expect(hasAgentComment(buildTask([]), AGENT)).toBe(false);
+        expect(
+          hasAgentComment(
+            buildTask([{ userId: USER, dateCreated: "2026-10-19T12:00:00.000Z" }]),
+            AGENT,
+          ),
+        ).toBe(false);
+        expect(
+          hasAgentComment(
+            buildTask([{ userId: AGENT, dateCreated: "2026-10-19T12:00:00.000Z" }]),
+            AGENT,
+          ),
+        ).toBe(true);
+        expect(hasAgentComment(buildTask([]), null)).toBe(false);
+      });
+    });
   });
 });

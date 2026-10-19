@@ -1,8 +1,11 @@
 // In-memory registry of the tasks whose CLI execution succeeded but whose
-// Planner finalization (summary comment, end status, folder cleanup) did not.
-// While a record exists the task is never picked again: re-running the CLI
-// would redo completed work; only the finalization steps are retried, with
-// an exponential backoff. One agent process per agent identity is assumed
+// Planner finalization (summary comment, end status, folder cleanup) did
+// not. While a record exists the task is never picked again: re-running the
+// CLI would redo completed work; only the finalization steps are retried,
+// with an exponential backoff. The statusEnd field selects the variant: a
+// status pipeline finalization moves the task and cleans the folder, the
+// comment-only finalization of a comments action (statusEnd null) only
+// posts the summary. One agent process per agent identity is assumed
 // (records are lost on restart, like the in-flight registrations).
 export interface FinalizationRecord {
   taskId: string;
@@ -11,8 +14,10 @@ export interface FinalizationRecord {
   contentVersion: string;
   // Summary comment to post when the comment POST has not succeeded yet.
   summary: string;
-  // End status to move the task to (snapshotted from the action).
-  statusEnd: string;
+  // End status to move the task to (snapshotted from the action); null in
+  // the comments mode, where the finalization is comment-only (no status
+  // move, no folder cleanup) and the retry then only re-posts the comment.
+  statusEnd: string | null;
   // True once the summary comment POST succeeded: the retry then only
   // updates the status, so the comment is never posted twice.
   commentPosted: boolean;
@@ -61,7 +66,7 @@ export class FinalizationStore {
       title: string;
       contentVersion: string;
       summary: string;
-      statusEnd: string;
+      statusEnd: string | null;
     },
     now: number = Date.now(),
   ): FinalizationRecord {

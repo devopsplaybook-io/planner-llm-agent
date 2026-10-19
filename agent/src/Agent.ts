@@ -255,12 +255,25 @@ export class Agent {
 
   // The effective polling ceiling: the largest of TASK_POLLING_MAX_INTERVAL
   // and the base interval, so a misconfigured maximum can never make the
-  // agent poll faster than the base interval.
+  // agent poll faster than the base interval. When any comment-triggered
+  // action is configured, the ceiling is the base interval itself: the
+  // backoff never extends past it, so a user comment is answered within
+  // one base interval (the live configuration is re-read on every call, so
+  // hot-reload is picked up automatically).
   private maxPollingIntervalSeconds(): number {
+    if (this.hasCommentTriggeredActions()) {
+      return this.pollingIntervalSeconds();
+    }
     return Math.max(
       this.pollingIntervalSeconds(),
       this.configuredMaxPollingIntervalSeconds(),
     );
+  }
+
+  // Whether at least one action of the (live, hot-reloaded) configuration
+  // is comment-triggered.
+  private hasCommentTriggeredActions(): boolean {
+    return this.getActions().some((action) => action.trigger === "comments");
   }
 
   private pollingIntervalSeconds(): number {
@@ -353,6 +366,20 @@ export class Agent {
             // Planner updates remain, never a new CLI execution.
             this.finalizationStore.has(task.id) ||
             candidates.some((selected) => selected.task.id === task.id)
+          ) {
+            continue;
+          }
+          // Comment-triggered actions only pick a task up when the
+          // conversation waits for the agent: zero comments (the
+          // description is the initial prompt) or a last comment the agent
+          // did not author. A conversation waiting for the user is not
+          // queued work, so the skip is silent (no deferral, no queue
+          // gauge entry). The predicate is evaluated over the data every
+          // poll already fetched, which makes the rule stateless and
+          // restart-safe.
+          if (
+            action.trigger === "comments" &&
+            !commentsPickupPending(task, this.agentUserId)
           ) {
             continue;
           }
@@ -817,7 +844,16 @@ export class Agent {
           : "") ||
         "";
       const resolvedModel = resolveModel(task, defaultModel)?.model ?? "";
-      await this.postStartComment(task, resolvedModel);
+      // Pipeline actions notify on every run; a comments action only on
+      // the first run of the task (stateless test: no agent-authored
+      // comment exists yet), so a fast comment back-and-forth does not
+      // flood the task with "started working" lines.
+      if (
+        action.trigger !== "comments" ||
+        !hasAgentComment(task, this.agentUserId)
+      ) {
+        await this.postStartComment(task, resolvedModel);
+      }
       // Show the task as being processed on Planner (optional
       // status_in_progress): best-effort, a failed or skipped transition
       // never fails the task processing.
@@ -879,7 +915,9 @@ export class Agent {
       await this.finalizeCompletedTask(task.id);
       this.finalizationStore.delete(task.id);
       logger.info(
-        `Task '${task.title}' (${task.id}) completed and moved to status '${action.statusEnd}'`,
+        action.statusEnd === null
+          ? `Task '${task.title}' (${task.id}) completed (comment-only finalization)`
+          : `Task '${task.title}' (${task.id}) completed and moved to status '${action.statusEnd}'`,
       );
     } catch (error) {
       const message = (error as Error).message;
@@ -904,23 +942,49 @@ export class Agent {
       logger.error(
         `Failed to process task '${task.title}' (${task.id}): ${message}`,
       );
+      const salvagedSummary = await this.readSalvagedSummary(task.id);
+      const salvagedOutput = extractErrorOutputTail(
+        error,
+        MAX_SALVAGED_OUTPUT_LENGTH,
+      );
+      if (action.trigger === "comments") {
+        // Comments mode: no status move (the resolved error status is
+        // ignored) and no folder cleanup — the failure comment reports the
+        // problem and the user comments again to trigger a new run.
+        try {
+          await this.planner.addTaskComment(
+            task.id,
+            buildFailureComment(message, null, salvagedSummary, salvagedOutput),
+          );
+          logger.info(
+            `Task '${task.title}' (${task.id}) failed: the failure comment was posted and the task keeps its status (comments mode)`,
+          );
+        } catch (commentError) {
+          logger.error(
+            `Failed to post the failure comment for task '${task.title}' (${task.id}): ${(commentError as Error).message}`,
+          );
+        }
+        return;
+      }
       // A failing task must not block the agent by staying in the start
       // status forever: it is moved to the resolved error status (the action
       // status_error, then the actions default status_error, then the end
       // status) with an explanation, salvaging the partial work of the CLI
       // run (partial summary file and output tail) when any exists.
+      // statusEnd is always set in the pipeline mode (the validation
+      // rejects a status action without one).
       const errorStatus =
         action.statusError ??
         this.agentActions?.defaultStatusError ??
-        action.statusEnd;
+        action.statusEnd!;
       try {
         await this.planner.addTaskComment(
           task.id,
           buildFailureComment(
             message,
             errorStatus,
-            await this.readSalvagedSummary(task.id),
-            extractErrorOutputTail(error, MAX_SALVAGED_OUTPUT_LENGTH),
+            salvagedSummary,
+            salvagedOutput,
           ),
         );
         await this.planner.updateTaskStatus(task.id, errorStatus);
@@ -1044,8 +1108,10 @@ export class Agent {
   }
 
   // Completes a finished task on Planner: posts the summary comment (unless
-  // a previous attempt already did) and moves the task to its end status.
-  // Idempotent, driven by the FinalizationStore record of the task.
+  // a previous attempt already did) and moves the task to its end status
+  // unless the record is comment-only (comments mode: the task never
+  // changes status, so no folder cleanup applies either). Idempotent,
+  // driven by the FinalizationStore record of the task.
   private async finalizeCompletedTask(taskId: string): Promise<void> {
     const record = this.finalizationStore.get(taskId);
     if (!record) {
@@ -1054,6 +1120,9 @@ export class Agent {
     if (!record.commentPosted) {
       await this.planner.addTaskComment(taskId, record.summary);
       this.finalizationStore.markCommentPosted(taskId);
+    }
+    if (record.statusEnd === null) {
+      return;
     }
     await this.planner.updateTaskStatus(taskId, record.statusEnd);
     await this.cleanupTaskFolderIfNeeded(taskId, record.statusEnd);
@@ -1074,7 +1143,9 @@ export class Agent {
         await this.finalizeCompletedTask(taskId);
         this.finalizationStore.delete(taskId);
         logger.info(
-          `Task '${record.title}' (${taskId}) finalized on retry and moved to status '${record.statusEnd}'`,
+          record.statusEnd === null
+            ? `Task '${record.title}' (${taskId}) finalized on retry (comment-only finalization)`
+            : `Task '${record.title}' (${taskId}) finalized on retry and moved to status '${record.statusEnd}'`,
         );
       } catch (error) {
         this.finalizationStore.scheduleRetry(taskId);
@@ -1129,6 +1200,12 @@ export class Agent {
     project: PlannerProject | null,
     action: AgentAction,
   ): Promise<void> {
+    // Comments mode never moves the task: even the config-wide
+    // default.status_in_progress must not silently move a conversational
+    // task out of its start status, which would kill the next pickups.
+    if (action.trigger === "comments") {
+      return;
+    }
     const statusInProgress =
       action.statusInProgress ?? this.agentActions?.defaultStatusInProgress;
     if (!statusInProgress || statusInProgress === task.status) {
@@ -1518,6 +1595,60 @@ export function blockingDependencies(
   );
 }
 
+// Sort key of a comment timestamp, with unparsable dates as the oldest.
+function commentTimestamp(dateCreated: string): number {
+  const time = Date.parse(dateCreated);
+  return Number.isNaN(time) ? Number.NEGATIVE_INFINITY : time;
+}
+
+// The most recent comment of a task: the greatest server-generated
+// dateCreated, and the later array index on equal timestamps (robust to any
+// ordering of the comments array by the server). Null when the task has no
+// comment.
+export function lastCommentOf(task: PlannerTask): PlannerTaskComment | null {
+  let last: PlannerTaskComment | null = null;
+  let lastTime = Number.NEGATIVE_INFINITY;
+  for (const comment of task.comments) {
+    const time = commentTimestamp(comment.dateCreated);
+    if (last === null || time >= lastTime) {
+      last = comment;
+      lastTime = time;
+    }
+  }
+  return last;
+}
+
+// Whether a comment-triggered action must pick the task up now: zero
+// comments means pending (the description is the initial prompt) and
+// otherwise the task is picked up exactly when its last comment was not
+// authored by the agent. A null agentUserId is fail-safe: the agent's own
+// comments cannot be told apart from the user ones, so picking could loop
+// on the agent's own summary.
+export function commentsPickupPending(
+  task: PlannerTask,
+  agentUserId: string | null,
+): boolean {
+  if (agentUserId === null) {
+    return false;
+  }
+  const last = lastCommentOf(task);
+  return last === null || last.userId !== agentUserId;
+}
+
+// Whether the agent already commented on the task at least once: the
+// stateless "first run" test of the comments mode (the one-line start
+// comment is posted on the first run only, to keep a fast back-and-forth
+// readable).
+export function hasAgentComment(
+  task: PlannerTask,
+  agentUserId: string | null,
+): boolean {
+  if (agentUserId === null) {
+    return false;
+  }
+  return task.comments.some((comment) => comment.userId === agentUserId);
+}
+
 // One line per dependency in the task brief: the current title and status
 // when the planner hydrated them, the id alone otherwise.
 function dependencyLines(dependencies: PlannerTaskDependency[]): string {
@@ -1565,11 +1696,13 @@ function buildAdjustmentInstruction(
 
 // The comment posted on a task that failed to process: the explanation of
 // the error, kept concise, the partial work salvaged from the failed CLI
-// run (partial summary and output tail) when any exists, and the resulting
-// status change.
+// run (partial summary and output tail) when any exists, and the outcome:
+// the end status the task was moved to, or — for a comments action
+// (endStatus null) — the fact that the task keeps its status and a new
+// user comment triggers a new run.
 function buildFailureComment(
   message: string,
-  endStatus: string,
+  endStatus: string | null,
   salvagedSummary: string | null = null,
   salvagedOutput: string | null = null,
 ): string {
@@ -1590,7 +1723,9 @@ function buildFailureComment(
   }
   sections.push(
     "",
-    `The task was moved to '${endStatus}' so it does not block the agent. Check the agent logs for more details.`,
+    endStatus === null
+      ? "The task keeps its status: post a new comment on the task to trigger a new run. Check the agent logs for more details."
+      : `The task was moved to '${endStatus}' so it does not block the agent. Check the agent logs for more details.`,
   );
   return sections.join("\n");
 }

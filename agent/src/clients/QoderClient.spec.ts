@@ -117,9 +117,13 @@ describe("QoderClient", () => {
 
       const promise = run();
       // Pump the event loop until the CLI spawns: the preparatory awaits of
-      // the run (file cleanup, usage read) precede the spawn.
+      // the run (file cleanup, usage read) are real file I/O and need real
+      // event-loop turns to settle, which a fake-clock advance alone does
+      // not always grant on a loaded runner.
+      const realSetTimeout = jest.requireActual("timers").setTimeout;
       for (let i = 0; i < 500 && mockExecFile.mock.calls.length === 0; i++) {
         await jest.advanceTimersByTimeAsync(10);
+        await new Promise((resolve) => realSetTimeout(resolve, 1));
       }
       expect(mockExecFile).toHaveBeenCalledTimes(1);
       await jest.advanceTimersByTimeAsync(timeoutMs);
