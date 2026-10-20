@@ -4332,6 +4332,113 @@ describe("Agent", () => {
     agent.stop();
   });
 
+  describe("first matching action ownership", () => {
+    // Two actions matching the same task: the first one must process it and
+    // the second one must never run, whatever the scheduling path.
+    const overlappingActions = (): AgentActionsConfig => ({
+      defaultModel: "",
+      defaultTimeout: null,
+      actions: [
+        {
+          project: "Web",
+          statusStart: "To Do",
+          statusEnd: "Done",
+          trigger: "status",
+          model: "",
+          instruction: "FIRST_INSTRUCTION",
+          timeout: null,
+          weight: null,
+        },
+        {
+          project: "W*",
+          statusStart: "To Do",
+          statusEnd: "Done",
+          trigger: "status",
+          model: "",
+          instruction: "SECOND_INSTRUCTION",
+          timeout: null,
+          weight: null,
+        },
+      ],
+    });
+
+    it("should process an overlapping task with the first matching pipeline action only", async () => {
+      mockPlanner.listProjects.mockResolvedValue([
+        { id: "p1", name: "Web", description: "" },
+      ]);
+      mockPlannerTasks([
+        {
+          id: "task-1",
+          projectId: "p1",
+          title: "Fix the build",
+          status: "To Do",
+          description: "",
+          comments: [],
+          attachments: [],
+        },
+      ]);
+      mockQoder.performTask.mockResolvedValue("Done");
+
+      const agent = createAgent(overlappingActions());
+      agent.start();
+      await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
+
+      expect(mockQoder.performTask).toHaveBeenCalledTimes(1);
+      expect(
+        (mockQoder.performTask.mock.calls[0]![2] as { instruction: string })
+          .instruction,
+      ).toBe("FIRST_INSTRUCTION");
+      expect(mockPlanner.updateTaskStatus).toHaveBeenCalledTimes(1);
+      expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith(
+        "task-1",
+        "Done",
+      );
+      agent.stop();
+    });
+
+    it("should report a dependency-blocked task once when several actions match it", async () => {
+      config.TASK_POLLING_INTERVAL = 1;
+      mockPlanner.listProjects.mockResolvedValue([
+        { id: "p1", name: "Web", description: "" },
+      ]);
+      mockPlanner.listAssignedTasks.mockResolvedValue([
+        {
+          id: "task-1",
+          projectId: "p1",
+          title: "Blocked work",
+          status: "To Do",
+          description: "",
+          comments: [],
+          attachments: [],
+          dependencies: [
+            { taskId: "task-2", title: "First step", status: "In Progress" },
+          ],
+        },
+      ]);
+
+      const agent = createAgent(overlappingActions());
+      agent.start();
+      await waitFor(() => mockPlanner.getCurrentUser.mock.calls.length >= 2);
+
+      const rounds = logSpy.mock.calls
+        .map((call) => String(call[0]))
+        .filter((text) => text.includes("Scheduling round:"));
+      const deferralRound = rounds.find((text) =>
+        text.includes("Blocked work"),
+      );
+      expect(deferralRound).toBeDefined();
+      expect(deferralRound).toContain(
+        "deferred: 'Blocked work' (dependency:task-2)",
+      );
+      // The claim is taken before the dependency gate: the task is reported
+      // once, not once per matching action.
+      expect(deferralRound!.match(/'Blocked work'/g)).toHaveLength(1);
+      expect(mockQoder.performTask).not.toHaveBeenCalled();
+      expect(mockPlanner.updateTaskStatus).not.toHaveBeenCalled();
+      agent.stop();
+    });
+  });
+
   // A comment-triggered action: the task stays in its start status, the
   // agent never moves it, and every new user comment re-triggers a run.
   const commentsActions = (): AgentActionsConfig => ({
@@ -4440,6 +4547,190 @@ describe("Agent", () => {
       ];
       await waitFor(() => mockQoder.performTask.mock.calls.length === 2);
       expect(mockPlanner.updateTaskStatus).not.toHaveBeenCalled();
+      agent.stop();
+    });
+
+    it("should keep a comment-triggered task owned by the first matching action when a broader pipeline action follows", async () => {
+      config.TASK_POLLING_INTERVAL = 1;
+      mockPlanner.listProjects.mockResolvedValue([
+        {
+          id: "p1",
+          name: "Projects/Ideation",
+          description: "",
+          statuses: ["To Do", "Doing", "Done"],
+        },
+      ]);
+      const task = {
+        id: "task-1",
+        projectId: "p1",
+        title: "Investigate the failure",
+        status: "Doing",
+        description: "Investigate the failure",
+        comments: [] as unknown[],
+        attachments: [] as unknown[],
+      };
+      mockPlannerTasks([task]);
+      mockQoder.performTask.mockResolvedValue("Investigation summary");
+
+      const agent = createAgent({
+        defaultModel: "",
+        defaultTimeout: null,
+        actions: [
+          {
+            project: "Projects/Ideation*",
+            statusStart: "Doing",
+            statusEnd: null,
+            trigger: "comments",
+            model: "",
+            instruction: "IDEATION_INSTRUCTION",
+            timeout: null,
+            weight: null,
+          },
+          {
+            project: "Project*",
+            statusStart: "Doing",
+            statusEnd: "Review",
+            trigger: "status",
+            model: "",
+            instruction: "IMPLEMENTATION_INSTRUCTION",
+            timeout: null,
+            weight: null,
+          },
+        ],
+      });
+      agent.start();
+      // The zero-comment task is processed by the first (comments) action.
+      await waitFor(() =>
+        mockPlanner.addTaskComment.mock.calls.some(
+          (call) => call[1] === "Investigation summary",
+        ),
+      );
+      expect(mockQoder.performTask).toHaveBeenCalledTimes(1);
+      expect(
+        (mockQoder.performTask.mock.calls[0]![2] as { instruction: string })
+          .instruction,
+      ).toBe("IDEATION_INSTRUCTION");
+      expect(mockPlanner.updateTaskStatus).not.toHaveBeenCalled();
+
+      // The agent summary is now the last comment: the conversation waits
+      // for the user, and the later pipeline action must never pick the
+      // task up (the first matching action owns it).
+      const pollsBefore = mockPlanner.getCurrentUser.mock.calls.length;
+      task.comments = [
+        {
+          id: "c-agent",
+          userId: "user-1",
+          userName: "Test User",
+          text: "Investigation summary",
+          dateCreated: "2026-10-20T00:52:57.000Z",
+        },
+      ];
+      await waitFor(
+        () => mockPlanner.getCurrentUser.mock.calls.length >= pollsBefore + 2,
+      );
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(mockQoder.performTask).toHaveBeenCalledTimes(1);
+      expect(mockPlanner.updateTaskStatus).not.toHaveBeenCalled();
+
+      // A user reply re-triggers exactly one run, still by the comments
+      // action, and the task still never moves.
+      task.comments = [
+        ...task.comments,
+        {
+          id: "c-user",
+          userId: "user-2",
+          userName: "Alice",
+          text: "Also check the labels",
+          dateCreated: "2026-10-20T01:00:00.000Z",
+        },
+      ];
+      await waitFor(() => mockQoder.performTask.mock.calls.length === 2);
+      expect(
+        (mockQoder.performTask.mock.calls[1]![2] as { instruction: string })
+          .instruction,
+      ).toBe("IDEATION_INSTRUCTION");
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(mockQoder.performTask).toHaveBeenCalledTimes(2);
+      expect(mockPlanner.updateTaskStatus).not.toHaveBeenCalled();
+      agent.stop();
+    });
+
+    it("should let the first of two overlapping comments actions own a task waiting for the user", async () => {
+      config.TASK_POLLING_INTERVAL = 1;
+      mockPlanner.listProjects.mockResolvedValue([
+        { id: "p1", name: "Weekly Plan", description: "" },
+      ]);
+      const task = {
+        id: "task-1",
+        projectId: "p1",
+        title: "Discuss the plan",
+        status: "Plan",
+        description: "Design the conversational flow",
+        comments: [
+          {
+            id: "c-agent",
+            userId: "user-1",
+            userName: "Test User",
+            text: "First analysis",
+            dateCreated: "2026-10-19T12:01:00.000Z",
+          },
+        ] as unknown[],
+        attachments: [] as unknown[],
+      };
+      mockPlannerTasks([task]);
+      mockQoder.performTask.mockResolvedValue("Second analysis");
+
+      const agent = createAgent({
+        defaultModel: "",
+        defaultTimeout: null,
+        actions: [
+          {
+            project: "Weekly*",
+            statusStart: "Plan",
+            statusEnd: null,
+            trigger: "comments",
+            model: "",
+            instruction: "FIRST_INSTRUCTION",
+            timeout: null,
+            weight: null,
+          },
+          {
+            project: "*",
+            statusStart: "Plan",
+            statusEnd: null,
+            trigger: "comments",
+            model: "",
+            instruction: "SECOND_INSTRUCTION",
+            timeout: null,
+            weight: null,
+          },
+        ],
+      });
+      agent.start();
+      // The first action owns the task and its conversation waits for the
+      // user: neither action runs.
+      await waitFor(() => mockPlanner.getCurrentUser.mock.calls.length >= 2);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(mockQoder.performTask).not.toHaveBeenCalled();
+
+      // A user reply re-triggers exactly one run, by the first action.
+      task.comments = [
+        ...task.comments,
+        {
+          id: "c-user",
+          userId: "user-2",
+          userName: "Alice",
+          text: "Please continue",
+          dateCreated: "2026-10-19T12:02:00.000Z",
+        },
+      ];
+      await waitFor(() => mockQoder.performTask.mock.calls.length === 1);
+      expect(
+        (mockQoder.performTask.mock.calls[0]![2] as { instruction: string })
+          .instruction,
+      ).toBe("FIRST_INSTRUCTION");
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(mockQoder.performTask).toHaveBeenCalledTimes(1);
       agent.stop();
     });
 
