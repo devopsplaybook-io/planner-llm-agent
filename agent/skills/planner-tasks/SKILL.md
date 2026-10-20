@@ -37,6 +37,7 @@ All endpoints are relative to `$PLANNER_URL` and require the `x-api-key` header.
 | `POST` | `/api/tasks/:id/assignees` | `{userId}` | `{}` — adds one assignee |
 | `DELETE` | `/api/tasks/:id/assignees/:userId` | — | `{}` — removes the assignee |
 | `POST` | `/api/tasks/:id/labels` | `{labels: [<name>]}` | `{}` — **replaces** the whole label list (clears, then adds) |
+| `PATCH` | `/api/tasks/:id/labels` | `{add?: [<name>], remove?: [<name>], quiet?: boolean}` | `{labels, changed}` — **atomic** add/remove (idempotent, no read-merge-write needed); `quiet: true` skips the "Labels updated" feed entry and the assignee notification |
 | `POST` | `/api/tasks/:id/dependencies` | `{dependencies: [taskId]}` | `{}` — **replaces** the whole dependency list (like labels) |
 | `POST` | `/api/tasks/:id/attachments` | multipart, one file | `{id, fileName, filePath, dateCreated}` |
 | `GET` | `/api/tasks/:id/attachments/:attachmentId` | query: `inline=true` streams images inline | the file stream |
@@ -104,12 +105,13 @@ curl -s -X POST -H "$PLANNER_AUTH" -H "Content-Type: application/json" \
   -d '{"text":"<comment>"}' "$PLANNER_URL/api/tasks/$TASK_ID/comments" | jq .
 ```
 
-Use `PUT` for `title`, `description`, `status`, `priority`, `dueDate` and `checklist`; use the dedicated endpoints for comments, assignees, labels (whole-list replace) and attachments.
+Use `PUT` for `title`, `description`, `status`, `priority`, `dueDate` and `checklist`; use the dedicated endpoints for comments, assignees, labels (`PATCH` for atomic add/remove, `POST` only for an intentional whole-list replacement) and attachments.
 
 ## Gotchas
 
 - **Default assignee is the agent itself**: a `POST /api/tasks` without `assignees` creates a task assigned to the API-key user, not to a human.
 - **Dependencies gate agent pickup**: a task with a dependency that is not `Done` is skipped by the agent (deferred with reason `dependency:<taskId>`) and retried on later polls — create follow-up tasks with dependencies to respect sequence. Validation: dependency ids must be visible tasks (`404`), self-reference is rejected (`400`), duplicates are dropped; `POST /api/tasks/:id/dependencies` replaces the whole list, like labels.
+- **Labels: mutate atomically**: prefer `PATCH /api/tasks/:id/labels` with `add`/`remove` over the replacing `POST`: the server merges only the difference, so a label a human changes concurrently is never lost, and the response `changed` tells whether anything was written. Label names are case-sensitive; values are trimmed, deduplicated and limited to 100 characters (`400` otherwise). Use `quiet: true` for bookkeeping labels (the run's `agent:running`/`model:*` markers) so they do not spam the task feed.
 - **Status must exist in the target project**: each project carries its own `statuses` list; a status name outside it is invalid. Check `GET /api/projects` first.
 - **Never move a task the agent is processing**: tasks matching an action's start status are auto-moved to the action's end status by the agent; moving an in-flight task manually breaks the pipeline bookkeeping.
 - **Comment-triggered actions never change the status**: a task handled by a `trigger: comments` action stays in its start status forever (the agent posts its answer as a comment). To retry a failed conversational run, comment on the task again; to resume after an abort, move the task back to the start status and comment again — the pickup rule is stateless (zero comments, or the last comment not authored by the agent), so no other action is needed.

@@ -16,11 +16,20 @@ import { FinalizationStore } from "./FinalizationStore";
 import { CliAbortedError } from "./CliUtils";
 import { createCliAgent } from "./clients/CliAgentRegistry";
 import type { CliAgentClient, TaskOptions } from "./clients/CliAgent";
-import { PlannerClient, PlannerTask } from "./PlannerClient";
+import { PlannerClient, PlannerRequestError, PlannerTask } from "./PlannerClient";
 
-jest.mock("./PlannerClient", () => ({
-  PlannerClient: jest.fn(),
-}));
+jest.mock("./PlannerClient", () => {
+  class PlannerRequestError extends Error {
+    public readonly status: number;
+
+    constructor(message: string, status: number) {
+      super(message);
+      this.name = "PlannerRequestError";
+      this.status = status;
+    }
+  }
+  return { PlannerClient: jest.fn(), PlannerRequestError };
+});
 
 jest.mock("./clients/CliAgentRegistry", () => ({
   createCliAgent: jest.fn(),
@@ -62,6 +71,7 @@ const mockPlanner = {
   listProjects: jest.fn(),
   addTaskComment: jest.fn(),
   updateTaskStatus: jest.fn(),
+  mutateTaskLabels: jest.fn(),
   updateTaskLabels: jest.fn(),
   downloadTaskAttachment: jest.fn(),
 };
@@ -163,22 +173,49 @@ describe("Agent", () => {
     );
   };
 
-  // Stateful label store for the label tests: getTask reads the current
-  // labels, updateTaskLabels records every replacement and persists it.
+  // Stateful label store for the label tests: mutateTaskLabels applies the
+  // add/remove sets and records the writes that actually changed the list;
+  // updateTaskLabels persists the legacy whole-list fallback replacements.
   const mockTaskLabels = (task: Record<string, unknown>): string[][] => {
     const writes: string[][] = [];
     if (!Array.isArray(task.labels)) {
       task.labels = [];
     }
+    const currentLabels = () => [...(task.labels as string[])];
+    const persist = (labels: string[]): boolean => {
+      const current = currentLabels();
+      if (
+        labels.length === current.length &&
+        labels.every((label, index) => label === current[index])
+      ) {
+        return false;
+      }
+      writes.push([...labels]);
+      task.labels = [...labels];
+      return true;
+    };
     mockPlanner.listAssignedTasks.mockImplementation(async () => [{ ...task }]);
     mockPlanner.getTask.mockImplementation(async () => ({
       ...task,
-      labels: [...(task.labels as string[])],
+      labels: currentLabels(),
     }));
+    mockPlanner.mutateTaskLabels.mockImplementation(
+      async (
+        _taskId: string,
+        mutation: { add?: string[]; remove?: string[] },
+      ) => {
+        const removed = new Set(mutation.remove ?? []);
+        const labels = mergeLabels(
+          currentLabels().filter((label) => !removed.has(label)),
+          mutation.add ?? [],
+        );
+        const changed = persist(labels);
+        return { labels, changed };
+      },
+    );
     mockPlanner.updateTaskLabels.mockImplementation(
       async (_taskId: string, labels: string[]) => {
-        writes.push([...labels]);
-        task.labels = [...labels];
+        persist([...labels]);
       },
     );
     return writes;
@@ -209,6 +246,7 @@ describe("Agent", () => {
       mockPlanner.listProjects,
       mockPlanner.addTaskComment,
       mockPlanner.updateTaskStatus,
+      mockPlanner.mutateTaskLabels,
       mockPlanner.updateTaskLabels,
       mockPlanner.downloadTaskAttachment,
       mockQoder.checkAuthentication,
@@ -228,6 +266,10 @@ describe("Agent", () => {
     });
     mockPlanner.listAssignedTasks.mockResolvedValue([]);
     mockPlanner.addTaskComment.mockResolvedValue(undefined);
+    mockPlanner.mutateTaskLabels.mockResolvedValue({
+      labels: [],
+      changed: false,
+    });
     mockPlanner.updateTaskLabels.mockResolvedValue(undefined);
     // Default getTask: mirrors the task as the last poll saw it, so the
     // new-comment check of every processed task sees no new comments.
@@ -3205,13 +3247,12 @@ describe("Agent", () => {
 
     const agent = createAgent();
     agent.start();
-    // The add of the run labels, the new-comment check and the removal of
-    // the running label each re-read the task: wait for the removal too, so
-    // the count is asserted after the processing fully completed.
-    await waitFor(() => mockPlanner.getTask.mock.calls.length >= 3);
+    // Label writes are atomic (no read-merge-write): the only re-read is the
+    // new-comment check after the run.
+    await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
 
     expect(mockQoder.performTask).toHaveBeenCalledTimes(1);
-    expect(mockPlanner.getTask).toHaveBeenCalledTimes(3);
+    expect(mockPlanner.getTask).toHaveBeenCalledTimes(1);
     expect(mockPlanner.addTaskComment).toHaveBeenCalledWith(
       "task-1",
       "Feature implemented",
@@ -3442,13 +3483,13 @@ describe("Agent", () => {
 
     const agent = createAgent();
     agent.start();
-    // Two adjustment checks plus the bounded final check, with the run-label
-    // add and removal reads around them: wait for the removal too, so the
-    // count is asserted after the processing fully completed.
-    await waitFor(() => mockPlanner.getTask.mock.calls.length >= 5);
+    // Two adjustment checks plus the bounded final check; the label writes
+    // are atomic and re-read nothing. The end status confirms the processing
+    // fully completed.
+    await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
 
     expect(mockQoder.performTask).toHaveBeenCalledTimes(3);
-    expect(mockPlanner.getTask).toHaveBeenCalledTimes(5);
+    expect(mockPlanner.getTask).toHaveBeenCalledTimes(3);
     expect(mockPlanner.addTaskComment).toHaveBeenCalledWith(
       "task-1",
       "Summary after call 3",
@@ -3499,13 +3540,12 @@ describe("Agent", () => {
 
     const agent = createAgent();
     agent.start();
-    // The run-label add, the detection-only new-comment check and the
-    // running-label removal each re-read the task: wait for the removal
-    // too, so the count is asserted after the processing fully completed.
-    await waitFor(() => mockPlanner.getTask.mock.calls.length >= 3);
+    // Label writes are atomic (no read-merge-write): the only re-read is the
+    // detection-only new-comment check after the run.
+    await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
 
     expect(mockQoder.performTask).toHaveBeenCalledTimes(1);
-    expect(mockPlanner.getTask).toHaveBeenCalledTimes(3);
+    expect(mockPlanner.getTask).toHaveBeenCalledTimes(1);
     expect(mockPlanner.addTaskComment).toHaveBeenCalledWith(
       "task-1",
       "Feature implemented",
@@ -3992,6 +4032,20 @@ describe("Agent", () => {
       ["urgent", "agent:running", "model:qwen3.8-flash"],
       ["urgent", "model:qwen3.8-flash"],
     ]);
+    // Atomic quiet mutations: add before the run, remove when it ends.
+    expect(mockPlanner.mutateTaskLabels).toHaveBeenCalledWith("task-1", {
+      add: ["agent:running", "model:qwen3.8-flash"],
+      remove: [],
+      quiet: true,
+    });
+    expect(mockPlanner.mutateTaskLabels).toHaveBeenCalledWith("task-1", {
+      add: [],
+      remove: ["agent:running"],
+      quiet: true,
+    });
+    // No read-merge-write on the happy path: the only re-read is the
+    // post-run new-comment check.
+    expect(mockPlanner.getTask).toHaveBeenCalledTimes(1);
     // The legacy start comment is off by default: only the summary is posted.
     expect(mockPlanner.addTaskComment).toHaveBeenCalledTimes(1);
     expect(mockPlanner.addTaskComment).toHaveBeenCalledWith(
@@ -4052,6 +4106,40 @@ describe("Agent", () => {
     agent.stop();
   });
 
+  it("should fall back to a whole-list label replace on a Planner without the PATCH endpoint", async () => {
+    const task = {
+      id: "task-1",
+      title: "Implement feature",
+      status: "To Do",
+      description: "Add a feature",
+      comments: [],
+      attachments: [],
+      labels: ["urgent"],
+    };
+    const writes = mockTaskLabels(task);
+    mockPlanner.mutateTaskLabels.mockRejectedValue(
+      new PlannerRequestError(
+        "Planner request to '/api/tasks/task-1/labels' failed with status 405",
+        405,
+      ),
+    );
+    mockQoder.performTask.mockResolvedValue("Feature implemented");
+
+    const agent = createAgent();
+    agent.start();
+    await waitFor(() => writes.length === 2);
+
+    // The legacy fallback reads the fresh task first and replaces the whole
+    // list, preserving the human label.
+    expect(writes).toEqual([["urgent", "agent:running"], ["urgent"]]);
+    expect(mockPlanner.getTask).toHaveBeenCalled();
+    expect(mockPlanner.updateTaskLabels).toHaveBeenCalledWith("task-1", [
+      "urgent",
+      "agent:running",
+    ]);
+    agent.stop();
+  });
+
   it("should clear the running label when the task fails", async () => {
     const task = {
       id: "task-1",
@@ -4095,10 +4183,19 @@ describe("Agent", () => {
       labels: [...tasks[0].labels],
     }));
     const writes: string[][] = [];
-    mockPlanner.updateTaskLabels.mockImplementation(
-      async (_taskId: string, labels: string[]) => {
+    mockPlanner.mutateTaskLabels.mockImplementation(
+      async (
+        _taskId: string,
+        mutation: { add?: string[]; remove?: string[] },
+      ) => {
+        const removed = new Set(mutation.remove ?? []);
+        const labels = mergeLabels(
+          tasks[0].labels.filter((label) => !removed.has(label)),
+          mutation.add ?? [],
+        );
         writes.push([...labels]);
         tasks[0].labels = [...labels];
+        return { labels, changed: true };
       },
     );
     mockQoder.performTask.mockImplementation(
@@ -4140,7 +4237,9 @@ describe("Agent", () => {
         attachments: [],
       },
     ]);
-    mockPlanner.getTask.mockRejectedValue(new Error("Planner is down"));
+    mockPlanner.mutateTaskLabels.mockRejectedValue(
+      new Error("Planner is down"),
+    );
     mockQoder.performTask.mockResolvedValue("Feature implemented");
 
     const agent = createAgent();
@@ -4153,6 +4252,8 @@ describe("Agent", () => {
       "Feature implemented",
     );
     expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith("task-1", "Done");
+    // An operational failure is not an unsupported endpoint: no fallback.
+    expect(mockPlanner.updateTaskLabels).not.toHaveBeenCalled();
     expect(console.log).toHaveBeenCalledWith(
       expect.stringContaining(
         "Failed to add the agent labels (agent:running) for task 'Implement feature' (task-1)",
@@ -4196,20 +4297,31 @@ describe("Agent", () => {
         attachments: [],
         labels: ["agent:running", "model:qwen3.8-flash"],
       },
+      {
+        id: "task-already-clear",
+        title: "Already clear task",
+        status: "Done",
+        description: "",
+        comments: [],
+        attachments: [],
+        labels: ["agent:running"],
+      },
     ];
     mockPlanner.listAssignedTasks.mockImplementation(
       async (_user, _projectIds, labels?: string[]) =>
         labels ? tasks.map((task) => ({ ...task })) : [],
     );
-    mockPlanner.getTask.mockImplementation(async (taskId: string) => ({
-      ...tasks.find((task) => task.id === taskId),
-      labels: [...tasks[0].labels],
-    }));
+    // The second task reports no change (labeled meanwhile by someone else).
+    mockPlanner.mutateTaskLabels.mockImplementation(async (taskId: string) =>
+      taskId === "task-stale"
+        ? { labels: ["model:qwen3.8-flash"], changed: true }
+        : { labels: ["agent:running"], changed: false },
+    );
 
     const agent = createAgent();
     agent.start();
     await jest.advanceTimersByTimeAsync(59999);
-    expect(mockPlanner.updateTaskLabels).not.toHaveBeenCalled();
+    expect(mockPlanner.mutateTaskLabels).not.toHaveBeenCalled();
 
     await jest.advanceTimersByTimeAsync(1);
     expect(mockPlanner.listAssignedTasks).toHaveBeenCalledWith(
@@ -4217,9 +4329,17 @@ describe("Agent", () => {
       undefined,
       ["agent:running"],
     );
-    expect(mockPlanner.updateTaskLabels).toHaveBeenCalledWith("task-stale", [
-      "model:qwen3.8-flash",
-    ]);
+    expect(mockPlanner.mutateTaskLabels).toHaveBeenCalledWith("task-stale", {
+      add: [],
+      remove: ["agent:running"],
+      quiet: true,
+    });
+    // Only the changed task counts as cleared.
+    expect(console.log).toHaveBeenCalledWith(
+      expect.stringContaining(
+        "Running label reconciliation: cleared 'agent:running' on 1 of 2 task(s)",
+      ),
+    );
     agent.stop();
   });
 

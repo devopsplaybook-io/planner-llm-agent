@@ -23,6 +23,7 @@ import { OTelLogger, OTelMeter } from "./OTelContext";
 import {
   PlannerClient,
   PlannerProject,
+  PlannerRequestError,
   PlannerTask,
   PlannerTaskComment,
   PlannerTaskDependency,
@@ -128,9 +129,10 @@ export function buildTaskLabel(
 
 /**
  * Merges labels into a task label list: existing labels first (order
- * preserved, duplicates dropped), then the new ones. The Planner has no
- * add/remove endpoint: every label change replaces the whole list, so the
- * merge keeps the labels set by humans.
+ * preserved, duplicates dropped), then the new ones. Only used by the
+ * whole-list fallback for Planner servers without the atomic label
+ * mutation endpoint; the fallback replaces the whole list, so the merge
+ * keeps the labels set by humans.
  */
 export function mergeLabels(
   current: string[],
@@ -1289,9 +1291,10 @@ export class Agent {
     return labels;
   }
 
-  // Marks the task as running and records its provenance in one replace
-  // write (the running label plus the model/CLI labels). Best-effort: a
-  // label failure is logged but never fails the task processing.
+  // Marks the task as running and records its provenance in one atomic
+  // mutation (the running label plus the model/CLI labels), without reading
+  // the task first. Best-effort: a label failure is logged but never fails
+  // the task processing.
   private async addTaskRunLabels(
     task: PlannerTask,
     model: string,
@@ -1308,10 +1311,11 @@ export class Agent {
     if (labelsToAdd.length === 0) {
       return;
     }
-    await this.updateTaskLabels(
+    const add = mergeLabels([], labelsToAdd);
+    await this.applyLabelMutation(
       task,
-      (current) => mergeLabels(current, labelsToAdd),
-      `add the agent labels (${labelsToAdd.join(", ")})`,
+      { add },
+      `add the agent labels (${add.join(", ")})`,
     );
   }
 
@@ -1325,27 +1329,63 @@ export class Agent {
     if (runningLabel.length === 0) {
       return;
     }
-    await this.updateTaskLabels(
+    await this.applyLabelMutation(
       task,
-      (current) => current.filter((label) => label !== runningLabel),
+      { remove: [runningLabel] },
       `remove the running label '${runningLabel}'`,
     );
   }
 
-  // Read-merge-write of the task labels: a fresh read keeps the overwrite
-  // window tiny (the Planner replaces the whole list on every write), the
-  // merge preserves the labels set by humans and a no-op change is skipped.
-  // Returns whether a write was performed. Best-effort: failures are
-  // logged, never propagated.
-  private async updateTaskLabels(
+  // Applies an atomic add/remove label mutation and returns whether anything
+  // changed (the server applies only the difference, so repeated or
+  // overlapping calls are idempotent). Against a Planner without the PATCH
+  // endpoint (404/405, e.g. an older deploy) it falls back to the
+  // read-merge-write whole-list replace. Writes are quiet: the server skips
+  // the "Labels updated" feed entry and the assignee notification. Returns
+  // whether a real change was written. Best-effort: failures are logged,
+  // never propagated.
+  private async applyLabelMutation(
     task: PlannerTask,
-    merge: (current: string[]) => string[],
+    mutation: { add?: string[]; remove?: string[] },
+    description: string,
+  ): Promise<boolean> {
+    try {
+      const result = await this.planner.mutateTaskLabels(task.id, {
+        add: mutation.add ?? [],
+        remove: mutation.remove ?? [],
+        quiet: true,
+      });
+      return result.changed;
+    } catch (error) {
+      if (
+        !(error instanceof PlannerRequestError) ||
+        (error.status !== 404 && error.status !== 405)
+      ) {
+        logger.warn(
+          `Failed to ${description} for task '${task.title}' (${task.id}) (continuing): ${(error as Error).message}`,
+        );
+        return false;
+      }
+    }
+    return this.updateTaskLabelsFallback(task, mutation, description);
+  }
+
+  // Legacy whole-list replace for Planner servers without the atomic label
+  // mutation endpoint: a fresh read keeps the overwrite window tiny, the
+  // merge preserves the labels set by humans and a no-op change is skipped.
+  private async updateTaskLabelsFallback(
+    task: PlannerTask,
+    mutation: { add?: string[]; remove?: string[] },
     description: string,
   ): Promise<boolean> {
     try {
       const fresh = await this.planner.getTask(task.id);
       const current = fresh.labels ?? [];
-      const updated = merge(current);
+      const removed = new Set(mutation.remove ?? []);
+      const updated = mergeLabels(
+        current.filter((label) => !removed.has(label)),
+        mutation.add ?? [],
+      );
       if (
         updated.length === current.length &&
         updated.every((label, index) => label === current[index])
@@ -1395,9 +1435,9 @@ export class Agent {
         continue;
       }
       if (
-        await this.updateTaskLabels(
+        await this.applyLabelMutation(
           task,
-          (current) => current.filter((label) => label !== runningLabel),
+          { remove: [runningLabel] },
           `reconcile the stale running label '${runningLabel}'`,
         )
       ) {

@@ -6,6 +6,19 @@ const REQUEST_TIMEOUT_MS = 30000;
 
 type PlannerSpan = ReturnType<StandardTracer["startSpan"]>;
 
+// Failed Planner HTTP request: the status lets callers distinguish a
+// missing/unsupported endpoint (404/405, e.g. an older Planner without the
+// atomic label mutation) from an operational failure.
+export class PlannerRequestError extends Error {
+  public readonly status: number;
+
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = "PlannerRequestError";
+    this.status = status;
+  }
+}
+
 export interface PlannerUser {
   id: string;
   name: string;
@@ -253,9 +266,43 @@ export class PlannerClient {
     }
   }
 
-  // Replaces the whole label list of a task: the Planner has no add/remove
-  // endpoint, so callers read the task first and merge. Also bumps the task
-  // dateUpdated and records a "Labels updated" feed entry server-side.
+  // Atomic label mutation: the server applies the add/remove sets itself
+  // (no read-merge-write race) and reports the resulting labels and whether
+  // anything changed. quiet skips the server-side "Labels updated" feed
+  // entry and the assignee notification while still bumping dateUpdated.
+  public async mutateTaskLabels(
+    taskId: string,
+    mutation: { add?: string[]; remove?: string[]; quiet?: boolean },
+  ): Promise<{ labels: string[]; changed: boolean }> {
+    const span = OTelTracer().startSpan("planner-client.mutate-task-labels");
+    try {
+      const body = await this.request(
+        `/api/tasks/${taskId}/labels`,
+        "PATCH",
+        span,
+        mutation,
+      );
+      if (!Array.isArray(body?.labels) || typeof body?.changed !== "boolean") {
+        throw new Error(
+          "Planner label mutation response is missing labels/changed",
+        );
+      }
+      return {
+        labels: body.labels.map((label: unknown) => String(label)),
+        changed: body.changed,
+      };
+    } catch (error) {
+      span.recordException(error as Error);
+      throw error;
+    } finally {
+      span.end();
+    }
+  }
+
+  // Replaces the whole label list of a task (legacy whole-list write), kept
+  // as the fallback for Planner servers without the atomic label mutation
+  // endpoint. Also bumps the task dateUpdated and records a "Labels updated"
+  // feed entry server-side.
   public async updateTaskLabels(
     taskId: string,
     labels: string[],
@@ -454,8 +501,9 @@ export class PlannerClient {
       );
     }
     if (!response.ok) {
-      throw new Error(
+      throw new PlannerRequestError(
         `Planner request to '${path}' failed with status ${response.status}`,
+        response.status,
       );
     }
     try {

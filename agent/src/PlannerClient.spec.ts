@@ -464,6 +464,17 @@ describe("PlannerClient", () => {
     );
   });
 
+  it("should report the HTTP status on request failures", async () => {
+    fetchMock.mockResolvedValue(
+      new Response(JSON.stringify({ error: "Not found" }), { status: 404 }),
+    );
+
+    const client = new PlannerClient(config);
+    await expect(client.getTask("task-1")).rejects.toMatchObject({
+      status: 404,
+    });
+  });
+
   it("should throw a clear error when the single-task response is invalid", async () => {
     fetchMock.mockResolvedValue(
       new Response(JSON.stringify({ error: "boom" }), { status: 200 }),
@@ -572,6 +583,55 @@ describe("PlannerClient", () => {
           labels: ["urgent", "agent:running", "model:deepseek-flash"],
         }),
       }),
+    );
+  });
+
+  it("should mutate the labels of a task atomically", async () => {
+    fetchMock.mockResolvedValue(
+      new Response(
+        JSON.stringify({ labels: ["urgent", "agent:running"], changed: true }),
+        { status: 200 },
+      ),
+    );
+
+    const client = new PlannerClient(config);
+    const result = await client.mutateTaskLabels("task-1", {
+      add: ["agent:running"],
+      remove: ["stale"],
+      quiet: true,
+    });
+
+    expect(result).toEqual({
+      labels: ["urgent", "agent:running"],
+      changed: true,
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://planner.test:8080/api/tasks/task-1/labels",
+      expect.objectContaining({
+        method: "PATCH",
+        headers: expect.objectContaining({
+          "x-api-key": "test-api-key",
+          "Content-Type": "application/json",
+        }),
+        body: JSON.stringify({
+          add: ["agent:running"],
+          remove: ["stale"],
+          quiet: true,
+        }),
+      }),
+    );
+  });
+
+  it("should reject an invalid label mutation response", async () => {
+    fetchMock.mockResolvedValue(
+      new Response(JSON.stringify({}), { status: 200 }),
+    );
+
+    const client = new PlannerClient(config);
+    await expect(
+      client.mutateTaskLabels("task-1", { add: ["agent:running"] }),
+    ).rejects.toThrow(
+      "Planner label mutation response is missing labels/changed",
     );
   });
 
