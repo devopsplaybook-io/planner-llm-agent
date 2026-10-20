@@ -109,8 +109,13 @@ export interface AgentActionsConfig {
  * 'status_in_progress' (a status move would break the conversation), while
  * 'status_abort' stays honored (user-initiated cancellation). A comments
  * action sharing a start status and overlapping project patterns with a
- * pipeline action is rejected. Everything else is required and unknown
- * fields are rejected.
+ * pipeline action is accepted only when it is listed before it and both
+ * patterns differ: the first matching action wins, so it explicitly claims
+ * that status for its project while the broader pipeline action keeps its
+ * other projects. A pipeline action listed before the comments action (it
+ * would shadow the conversation) or an identical project pattern (the
+ * pipeline action would be unreachable) is rejected. Everything else is
+ * required and unknown fields are rejected.
  * Throws an Error listing every problem found when the configuration is
  * invalid.
  */
@@ -401,11 +406,16 @@ export function parseAgentActions(content: string): AgentActionsConfig {
         parsed.push({ index, action });
       }
     });
-    // A comments action must not ambiguously compete with a pipeline action
-    // on the same start status: when both match the same task, the "first
-    // matching action wins" rule would silently turn one mode or the other
-    // off. Two comments actions overlapping stays allowed (the first one
-    // wins, like the documented overlapping pipeline patterns).
+    // A comments action and a pipeline action on the same start status and
+    // overlapping project patterns are only rejected when their order cannot
+    // express an intent. Listed first with its own pattern, the comments
+    // action explicitly claims that status for its project and the broader
+    // pipeline action still covers its other projects ("first matching
+    // action wins", like the documented specific-before-generic ordering of
+    // the pipeline patterns). Listed after, the pipeline action silently
+    // shadows the conversation; with the exact same pattern the pipeline
+    // action is unreachable. Two overlapping comments actions stay allowed
+    // (the first one wins, like the overlapping pipeline patterns).
     for (let i = 0; i < parsed.length; i++) {
       for (let j = i + 1; j < parsed.length; j++) {
         const first = parsed[i].action;
@@ -417,12 +427,20 @@ export function parseAgentActions(content: string): AgentActionsConfig {
         ) {
           continue;
         }
-        const comments =
-          first.trigger === "comments" ? parsed[i] : parsed[j];
-        const pipeline =
-          first.trigger === "comments" ? parsed[j] : parsed[i];
+        const commentsFirst = first.trigger === "comments";
+        const comments = commentsFirst ? parsed[i] : parsed[j];
+        const pipeline = commentsFirst ? parsed[j] : parsed[i];
+        if (
+          commentsFirst &&
+          comments.action.project !== pipeline.action.project
+        ) {
+          continue;
+        }
+        const reason = commentsFirst
+          ? "both actions declare the same project pattern, so the pipeline action is unreachable"
+          : "the pipeline action is listed first and shadows the conversation, so list the comments action before it";
         errors.push(
-          `actions[${comments.index}] (trigger: comments) competes with actions[${pipeline.index}] (status pipeline): both match the status_start '${comments.action.statusStart}' and overlapping project patterns; a comments action must not ambiguously compete with a pipeline action`,
+          `actions[${comments.index}] (trigger: comments) competes with actions[${pipeline.index}] (status pipeline): both match the status_start '${comments.action.statusStart}' and overlapping project patterns; ${reason}`,
         );
       }
     }

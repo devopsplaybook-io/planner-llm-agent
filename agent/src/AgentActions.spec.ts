@@ -965,11 +965,11 @@ describe("AgentActions", () => {
             ].join("\n"),
           ),
         ).toThrow(
-          /actions\[0\] \(trigger: comments\) competes with actions\[1\] \(status pipeline\): both match the status_start 'To Do' and overlapping project patterns/,
+          /actions\[0\] \(trigger: comments\) competes with actions\[1\] \(status pipeline\): both match the status_start 'To Do' and overlapping project patterns; both actions declare the same project pattern, so the pipeline action is unreachable/,
         );
       });
 
-      it("should reject a comments action competing with a wildcard-overlapping status action", () => {
+      it("should reject a comments action with the exact project pattern of a status action", () => {
         expect(() =>
           parseAgentActions(
             [
@@ -980,9 +980,46 @@ describe("AgentActions", () => {
               "  - project: 'W*'",
               "    status_start: To Do",
               "    status_end: Done",
+              "  - project: Web",
+              "    status_start: To Do",
+              "    status_end: Done",
             ].join("\n"),
           ),
-        ).toThrow(/competes with actions\[1\] \(status pipeline\)/);
+        ).toThrow(
+          /actions\[0\] \(trigger: comments\) competes with actions\[2\] \(status pipeline\): both match the status_start 'To Do' and overlapping project patterns; both actions declare the same project pattern/,
+        );
+      });
+
+      it("should accept a specific comments action listed before the broader status action it overrides", () => {
+        const config = parseAgentActions(
+          [
+            "actions:",
+            "  - project: Projects/Ideation*",
+            "    trigger: comments",
+            "    status_start: Doing",
+            "  - project: Project*",
+            "    status_start: Doing",
+            "    status_end: Review",
+          ].join("\n"),
+        );
+        expect(config.actions).toHaveLength(2);
+        expect(config.actions[0].trigger).toBe("comments");
+        expect(config.actions[1].trigger).toBe("status");
+      });
+
+      it("should accept a comments action listed before a wildcard-overlapping status action", () => {
+        const config = parseAgentActions(
+          [
+            "actions:",
+            "  - project: Web",
+            "    trigger: comments",
+            "    status_start: To Do",
+            "  - project: 'W*'",
+            "    status_start: To Do",
+            "    status_end: Done",
+          ].join("\n"),
+        );
+        expect(config.actions).toHaveLength(2);
       });
 
       it("should accept a comments action and a status action with disjoint project patterns", () => {
@@ -1044,7 +1081,7 @@ describe("AgentActions", () => {
             ].join("\n"),
           ),
         ).toThrow(
-          /actions\[1\] \(trigger: comments\) competes with actions\[0\] \(status pipeline\)/,
+          /actions\[1\] \(trigger: comments\) competes with actions\[0\] \(status pipeline\): both match the status_start 'To Do' and overlapping project patterns; the pipeline action is listed first and shadows the conversation, so list the comments action before it/,
         );
       });
     });

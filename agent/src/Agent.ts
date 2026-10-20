@@ -418,15 +418,22 @@ export class Agent {
         await loadProjects();
       }
       // Only tasks matching an action are ready, and a task already being
-      // processed is never picked again by a subsequent poll. A task with a
-      // dependency that is not Done yet is never picked either: it is only
+      // processed is never picked again by a subsequent poll. The first
+      // action in configuration order whose project pattern and start status
+      // match owns the task: it claims the task before the eligibility gates
+      // below, so a task it deliberately leaves alone (a conversation waiting
+      // for the user, a blocked dependency) is never picked up by a later
+      // overlapping action. The claim set is rebuilt from the configuration
+      // and the comments on every poll, so the rule is stateless and
+      // restart-safe. A task with a dependency that is not Done yet is only
       // reported as deferred (no status change, no error comment) and is
-      // picked up naturally once its dependencies complete. Every matching
-      // (task, action) pair is a candidate; the scheduler then fills the
-      // capacity budget from the candidates sorted by queue priority. The
-      // budget is shared by every action.
+      // picked up naturally once its dependencies complete. Every claimed
+      // (task, action) pair that passes the gates is a candidate; the
+      // scheduler then fills the capacity budget from the candidates sorted
+      // by queue priority. The budget is shared by every action.
       const candidates: SchedulerPickless[] = [];
       const dependencyDeferrals: SchedulerDeferral[] = [];
+      const claimedTaskIds = new Set<string>();
       for (const action of actions) {
         for (const task of tasks) {
           if (
@@ -435,10 +442,14 @@ export class Agent {
             // A task with a pending finalization completed already: only its
             // Planner updates remain, never a new CLI execution.
             this.finalizationStore.has(task.id) ||
-            candidates.some((selected) => selected.task.id === task.id)
+            claimedTaskIds.has(task.id)
           ) {
             continue;
           }
+          // Taking the claim before the gates is what makes "the first
+          // matching action wins" hold whatever the trigger state: the gates
+          // only decide whether the owning action processes the task now.
+          claimedTaskIds.add(task.id);
           // Comment-triggered actions only pick a task up when the
           // conversation waits for the agent: zero comments (the
           // description is the initial prompt) or a last comment the agent

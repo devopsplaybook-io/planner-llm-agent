@@ -121,18 +121,18 @@ describe("checkConfig", () => {
     expect(errorSpy).not.toHaveBeenCalled();
   });
 
-  it("exits 1 when a comments action competes with a pipeline action", async () => {
+  it("exits 1 when a pipeline action shadows a comments action", async () => {
     const filePath = path.join(tmpDir, "llm-agent.yaml");
     await fse.outputFile(
       filePath,
       [
         "actions:",
-        "  - project: Web",
-        "    trigger: comments",
-        "    status_start: To Do",
         "  - project: 'W*'",
         "    status_start: To Do",
         "    status_end: Done",
+        "  - project: Web",
+        "    trigger: comments",
+        "    status_start: To Do",
       ].join("\n"),
     );
 
@@ -142,7 +142,27 @@ describe("checkConfig", () => {
       .join("\n");
     expect(errors).toContain("Invalid agent actions configuration:");
     expect(errors).toContain(
-      "actions[0] (trigger: comments) competes with actions[1] (status pipeline)",
+      "actions[1] (trigger: comments) competes with actions[0] (status pipeline)",
     );
+    expect(errors).toContain("the pipeline action is listed first");
+  });
+
+  it("exits 0 when a specific comments action overrides a broader pipeline action listed after it", async () => {
+    const filePath = path.join(tmpDir, "llm-agent.yaml");
+    await fse.outputFile(
+      filePath,
+      [
+        "actions:",
+        "  - project: Projects/Ideation*",
+        "    trigger: comments",
+        "    status_start: Doing",
+        "  - project: Project*",
+        "    status_start: Doing",
+        "    status_end: Review",
+      ].join("\n"),
+    );
+
+    await expect(run(filePath)).resolves.toBe(0);
+    expect(errorSpy).not.toHaveBeenCalled();
   });
 });
