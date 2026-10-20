@@ -37,6 +37,11 @@ describe("Config", () => {
       expect(config.TASK_SMART_SCHEDULING).toBe(true);
       expect(config.TASK_CONFLICT_MODE).toBe("repo");
       expect(config.TASK_ADJUSTMENT_MAX_ROUNDS).toBe(2);
+      expect(config.TASK_LABELS).toBe(true);
+      expect(config.TASK_RUNNING_LABEL).toBe("agent:running");
+      expect(config.TASK_MODEL_LABEL_PREFIX).toBe("model:");
+      expect(config.TASK_CLI_LABEL_PREFIX).toBe("");
+      expect(config.AGENT_START_COMMENT).toBe(false);
       expect(config.AGENT_UTILITY_MODEL).toBe("");
       expect(config.GITHUB_TOKENS).toBe("");
       expect(config.AGENT_CLI).toBe("qoder");
@@ -271,6 +276,46 @@ describe("Config", () => {
       await fs.remove(tmpDir);
     });
 
+    it("should load the label settings from the config file and environment", async () => {
+      const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-config-"));
+      const configFile = path.join(tmpDir, "config.json");
+      await fs.writeJson(configFile, {
+        TASK_LABELS: false,
+        TASK_RUNNING_LABEL: "file:running",
+        TASK_MODEL_LABEL_PREFIX: "file-model:",
+        TASK_CLI_LABEL_PREFIX: "file-cli:",
+        AGENT_START_COMMENT: true,
+      });
+      process.env.CONFIG_FILE = configFile;
+
+      const fileConfig = new Config();
+      await fileConfig.reload();
+      expect(fileConfig.TASK_LABELS).toBe(false);
+      expect(fileConfig.TASK_RUNNING_LABEL).toBe("file:running");
+      expect(fileConfig.TASK_MODEL_LABEL_PREFIX).toBe("file-model:");
+      expect(fileConfig.TASK_CLI_LABEL_PREFIX).toBe("file-cli:");
+      expect(fileConfig.AGENT_START_COMMENT).toBe(true);
+
+      // The environment wins over the config file; an empty string disables
+      // the running label and an empty prefix disables the CLI provenance
+      // label.
+      process.env.TASK_LABELS = "true";
+      process.env.TASK_RUNNING_LABEL = "";
+      process.env.TASK_MODEL_LABEL_PREFIX = "model:";
+      process.env.TASK_CLI_LABEL_PREFIX = "";
+      process.env.AGENT_START_COMMENT = "false";
+
+      const envConfig = new Config();
+      await envConfig.reload();
+      expect(envConfig.TASK_LABELS).toBe(true);
+      expect(envConfig.TASK_RUNNING_LABEL).toBe("");
+      expect(envConfig.TASK_MODEL_LABEL_PREFIX).toBe("model:");
+      expect(envConfig.TASK_CLI_LABEL_PREFIX).toBe("");
+      expect(envConfig.AGENT_START_COMMENT).toBe(false);
+
+      await fs.remove(tmpDir);
+    });
+
     it("should keep defaults when the config file does not exist", async () => {
       process.env.CONFIG_FILE = path.join(os.tmpdir(), "does-not-exist.json");
 
@@ -396,6 +441,53 @@ describe("Config", () => {
       const errors = config.validate();
       expect(errors).toEqual([
         "TASK_ADJUSTMENT_MAX_ROUNDS must be a non-negative integer (current value: '-1')",
+      ]);
+    });
+
+    it("should accept the default label settings", () => {
+      const config = new Config();
+      config.PLANNER_API_KEY = "key";
+
+      expect(config.validate()).toEqual([]);
+    });
+
+    it("should accept disabled label settings", () => {
+      const config = new Config();
+      config.PLANNER_API_KEY = "key";
+      config.TASK_RUNNING_LABEL = "";
+      config.TASK_MODEL_LABEL_PREFIX = "";
+      config.TASK_CLI_LABEL_PREFIX = "";
+
+      expect(config.validate()).toEqual([]);
+    });
+
+    it("should report a label setting containing a comma", () => {
+      const config = new Config();
+      config.PLANNER_API_KEY = "key";
+      config.TASK_RUNNING_LABEL = "agent:running,in-progress";
+
+      expect(config.validate()).toEqual([
+        "TASK_RUNNING_LABEL must not contain a comma (current value: 'agent:running,in-progress')",
+      ]);
+    });
+
+    it("should report a label setting longer than 100 characters", () => {
+      const config = new Config();
+      config.PLANNER_API_KEY = "key";
+      config.TASK_MODEL_LABEL_PREFIX = `model:${"a".repeat(95)}`;
+
+      expect(config.validate()).toEqual([
+        `TASK_MODEL_LABEL_PREFIX must be at most 100 characters (current value: 'model:${"a".repeat(95)}')`,
+      ]);
+    });
+
+    it("should report a label setting with surrounding whitespace", () => {
+      const config = new Config();
+      config.PLANNER_API_KEY = "key";
+      config.TASK_CLI_LABEL_PREFIX = "cli: ";
+
+      expect(config.validate()).toEqual([
+        "TASK_CLI_LABEL_PREFIX must not start or end with whitespace (current value: 'cli: ')",
       ]);
     });
 

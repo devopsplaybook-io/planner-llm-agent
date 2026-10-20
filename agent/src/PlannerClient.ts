@@ -42,6 +42,9 @@ export interface PlannerTask {
   dateUpdated: string;
   comments: PlannerTaskComment[];
   attachments: PlannerTaskAttachment[];
+  // Optional for the same reason as dependencies: consumers also tolerate
+  // the unmapped task shapes (tests, older servers without label support).
+  labels?: string[];
   // Hydrated when the poll requests the dependencies field; optional so the
   // consumers also tolerate the unmapped task shapes (tests, older servers).
   dependencies?: PlannerTaskDependency[];
@@ -70,13 +73,13 @@ type PlannerTaskJson = any;
 /**
  * Sparse fieldsets requested for the poll: every field the pipeline needs
  * (scheduling directives, evaluation prompt, session documents, dependency
- * gating) and only the ones it needs — labels, checklist and dueDate are
- * dropped because the PlannerTask mapping discards them anyway. The full
- * default shape is still safe: the server only omits keys when fields is
- * sent.
+ * gating, agent-managed labels) and only the ones it needs — checklist and
+ * dueDate are dropped because the PlannerTask mapping discards them anyway.
+ * The full default shape is still safe: the server only omits keys when
+ * fields is sent.
  */
 const AGENT_TASK_FIELDS =
-  "id,projectId,title,description,status,priority,assignees,comments,attachments,dependencies,dateCreated,dateUpdated";
+  "id,projectId,title,description,status,priority,assignees,comments,attachments,labels,dependencies,dateCreated,dateUpdated";
 
 export class PlannerClient {
   private config: Config;
@@ -107,16 +110,21 @@ export class PlannerClient {
   // 'fields' sparse fieldsets. The client-side assignee filter below is
   // kept as a safety net: against a server that ignores 'assigneeUserId'
   // (older deploy), a filter-less poll would hand the agent every
-  // human-assigned task in scope.
+  // human-assigned task in scope. 'labels' (optional) adds the server-side
+  // AND label filter used by the running-label reconciliation.
   public async listAssignedTasks(
     user: PlannerUser,
     projectIds?: string[],
+    labels?: string[],
   ): Promise<PlannerTask[]> {
     const span = OTelTracer().startSpan("planner-client.list-assigned-tasks");
     try {
       let path = `/api/tasks?assigneeUserId=${encodeURIComponent(user.id)}&fields=${AGENT_TASK_FIELDS}`;
       if (projectIds && projectIds.length > 0) {
         path += `&projectIds=${encodeURIComponent(projectIds.join(","))}`;
+      }
+      if (labels && labels.length > 0) {
+        path += `&labels=${encodeURIComponent(labels.join(","))}`;
       }
       const body = await this.request(path, "GET", span);
       if (!Array.isArray(body)) {
@@ -184,6 +192,9 @@ export class PlannerClient {
             }),
           )
         : [],
+      labels: Array.isArray(task.labels)
+        ? task.labels.map((label: unknown) => String(label))
+        : [],
       dependencies: Array.isArray(task.dependencies)
         ? task.dependencies.map(
             (dependency: PlannerTaskJson): PlannerTaskDependency => ({
@@ -233,6 +244,26 @@ export class PlannerClient {
     try {
       await this.request(`/api/tasks/${taskId}`, "PUT", span, {
         status: status,
+      });
+    } catch (error) {
+      span.recordException(error as Error);
+      throw error;
+    } finally {
+      span.end();
+    }
+  }
+
+  // Replaces the whole label list of a task: the Planner has no add/remove
+  // endpoint, so callers read the task first and merge. Also bumps the task
+  // dateUpdated and records a "Labels updated" feed entry server-side.
+  public async updateTaskLabels(
+    taskId: string,
+    labels: string[],
+  ): Promise<void> {
+    const span = OTelTracer().startSpan("planner-client.update-task-labels");
+    try {
+      await this.request(`/api/tasks/${taskId}/labels`, "POST", span, {
+        labels: labels,
       });
     } catch (error) {
       span.recordException(error as Error);
