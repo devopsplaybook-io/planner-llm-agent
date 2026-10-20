@@ -53,6 +53,15 @@ const AGENT_NOTES_MARKER =
 // Refresh period of the heartbeat file the Kubernetes probes check.
 const HEARTBEAT_INTERVAL_MS = 30000;
 
+// Maximum length of a Planner label name (task_labels.name VARCHAR(100)).
+const MAX_LABEL_LENGTH = 100;
+
+// Delay before the stale running labels are reconciled at startup. The
+// deployment is a rolling update: the previous pod stops within its 15 s
+// shutdown guard, so a longer delay never clears the label of a task it is
+// still finishing.
+const RUNNING_LABEL_RECONCILE_DELAY_MS = 60000;
+
 // Maximum length of the failure explanation posted on a task.
 const MAX_FAILURE_EXPLANATION_LENGTH = 1000;
 
@@ -85,6 +94,60 @@ export function sanitizeAttachmentFileName(fileName: string): string | null {
   return base;
 }
 
+/**
+ * Normalizes a raw value for a machine label: lowercase kebab-case, dots
+ * kept (model version numbers), runs of separators collapsed and leading or
+ * trailing separators stripped.
+ */
+export function normalizeLabelValue(value: string): string {
+  return value
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9.]+/g, "-")
+    .replace(/-{2,}/g, "-")
+    .replace(/^[-.]+/, "")
+    .replace(/[-.]+$/, "");
+}
+
+/**
+ * Builds a prefixed label from a raw value (e.g. 'model:' + 'Qwen3.8-Flash'
+ * -> 'model:qwen3.8-flash'), truncated to the Planner name limit. Returns
+ * null when the normalized value is empty or the prefix is disabled.
+ */
+export function buildTaskLabel(
+  prefix: string,
+  value: string,
+): string | null {
+  const normalizedPrefix = prefix.trim();
+  const normalized = normalizeLabelValue(value);
+  if (normalizedPrefix.length === 0 || normalized.length === 0) {
+    return null;
+  }
+  return `${normalizedPrefix}${normalized}`.slice(0, MAX_LABEL_LENGTH);
+}
+
+/**
+ * Merges labels into a task label list: existing labels first (order
+ * preserved, duplicates dropped), then the new ones. The Planner has no
+ * add/remove endpoint: every label change replaces the whole list, so the
+ * merge keeps the labels set by humans.
+ */
+export function mergeLabels(
+  current: string[],
+  labelsToAdd: string[],
+): string[] {
+  const merged: string[] = [];
+  const seen = new Set<string>();
+  for (const label of [...current, ...labelsToAdd]) {
+    if (label.length === 0 || seen.has(label)) {
+      continue;
+    }
+    seen.add(label);
+    merged.push(label);
+  }
+  return merged;
+}
+
 export class Agent {
   private config: Config;
   private agentActions: AgentActionsConfig | null;
@@ -96,6 +159,8 @@ export class Agent {
   private running = false;
   private pollingTimer?: NodeJS.Timeout;
   private heartbeatTimer?: NodeJS.Timeout;
+  // Timer of the startup reconciliation of stale running labels.
+  private runningLabelTimer?: NodeJS.Timeout;
   // Tasks currently being processed with their scheduling metadata: they
   // are never picked again by a subsequent poll while their processing is
   // still running. In-memory only: one agent process per agent identity is
@@ -171,6 +236,7 @@ export class Agent {
         logger.error(`Failed to run the polling loop: ${error.message}`),
       );
     this.startHeartbeat();
+    this.scheduleRunningLabelReconciliation();
   }
 
   public stop(): void {
@@ -185,6 +251,10 @@ export class Agent {
     if (this.heartbeatTimer) {
       clearInterval(this.heartbeatTimer);
       this.heartbeatTimer = undefined;
+    }
+    if (this.runningLabelTimer) {
+      clearTimeout(this.runningLabelTimer);
+      this.runningLabelTimer = undefined;
     }
     logger.info(`Agent '${this.config.AGENT_NAME}' stopped`);
   }
@@ -844,15 +914,23 @@ export class Agent {
           : "") ||
         "";
       const resolvedModel = resolveModel(task, defaultModel)?.model ?? "";
+      // The task shows as executing through the agent-managed labels: the
+      // transient running label is removed on every exit path (finally),
+      // while the model/CLI provenance labels accumulate across the task
+      // lifecycle. Best-effort, like the legacy start comment.
+      await this.addTaskRunLabels(task, resolvedModel, selectedAgent);
       // Pipeline actions notify on every run; a comments action only on
       // the first run of the task (stateless test: no agent-authored
       // comment exists yet), so a fast comment back-and-forth does not
-      // flood the task with "started working" lines.
-      if (
-        action.trigger !== "comments" ||
-        !hasAgentComment(task, this.agentUserId)
-      ) {
-        await this.postStartComment(task, resolvedModel);
+      // flood the task with "started working" lines. The comment is a
+      // legacy fallback: the labels above replace it by default.
+      if (this.config.AGENT_START_COMMENT) {
+        if (
+          action.trigger !== "comments" ||
+          !hasAgentComment(task, this.agentUserId)
+        ) {
+          await this.postStartComment(task, resolvedModel);
+        }
       }
       // Show the task as being processed on Planner (optional
       // status_in_progress): best-effort, a failed or skipped transition
@@ -998,6 +1076,7 @@ export class Agent {
         );
       }
     } finally {
+      await this.clearTaskRunningLabel(task);
       this.abortControllers.delete(task.id);
       this.processingTasks.delete(task.id);
     }
@@ -1166,6 +1245,159 @@ export class Agent {
       await prepareCliAgent(cliAgent);
     }
     return cliAgent;
+  }
+
+  // Whether the agent manages Planner task labels (master switch).
+  private taskLabelsEnabled(): boolean {
+    return this.config.TASK_LABELS !== false;
+  }
+
+  private runningLabel(): string {
+    return (this.config.TASK_RUNNING_LABEL ?? "").trim();
+  }
+
+  // Labels recording what worked on the task: the normalized model and,
+  // when a prefix is configured, the CLI agent. They accumulate across runs
+  // and are never removed.
+  private provenanceLabels(model: string, cliAgent: string): string[] {
+    const labels: string[] = [];
+    const modelLabel = buildTaskLabel(
+      this.config.TASK_MODEL_LABEL_PREFIX ?? "",
+      model,
+    );
+    if (modelLabel) {
+      labels.push(modelLabel);
+    }
+    const cliLabel = buildTaskLabel(
+      this.config.TASK_CLI_LABEL_PREFIX ?? "",
+      cliAgent,
+    );
+    if (cliLabel) {
+      labels.push(cliLabel);
+    }
+    return labels;
+  }
+
+  // Marks the task as running and records its provenance in one replace
+  // write (the running label plus the model/CLI labels). Best-effort: a
+  // label failure is logged but never fails the task processing.
+  private async addTaskRunLabels(
+    task: PlannerTask,
+    model: string,
+    cliAgent: string,
+  ): Promise<void> {
+    if (!this.taskLabelsEnabled()) {
+      return;
+    }
+    const labelsToAdd = this.provenanceLabels(model, cliAgent);
+    const runningLabel = this.runningLabel();
+    if (runningLabel.length > 0) {
+      labelsToAdd.unshift(runningLabel);
+    }
+    if (labelsToAdd.length === 0) {
+      return;
+    }
+    await this.updateTaskLabels(
+      task,
+      (current) => mergeLabels(current, labelsToAdd),
+      `add the agent labels (${labelsToAdd.join(", ")})`,
+    );
+  }
+
+  // Removes the transient running label; the provenance labels stay. Called
+  // on every exit path of processTask through its finally.
+  private async clearTaskRunningLabel(task: PlannerTask): Promise<void> {
+    if (!this.taskLabelsEnabled()) {
+      return;
+    }
+    const runningLabel = this.runningLabel();
+    if (runningLabel.length === 0) {
+      return;
+    }
+    await this.updateTaskLabels(
+      task,
+      (current) => current.filter((label) => label !== runningLabel),
+      `remove the running label '${runningLabel}'`,
+    );
+  }
+
+  // Read-merge-write of the task labels: a fresh read keeps the overwrite
+  // window tiny (the Planner replaces the whole list on every write), the
+  // merge preserves the labels set by humans and a no-op change is skipped.
+  // Returns whether a write was performed. Best-effort: failures are
+  // logged, never propagated.
+  private async updateTaskLabels(
+    task: PlannerTask,
+    merge: (current: string[]) => string[],
+    description: string,
+  ): Promise<boolean> {
+    try {
+      const fresh = await this.planner.getTask(task.id);
+      const current = fresh.labels ?? [];
+      const updated = merge(current);
+      if (
+        updated.length === current.length &&
+        updated.every((label, index) => label === current[index])
+      ) {
+        return false;
+      }
+      await this.planner.updateTaskLabels(task.id, updated);
+      return true;
+    } catch (error) {
+      logger.warn(
+        `Failed to ${description} for task '${task.title}' (${task.id}) (continuing): ${(error as Error).message}`,
+      );
+      return false;
+    }
+  }
+
+  // Reconciles the stale running labels left by a previous process (crash
+  // or hard kill): after the startup delay the agent lists its assigned
+  // tasks carrying the running label and clears it, skipping the tasks it
+  // is processing itself. The delay protects the tasks a previous pod may
+  // still be finishing during a rolling update.
+  private scheduleRunningLabelReconciliation(): void {
+    if (!this.taskLabelsEnabled() || this.runningLabel().length === 0) {
+      return;
+    }
+    this.runningLabelTimer = setTimeout(() => {
+      this.runningLabelTimer = undefined;
+      void this.reconcileRunningLabels().catch((error: Error) => {
+        logger.warn(
+          `Failed to reconcile the stale running labels: ${error.message}`,
+        );
+      });
+    }, RUNNING_LABEL_RECONCILE_DELAY_MS);
+    this.runningLabelTimer.unref();
+  }
+
+  private async reconcileRunningLabels(): Promise<void> {
+    const runningLabel = this.runningLabel();
+    const user = await this.planner.getCurrentUser();
+    this.agentUserId = user.id;
+    const tasks = await this.planner.listAssignedTasks(user, undefined, [
+      runningLabel,
+    ]);
+    let cleared = 0;
+    for (const task of tasks) {
+      if (this.processingTasks.has(task.id)) {
+        continue;
+      }
+      if (
+        await this.updateTaskLabels(
+          task,
+          (current) => current.filter((label) => label !== runningLabel),
+          `reconcile the stale running label '${runningLabel}'`,
+        )
+      ) {
+        cleared++;
+      }
+    }
+    if (tasks.length > 0) {
+      logger.info(
+        `Running label reconciliation: cleared '${runningLabel}' on ${cleared} of ${tasks.length} task(s)`,
+      );
+    }
   }
 
   // Notifies the user that the agent started working on the task, with the

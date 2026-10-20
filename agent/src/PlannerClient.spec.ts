@@ -140,11 +140,12 @@ describe("PlannerClient", () => {
           },
         ],
         attachments: [],
+        labels: [],
         dependencies: [],
       },
     ]);
     expect(fetchMock).toHaveBeenCalledWith(
-      "http://planner.test:8080/api/tasks?assigneeUserId=user-1&fields=id,projectId,title,description,status,priority,assignees,comments,attachments,dependencies,dateCreated,dateUpdated",
+      "http://planner.test:8080/api/tasks?assigneeUserId=user-1&fields=id,projectId,title,description,status,priority,assignees,comments,attachments,labels,dependencies,dateCreated,dateUpdated",
       expect.objectContaining({
         method: "GET",
         headers: expect.objectContaining({ "x-api-key": "test-api-key" }),
@@ -162,12 +163,24 @@ describe("PlannerClient", () => {
     ]);
 
     expect(fetchMock).toHaveBeenCalledWith(
-      "http://planner.test:8080/api/tasks?assigneeUserId=user-1&fields=id,projectId,title,description,status,priority,assignees,comments,attachments,dependencies,dateCreated,dateUpdated&projectIds=p1%2Cp2",
+      "http://planner.test:8080/api/tasks?assigneeUserId=user-1&fields=id,projectId,title,description,status,priority,assignees,comments,attachments,labels,dependencies,dateCreated,dateUpdated&projectIds=p1%2Cp2",
       expect.objectContaining({
         method: "GET",
         headers: expect.objectContaining({ "x-api-key": "test-api-key" }),
       }),
     );
+  });
+
+  it("should scope the task fetch to the given label names", async () => {
+    fetchMock.mockResolvedValue(new Response(JSON.stringify([]), { status: 200 }));
+
+    const client = new PlannerClient(config);
+    await client.listAssignedTasks({ id: "user-1", name: "Didier" }, undefined, [
+      "agent:running",
+    ]);
+
+    const url = fetchMock.mock.calls[0]![0] as string;
+    expect(url).toContain("labels=agent%3Arunning");
   });
 
   it("should request every field the agent pipeline relies on", async () => {
@@ -188,6 +201,7 @@ describe("PlannerClient", () => {
       "assignees",
       "comments",
       "attachments",
+      "labels",
       "dependencies",
       "dateCreated",
       "dateUpdated",
@@ -235,6 +249,7 @@ describe("PlannerClient", () => {
         dateUpdated: "2026-09-10T12:00:00.000Z",
         comments: [],
         attachments: [],
+        labels: [],
         dependencies: [],
       },
     ]);
@@ -327,6 +342,7 @@ describe("PlannerClient", () => {
             dateCreated: "2026-09-02T00:00:00.000Z",
           },
         ],
+        labels: [],
         dependencies: [],
       },
     ]);
@@ -360,6 +376,7 @@ describe("PlannerClient", () => {
               dateCreated: "2026-09-02T00:00:00.000Z",
             },
           ],
+          labels: ["urgent", "model:qwen3.8-flash"],
           dependencies: [
             { taskId: "task-2", title: "First step", status: "Done" },
           ],
@@ -396,6 +413,7 @@ describe("PlannerClient", () => {
           dateCreated: "2026-09-02T00:00:00.000Z",
         },
       ],
+      labels: ["urgent", "model:qwen3.8-flash"],
       dependencies: [
         { taskId: "task-2", title: "First step", status: "Done" },
       ],
@@ -430,6 +448,7 @@ describe("PlannerClient", () => {
       dateUpdated: "",
       comments: [],
       attachments: [],
+      labels: [],
       dependencies: [],
     });
   });
@@ -525,6 +544,33 @@ describe("PlannerClient", () => {
           "Content-Type": "application/json",
         }),
         body: JSON.stringify({ status: "Done" }),
+      }),
+    );
+  });
+
+  it("should replace the labels of a task", async () => {
+    fetchMock.mockResolvedValue(
+      new Response(JSON.stringify({}), { status: 201 }),
+    );
+
+    const client = new PlannerClient(config);
+    await client.updateTaskLabels("task-1", [
+      "urgent",
+      "agent:running",
+      "model:deepseek-flash",
+    ]);
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://planner.test:8080/api/tasks/task-1/labels",
+      expect.objectContaining({
+        method: "POST",
+        headers: expect.objectContaining({
+          "x-api-key": "test-api-key",
+          "Content-Type": "application/json",
+        }),
+        body: JSON.stringify({
+          labels: ["urgent", "agent:running", "model:deepseek-flash"],
+        }),
       }),
     );
   });

@@ -35,6 +35,15 @@ export class Config {
   // Periodic "still working" comment on tasks running longer than this
   // many seconds; 0 disables the progress comments.
   public TASK_PROGRESS_COMMENT_INTERVAL: number;
+  // Agent-managed task labels: a transient running label and the model/CLI
+  // provenance labels accumulated across runs (see README).
+  public TASK_LABELS: boolean;
+  public TASK_RUNNING_LABEL: string;
+  public TASK_MODEL_LABEL_PREFIX: string;
+  public TASK_CLI_LABEL_PREFIX: string;
+  // Legacy one-line "started working" comment, off by default: the running
+  // label replaces it; enable the fallback for deployments relying on it.
+  public AGENT_START_COMMENT: boolean;
   public AGENT_UTILITY_MODEL: string;
   public AGENT_EVALUATION_TIMEOUT: number;
   public AGENT_NOTE_PROJECT: string;
@@ -114,6 +123,13 @@ export class Config {
     this.TASK_ADJUSTMENT_MAX_ROUNDS = 2;
     // Progress heartbeats are opt-in: 0 posts no periodic comment.
     this.TASK_PROGRESS_COMMENT_INTERVAL = 0;
+    this.TASK_LABELS = true;
+    this.TASK_RUNNING_LABEL = "agent:running";
+    this.TASK_MODEL_LABEL_PREFIX = "model:";
+    // The CLI provenance label is opt-in: with a single CLI configured it
+    // would add a constant label to every task (e.g. 'agent:qoder').
+    this.TASK_CLI_LABEL_PREFIX = "";
+    this.AGENT_START_COMMENT = false;
     this.AGENT_UTILITY_MODEL = "";
     // Bound of one scheduling round's utility-model evaluations (seconds).
     this.AGENT_EVALUATION_TIMEOUT = 30;
@@ -204,6 +220,26 @@ export class Config {
     if (config.TASK_PROGRESS_COMMENT_INTERVAL !== undefined) {
       this.TASK_PROGRESS_COMMENT_INTERVAL =
         config.TASK_PROGRESS_COMMENT_INTERVAL as number;
+    }
+    if (config.TASK_LABELS !== undefined) {
+      this.TASK_LABELS = config.TASK_LABELS === true;
+    }
+    // The empty value disables a label: it is a valid configured value.
+    if (config.TASK_RUNNING_LABEL !== undefined) {
+      this.TASK_RUNNING_LABEL = (config.TASK_RUNNING_LABEL ?? "") as string;
+    }
+    if (config.TASK_MODEL_LABEL_PREFIX !== undefined) {
+      this.TASK_MODEL_LABEL_PREFIX = (
+        config.TASK_MODEL_LABEL_PREFIX ?? ""
+      ) as string;
+    }
+    if (config.TASK_CLI_LABEL_PREFIX !== undefined) {
+      this.TASK_CLI_LABEL_PREFIX = (
+        config.TASK_CLI_LABEL_PREFIX ?? ""
+      ) as string;
+    }
+    if (config.AGENT_START_COMMENT !== undefined) {
+      this.AGENT_START_COMMENT = config.AGENT_START_COMMENT === true;
     }
     if (config.AGENT_UTILITY_MODEL !== undefined) {
       this.AGENT_UTILITY_MODEL = (config.AGENT_UTILITY_MODEL ?? "") as string;
@@ -356,6 +392,27 @@ export class Config {
     if (process.env.TASK_PROGRESS_COMMENT_INTERVAL) {
       this.TASK_PROGRESS_COMMENT_INTERVAL = parseInt(
         process.env.TASK_PROGRESS_COMMENT_INTERVAL,
+      );
+    }
+    if (process.env.TASK_LABELS !== undefined) {
+      this.TASK_LABELS = parseBooleanFlag(
+        process.env.TASK_LABELS,
+        this.TASK_LABELS,
+      );
+    }
+    if (process.env.TASK_RUNNING_LABEL !== undefined) {
+      this.TASK_RUNNING_LABEL = process.env.TASK_RUNNING_LABEL;
+    }
+    if (process.env.TASK_MODEL_LABEL_PREFIX !== undefined) {
+      this.TASK_MODEL_LABEL_PREFIX = process.env.TASK_MODEL_LABEL_PREFIX;
+    }
+    if (process.env.TASK_CLI_LABEL_PREFIX !== undefined) {
+      this.TASK_CLI_LABEL_PREFIX = process.env.TASK_CLI_LABEL_PREFIX;
+    }
+    if (process.env.AGENT_START_COMMENT !== undefined) {
+      this.AGENT_START_COMMENT = parseBooleanFlag(
+        process.env.AGENT_START_COMMENT,
+        this.AGENT_START_COMMENT,
       );
     }
     if (process.env.AGENT_UTILITY_MODEL !== undefined) {
@@ -546,6 +603,33 @@ export class Config {
       errors.push(
         `TASK_PROGRESS_COMMENT_INTERVAL must be a non-negative integer (current value: '${this.TASK_PROGRESS_COMMENT_INTERVAL}')`,
       );
+    }
+
+    // Agent-managed label names: the Planner stores names up to 100
+    // characters and the labels filter uses the comma as separator. An
+    // empty value disables the label/prefix, so only set values are checked.
+    const labelSettings: [string, string][] = [
+      ["TASK_RUNNING_LABEL", this.TASK_RUNNING_LABEL],
+      ["TASK_MODEL_LABEL_PREFIX", this.TASK_MODEL_LABEL_PREFIX],
+      ["TASK_CLI_LABEL_PREFIX", this.TASK_CLI_LABEL_PREFIX],
+    ];
+    for (const [name, value] of labelSettings) {
+      if (value.length === 0) {
+        continue;
+      }
+      if (value.includes(",")) {
+        errors.push(
+          `${name} must not contain a comma (current value: '${value}')`,
+        );
+      } else if (value.length > 100) {
+        errors.push(
+          `${name} must be at most 100 characters (current value: '${value}')`,
+        );
+      } else if (value !== value.trim()) {
+        errors.push(
+          `${name} must not start or end with whitespace (current value: '${value}')`,
+        );
+      }
     }
 
     // The organization tokens are optional; when set, every entry must be a

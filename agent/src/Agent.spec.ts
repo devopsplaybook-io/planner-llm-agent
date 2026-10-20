@@ -3,9 +3,12 @@ import * as path from "path";
 import * as fse from "fs-extra";
 import {
   Agent,
+  buildTaskLabel,
   commentsPickupPending,
   hasAgentComment,
   lastCommentOf,
+  mergeLabels,
+  normalizeLabelValue,
 } from "./Agent";
 import { AgentActionsConfig } from "./AgentActions";
 import { Config } from "./Config";
@@ -59,6 +62,7 @@ const mockPlanner = {
   listProjects: jest.fn(),
   addTaskComment: jest.fn(),
   updateTaskStatus: jest.fn(),
+  updateTaskLabels: jest.fn(),
   downloadTaskAttachment: jest.fn(),
 };
 const mockQoder = {
@@ -159,6 +163,27 @@ describe("Agent", () => {
     );
   };
 
+  // Stateful label store for the label tests: getTask reads the current
+  // labels, updateTaskLabels records every replacement and persists it.
+  const mockTaskLabels = (task: Record<string, unknown>): string[][] => {
+    const writes: string[][] = [];
+    if (!Array.isArray(task.labels)) {
+      task.labels = [];
+    }
+    mockPlanner.listAssignedTasks.mockImplementation(async () => [{ ...task }]);
+    mockPlanner.getTask.mockImplementation(async () => ({
+      ...task,
+      labels: [...(task.labels as string[])],
+    }));
+    mockPlanner.updateTaskLabels.mockImplementation(
+      async (_taskId: string, labels: string[]) => {
+        writes.push([...labels]);
+        task.labels = [...labels];
+      },
+    );
+    return writes;
+  };
+
   beforeEach(() => {
     logSpy = jest.spyOn(console, "log").mockImplementation(jest.fn());
     delete process.env.AGENT_NAME;
@@ -184,6 +209,7 @@ describe("Agent", () => {
       mockPlanner.listProjects,
       mockPlanner.addTaskComment,
       mockPlanner.updateTaskStatus,
+      mockPlanner.updateTaskLabels,
       mockPlanner.downloadTaskAttachment,
       mockQoder.checkAuthentication,
       mockQoder.prepare,
@@ -202,6 +228,7 @@ describe("Agent", () => {
     });
     mockPlanner.listAssignedTasks.mockResolvedValue([]);
     mockPlanner.addTaskComment.mockResolvedValue(undefined);
+    mockPlanner.updateTaskLabels.mockResolvedValue(undefined);
     // Default getTask: mirrors the task as the last poll saw it, so the
     // new-comment check of every processed task sees no new comments.
     // Overridden per test when a new-comment scenario is exercised.
@@ -1841,6 +1868,7 @@ describe("Agent", () => {
 
   it("should post a start notification comment before executing the task", async () => {
     config.AGENT_NAME = "test-agent";
+    config.AGENT_START_COMMENT = true;
     mockPlanner.listAssignedTasks.mockResolvedValue([
       {
         id: "task-1",
@@ -1879,6 +1907,7 @@ describe("Agent", () => {
   });
 
   it("should not fail the task when the start notification fails", async () => {
+    config.AGENT_START_COMMENT = true;
     mockPlanner.listAssignedTasks.mockResolvedValue([
       {
         id: "task-1",
@@ -3160,7 +3189,9 @@ describe("Agent", () => {
 
   it("should finalize the task without an adjustment pass when no new comments arrived", async () => {
     config.TASK_ADJUSTMENT_MAX_ROUNDS = 2;
-    mockPlanner.listAssignedTasks.mockResolvedValue([
+    // The status update is stateful, so the completed task is not picked
+    // again by a later poll while the assertions run.
+    mockPlannerTasks([
       {
         id: "task-1",
         title: "Implement feature",
@@ -3174,10 +3205,13 @@ describe("Agent", () => {
 
     const agent = createAgent();
     agent.start();
-    await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
+    // The add of the run labels, the new-comment check and the removal of
+    // the running label each re-read the task: wait for the removal too, so
+    // the count is asserted after the processing fully completed.
+    await waitFor(() => mockPlanner.getTask.mock.calls.length >= 3);
 
     expect(mockQoder.performTask).toHaveBeenCalledTimes(1);
-    expect(mockPlanner.getTask).toHaveBeenCalledTimes(1);
+    expect(mockPlanner.getTask).toHaveBeenCalledTimes(3);
     expect(mockPlanner.addTaskComment).toHaveBeenCalledWith(
       "task-1",
       "Feature implemented",
@@ -3365,7 +3399,9 @@ describe("Agent", () => {
 
   it("should bound the adjustment rounds by TASK_ADJUSTMENT_MAX_ROUNDS", async () => {
     config.TASK_ADJUSTMENT_MAX_ROUNDS = 2;
-    mockPlanner.listAssignedTasks.mockResolvedValue([
+    // The status update is stateful, so the completed task is not picked
+    // again by a later poll while the assertions run.
+    mockPlannerTasks([
       {
         id: "task-1",
         title: "Implement feature",
@@ -3406,10 +3442,13 @@ describe("Agent", () => {
 
     const agent = createAgent();
     agent.start();
-    await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
+    // Two adjustment checks plus the bounded final check, with the run-label
+    // add and removal reads around them: wait for the removal too, so the
+    // count is asserted after the processing fully completed.
+    await waitFor(() => mockPlanner.getTask.mock.calls.length >= 5);
 
     expect(mockQoder.performTask).toHaveBeenCalledTimes(3);
-    expect(mockPlanner.getTask).toHaveBeenCalledTimes(3);
+    expect(mockPlanner.getTask).toHaveBeenCalledTimes(5);
     expect(mockPlanner.addTaskComment).toHaveBeenCalledWith(
       "task-1",
       "Summary after call 3",
@@ -3424,7 +3463,9 @@ describe("Agent", () => {
 
   it("should not re-run the CLI when TASK_ADJUSTMENT_MAX_ROUNDS is 0", async () => {
     config.TASK_ADJUSTMENT_MAX_ROUNDS = 0;
-    mockPlanner.listAssignedTasks.mockResolvedValue([
+    // The status update is stateful, so the completed task is not picked
+    // again by a later poll while the assertions run.
+    mockPlannerTasks([
       {
         id: "task-1",
         title: "Implement feature",
@@ -3458,10 +3499,13 @@ describe("Agent", () => {
 
     const agent = createAgent();
     agent.start();
-    await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
+    // The run-label add, the detection-only new-comment check and the
+    // running-label removal each re-read the task: wait for the removal
+    // too, so the count is asserted after the processing fully completed.
+    await waitFor(() => mockPlanner.getTask.mock.calls.length >= 3);
 
     expect(mockQoder.performTask).toHaveBeenCalledTimes(1);
-    expect(mockPlanner.getTask).toHaveBeenCalledTimes(1);
+    expect(mockPlanner.getTask).toHaveBeenCalledTimes(3);
     expect(mockPlanner.addTaskComment).toHaveBeenCalledWith(
       "task-1",
       "Feature implemented",
@@ -3766,6 +3810,7 @@ describe("Agent", () => {
 
   it("should mention the resolved model in the start notification", async () => {
     config.AGENT_NAME = "test-agent";
+    config.AGENT_START_COMMENT = true;
     mockPlanner.listAssignedTasks.mockResolvedValue([
       {
         id: "task-1",
@@ -3916,6 +3961,281 @@ describe("Agent", () => {
     // finalization record (the CLI work is never re-run either way).
     expect(mockPlanner.updateTaskStatus).not.toHaveBeenCalled();
     expect(store.has("task-1")).toBe(false);
+    agent.stop();
+  });
+
+  it("should mark the task running and record the model, then clear the running label", async () => {
+    const task = {
+      id: "task-1",
+      title: "Implement feature",
+      status: "To Do",
+      description: "Add a feature",
+      comments: [],
+      attachments: [],
+      labels: ["urgent"],
+    };
+    const writes = mockTaskLabels(task);
+    mockQoder.performTask.mockResolvedValue("Feature implemented");
+    const actions: AgentActionsConfig = {
+      defaultModel: "Qwen3.8-Flash",
+      defaultTimeout: null,
+      actions: WILDCARD_ACTIONS.actions,
+    };
+
+    const agent = createAgent(actions);
+    agent.start();
+    await waitFor(() => writes.length === 2);
+
+    // One replacement before the run (human label preserved, model
+    // normalized) and one when it ends (the transient label only).
+    expect(writes).toEqual([
+      ["urgent", "agent:running", "model:qwen3.8-flash"],
+      ["urgent", "model:qwen3.8-flash"],
+    ]);
+    // The legacy start comment is off by default: only the summary is posted.
+    expect(mockPlanner.addTaskComment).toHaveBeenCalledTimes(1);
+    expect(mockPlanner.addTaskComment).toHaveBeenCalledWith(
+      "task-1",
+      "Feature implemented",
+    );
+    expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith("task-1", "Done");
+    agent.stop();
+  });
+
+  it("should record the CLI agent label when a prefix is configured", async () => {
+    config.TASK_CLI_LABEL_PREFIX = "agent:";
+    const task = {
+      id: "task-1",
+      title: "Implement feature",
+      status: "To Do",
+      description: "Add a feature",
+      comments: [],
+      attachments: [],
+    };
+    const writes = mockTaskLabels(task);
+    mockQoder.performTask.mockResolvedValue("Feature implemented");
+
+    const agent = createAgent();
+    agent.start();
+    await waitFor(() => writes.length === 2);
+
+    expect(writes[0]).toEqual(["agent:running", "agent:qoder"]);
+    expect(writes[1]).toEqual(["agent:qoder"]);
+    agent.stop();
+  });
+
+  it("should skip a no-op label write when the running label is already set", async () => {
+    const task = {
+      id: "task-1",
+      title: "Implement feature",
+      status: "To Do",
+      description: "Add a feature",
+      comments: [],
+      attachments: [],
+      labels: ["agent:running", "model:qwen3.8-flash"],
+    };
+    const writes = mockTaskLabels(task);
+    mockQoder.performTask.mockResolvedValue("Feature implemented");
+    const actions: AgentActionsConfig = {
+      defaultModel: "Qwen3.8-Flash",
+      defaultTimeout: null,
+      actions: WILDCARD_ACTIONS.actions,
+    };
+
+    const agent = createAgent(actions);
+    agent.start();
+    await waitFor(() => writes.length === 1);
+
+    // The add matches the current labels (no write); only the final removal
+    // is written.
+    expect(writes).toEqual([["model:qwen3.8-flash"]]);
+    agent.stop();
+  });
+
+  it("should clear the running label when the task fails", async () => {
+    const task = {
+      id: "task-1",
+      title: "Implement feature",
+      status: "To Do",
+      description: "Add a feature",
+      comments: [],
+      attachments: [],
+    };
+    const writes = mockTaskLabels(task);
+    mockQoder.performTask.mockRejectedValue(new Error("CLI exploded"));
+
+    const agent = createAgent();
+    agent.start();
+    await waitFor(() => writes.length === 2);
+
+    expect(writes[0]).toContain("agent:running");
+    expect(writes[1]).not.toContain("agent:running");
+    expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith("task-1", "Done");
+    agent.stop();
+  });
+
+  it("should clear the running label when the task is aborted", async () => {
+    config.TASK_POLLING_INTERVAL = 1;
+    const tasks = [
+      {
+        id: "task-1",
+        title: "Implement feature",
+        status: "To Do",
+        description: "Add a feature",
+        comments: [] as unknown[],
+        attachments: [] as unknown[],
+        labels: [] as string[],
+      },
+    ];
+    mockPlanner.listAssignedTasks.mockImplementation(async () =>
+      tasks.map((task) => ({ ...task, labels: [...task.labels] })),
+    );
+    mockPlanner.getTask.mockImplementation(async () => ({
+      ...tasks[0],
+      labels: [...tasks[0].labels],
+    }));
+    const writes: string[][] = [];
+    mockPlanner.updateTaskLabels.mockImplementation(
+      async (_taskId: string, labels: string[]) => {
+        writes.push([...labels]);
+        tasks[0].labels = [...labels];
+      },
+    );
+    mockQoder.performTask.mockImplementation(
+      (_task: unknown, _notesFile: string, options?: TaskOptions) =>
+        new Promise<string>((_resolve, reject) => {
+          options?.abortSignal?.addEventListener(
+            "abort",
+            () => reject(new CliAbortedError("Qoder task execution aborted")),
+            { once: true },
+          );
+        }),
+    );
+    const actions: AgentActionsConfig = {
+      defaultStatusAbort: "Aborted",
+      defaultModel: "",
+      defaultTimeout: null,
+      actions: WILDCARD_ACTIONS.actions,
+    };
+
+    const agent = createAgent(actions);
+    agent.start();
+    await waitFor(() => mockQoder.performTask.mock.calls.length === 1);
+    tasks[0].status = "Aborted";
+    await waitFor(() => writes.length === 2, 10000);
+
+    expect(writes[0]).toContain("agent:running");
+    expect(writes[1]).not.toContain("agent:running");
+    agent.stop();
+  });
+
+  it("should not fail the task when the label writes fail", async () => {
+    mockPlanner.listAssignedTasks.mockResolvedValue([
+      {
+        id: "task-1",
+        title: "Implement feature",
+        status: "To Do",
+        description: "Add a feature",
+        comments: [],
+        attachments: [],
+      },
+    ]);
+    mockPlanner.getTask.mockRejectedValue(new Error("Planner is down"));
+    mockQoder.performTask.mockResolvedValue("Feature implemented");
+
+    const agent = createAgent();
+    agent.start();
+    await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
+
+    expect(mockQoder.performTask).toHaveBeenCalledTimes(1);
+    expect(mockPlanner.addTaskComment).toHaveBeenCalledWith(
+      "task-1",
+      "Feature implemented",
+    );
+    expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith("task-1", "Done");
+    expect(console.log).toHaveBeenCalledWith(
+      expect.stringContaining(
+        "Failed to add the agent labels (agent:running) for task 'Implement feature' (task-1)",
+      ),
+    );
+    agent.stop();
+  });
+
+  it("should not write labels when TASK_LABELS is false", async () => {
+    config.TASK_LABELS = false;
+    mockPlanner.listAssignedTasks.mockResolvedValue([
+      {
+        id: "task-1",
+        title: "Implement feature",
+        status: "To Do",
+        description: "Add a feature",
+        comments: [],
+        attachments: [],
+        labels: ["urgent"],
+      },
+    ]);
+    mockQoder.performTask.mockResolvedValue("Feature implemented");
+
+    const agent = createAgent();
+    agent.start();
+    await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
+
+    expect(mockPlanner.updateTaskLabels).not.toHaveBeenCalled();
+    agent.stop();
+  });
+
+  it("should reconcile the stale running labels after the startup delay", async () => {
+    jest.useFakeTimers();
+    const tasks = [
+      {
+        id: "task-stale",
+        title: "Stale task",
+        status: "Done",
+        description: "",
+        comments: [],
+        attachments: [],
+        labels: ["agent:running", "model:qwen3.8-flash"],
+      },
+    ];
+    mockPlanner.listAssignedTasks.mockImplementation(
+      async (_user, _projectIds, labels?: string[]) =>
+        labels ? tasks.map((task) => ({ ...task })) : [],
+    );
+    mockPlanner.getTask.mockImplementation(async (taskId: string) => ({
+      ...tasks.find((task) => task.id === taskId),
+      labels: [...tasks[0].labels],
+    }));
+
+    const agent = createAgent();
+    agent.start();
+    await jest.advanceTimersByTimeAsync(59999);
+    expect(mockPlanner.updateTaskLabels).not.toHaveBeenCalled();
+
+    await jest.advanceTimersByTimeAsync(1);
+    expect(mockPlanner.listAssignedTasks).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "user-1" }),
+      undefined,
+      ["agent:running"],
+    );
+    expect(mockPlanner.updateTaskLabels).toHaveBeenCalledWith("task-stale", [
+      "model:qwen3.8-flash",
+    ]);
+    agent.stop();
+  });
+
+  it("should not reconcile the running labels when labels are disabled", async () => {
+    jest.useFakeTimers();
+    config.TASK_LABELS = false;
+
+    const agent = createAgent();
+    agent.start();
+    await jest.advanceTimersByTimeAsync(60000);
+
+    expect(mockPlanner.listAssignedTasks).not.toHaveBeenCalledWith(
+      expect.anything(),
+      undefined,
+      ["agent:running"],
+    );
     agent.stop();
   });
 
@@ -4260,6 +4580,7 @@ describe("Agent", () => {
 
     it("should post the start comment on the first run of a comment-triggered task only", async () => {
       config.TASK_POLLING_INTERVAL = 1;
+      config.AGENT_START_COMMENT = true;
       const task = {
         id: "task-1",
         title: "Discuss the plan",
@@ -4442,6 +4763,32 @@ describe("Agent", () => {
           ),
         ).toBe(true);
         expect(hasAgentComment(buildTask([]), null)).toBe(false);
+      });
+    });
+
+    describe("label helpers", () => {
+      it("normalizeLabelValue should produce lowercase kebab-case values", () => {
+        expect(normalizeLabelValue("DeepSeek-Flash")).toBe("deepseek-flash");
+        expect(normalizeLabelValue("Qwen3.8 Flash")).toBe("qwen3.8-flash");
+        expect(normalizeLabelValue("  GPT 6 Luna ")).toBe("gpt-6-luna");
+        expect(normalizeLabelValue("--auto--")).toBe("auto");
+        expect(normalizeLabelValue("")).toBe("");
+      });
+
+      it("buildTaskLabel should apply the prefix, truncate and skip empty values", () => {
+        expect(buildTaskLabel("model:", "Qwen3.8-Flash")).toBe(
+          "model:qwen3.8-flash",
+        );
+        expect(buildTaskLabel("", "qoder")).toBeNull();
+        expect(buildTaskLabel("agent:", "")).toBeNull();
+        expect(buildTaskLabel("x".repeat(100), "model")).toHaveLength(100);
+      });
+
+      it("mergeLabels should preserve the existing labels, dedupe and append", () => {
+        expect(
+          mergeLabels(["urgent", "urgent"], ["agent:running", "urgent"]),
+        ).toEqual(["urgent", "agent:running"]);
+        expect(mergeLabels([], [])).toEqual([]);
       });
     });
   });
