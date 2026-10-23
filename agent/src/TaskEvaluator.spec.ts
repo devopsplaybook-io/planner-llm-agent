@@ -282,6 +282,23 @@ describe("TaskEvaluator", () => {
       );
     });
 
+    it("falls back to the default bound when the configured timeout overflows the timer", () => {
+      const mockCli = buildMockCli();
+      const config = new Config();
+      config.AGENT_UTILITY_MODEL = "qwen3-flash";
+      config.AGENT_EVALUATION_TIMEOUT = 2147484;
+      const evaluator = new TaskEvaluator(config, mockCli);
+      expect(
+        (evaluator as unknown as { timeoutMs: number }).timeoutMs,
+      ).toBe(30000);
+
+      config.AGENT_EVALUATION_TIMEOUT = 2147483;
+      const maxEvaluator = new TaskEvaluator(config, mockCli);
+      expect(
+        (maxEvaluator as unknown as { timeoutMs: number }).timeoutMs,
+      ).toBe(2147483000);
+    });
+
     it("bounds the concurrent utility-model calls", async () => {
       const mockCli = buildMockCli();
       let concurrent = 0;

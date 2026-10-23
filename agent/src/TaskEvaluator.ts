@@ -1,4 +1,4 @@
-import { Config } from "./Config";
+import { Config, MAX_DELAY_SECONDS } from "./Config";
 import { OTelLogger } from "./OTelContext";
 import type { PlannerTask } from "./PlannerClient";
 import type { CliAgentClient } from "./clients/CliAgent";
@@ -106,11 +106,14 @@ export class TaskEvaluator {
   }
 
   // The configured evaluation bound in milliseconds; a hot-reloaded
-  // invalid value falls back to the default instead of arming an
-  // immediate (NaN) or unbounded timer.
+  // invalid value (non-finite, non-positive or above the timer maximum,
+  // which Node would clamp to about 1 ms) falls back to the default
+  // instead of arming an immediate or overflowing timer.
   private configuredTimeoutMs(): number {
     const seconds = this.config.AGENT_EVALUATION_TIMEOUT;
-    return (Number.isFinite(seconds) && seconds > 0
+    return (Number.isInteger(seconds) &&
+      seconds > 0 &&
+      seconds <= MAX_DELAY_SECONDS
       ? seconds
       : DEFAULT_EVALUATION_TIMEOUT_SECONDS) * 1000;
   }

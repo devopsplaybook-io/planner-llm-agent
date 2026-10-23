@@ -1,7 +1,14 @@
-import { PlannerClient } from "./PlannerClient";
+import { AttachmentTooLargeError, PlannerClient } from "./PlannerClient";
 import { Config } from "./Config";
 
 jest.mock("./OTelContext", () => ({
+  OTelLogger: jest.fn(() => ({
+    createModuleLogger: jest.fn(() => ({
+      info: jest.fn(),
+      warn: jest.fn(),
+      error: jest.fn(),
+    })),
+  })),
   OTelTracer: jest.fn(() => ({
     startSpan: jest.fn(() => ({
       end: jest.fn(),
@@ -515,6 +522,88 @@ describe("PlannerClient", () => {
     ).rejects.toThrow(
       "Planner request to '/api/tasks/task-1/attachments/attachment-1' failed with status 404",
     );
+  });
+
+  it("should reject an attachment declared above the size cap without reading the body", async () => {
+    config.TASK_ATTACHMENT_MAX_BYTES = 10;
+    const pull = jest.fn();
+    const body = new ReadableStream({
+      pull(controller) {
+        pull();
+        controller.enqueue(new Uint8Array([1, 2, 3]));
+        controller.close();
+      },
+    });
+    fetchMock.mockResolvedValue(
+      new Response(body, {
+        status: 200,
+        headers: { "content-length": "100" },
+      }),
+    );
+
+    const client = new PlannerClient(config);
+    await expect(
+      client.downloadTaskAttachment("task-1", "attachment-1"),
+    ).rejects.toMatchObject({ limit: 10, size: 100 });
+    // The declared size is enough to reject: the body is not consumed (a
+    // ReadableStream may pull once eagerly into its internal queue).
+    expect(pull.mock.calls.length).toBeLessThanOrEqual(1);
+  });
+
+  it("should abort a chunked attachment body above the size cap", async () => {
+    config.TASK_ATTACHMENT_MAX_BYTES = 10;
+    const cancel = jest.fn();
+    let chunk = 0;
+    const body = new ReadableStream({
+      pull(controller) {
+        chunk += 1;
+        if (chunk > 5) {
+          controller.close();
+          return;
+        }
+        controller.enqueue(new Uint8Array([1, 2, 3, 4, 5, 6]));
+      },
+      cancel() {
+        cancel();
+      },
+    });
+    fetchMock.mockResolvedValue(new Response(body, { status: 200 }));
+
+    const client = new PlannerClient(config);
+    await expect(
+      client.downloadTaskAttachment("task-1", "attachment-1"),
+    ).rejects.toBeInstanceOf(AttachmentTooLargeError);
+    // The reader stopped pulling after the cap was crossed.
+    expect(chunk).toBeLessThan(5);
+    expect(cancel).toHaveBeenCalledTimes(1);
+  });
+
+  it("should enforce the size cap when the response has no content-length", async () => {
+    config.TASK_ATTACHMENT_MAX_BYTES = 10;
+    const body = new ReadableStream({
+      start(controller) {
+        controller.enqueue(new Uint8Array(6));
+        controller.enqueue(new Uint8Array(6));
+        controller.close();
+      },
+    });
+    fetchMock.mockResolvedValue(new Response(body, { status: 200 }));
+
+    const client = new PlannerClient(config);
+    await expect(
+      client.downloadTaskAttachment("task-1", "attachment-1"),
+    ).rejects.toBeInstanceOf(AttachmentTooLargeError);
+  });
+
+  it("should accept an oversized attachment when the cap is disabled", async () => {
+    // 0 disables the cap: a body above the 50 MiB default is accepted.
+    config.TASK_ATTACHMENT_MAX_BYTES = 0;
+    const payload = Buffer.alloc(50 * 1024 * 1024 + 1, 7);
+    fetchMock.mockResolvedValue(new Response(payload, { status: 200 }));
+
+    const client = new PlannerClient(config);
+    const data = await client.downloadTaskAttachment("task-1", "attachment-1");
+    expect(data.length).toBe(payload.length);
   });
 
   it("should add a comment to a task", async () => {

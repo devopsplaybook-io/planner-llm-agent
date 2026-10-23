@@ -5,7 +5,8 @@ import {
   AgentActionsConfig,
   matchProjectPattern,
 } from "./AgentActions";
-import { Config } from "./Config";
+import { Config, MAX_DELAY_SECONDS } from "./Config";
+import { writeJsonAtomic } from "./AtomicFile";
 import type { AgentSchedulingSnapshot } from "./AgentNote";
 import { FinalizationStore } from "./FinalizationStore";
 import { createCliAgent } from "./clients/CliAgentRegistry";
@@ -21,6 +22,7 @@ import {
 } from "./CliUtils";
 import { OTelLogger, OTelMeter } from "./OTelContext";
 import {
+  AttachmentTooLargeError,
   PlannerClient,
   PlannerProject,
   PlannerRequestError,
@@ -66,6 +68,15 @@ const RUNNING_LABEL_RECONCILE_DELAY_MS = 60000;
 // Maximum length of the failure explanation posted on a task.
 const MAX_FAILURE_EXPLANATION_LENGTH = 1000;
 
+// Manifest of the attachments already downloaded for a task, kept next to
+// the files so a repeated brief reuses them instead of downloading again.
+const ATTACHMENT_MANIFEST_FILE = "attachments.json";
+const ATTACHMENT_MANIFEST_VERSION = 1;
+
+// Bound of the invalid-id warnings kept in memory (a hostile Planner could
+// otherwise grow the set without limit).
+const MAX_WARNED_INVALID_TASK_IDS = 100;
+
 // Maximum lengths of the partial work salvaged into a failure comment (the
 // partial task summary written by the CLI and the tail of the CLI output).
 const MAX_SALVAGED_SUMMARY_LENGTH = 2000;
@@ -99,6 +110,41 @@ export function sanitizeAttachmentFileName(fileName: string): string | null {
     return null;
   }
   return base;
+}
+
+type AttachmentOutcomeStatus =
+  | "downloaded"
+  | "reused"
+  | "skipped"
+  | "unsafe"
+  | "failed";
+
+interface AttachmentOutcome {
+  status: AttachmentOutcomeStatus;
+  filePath?: string;
+}
+
+interface AttachmentManifestEntry {
+  id: string;
+  dateCreated: string;
+  fileName: string;
+}
+
+interface AttachmentManifest {
+  version: number;
+  attachments: AttachmentManifestEntry[];
+}
+
+// Canonical Planner task id (hyphenated 8-4-4-4-12 UUID, case-insensitive):
+// ids are used in filesystem paths, so anything else (path traversal or an
+// absolute path) is refused before a path is built.
+export function isCanonicalTaskId(value: string): boolean {
+  return (
+    typeof value === "string" &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+      value,
+    )
+  );
 }
 
 /**
@@ -200,6 +246,9 @@ export class Agent {
   // Invalid hot-reloaded values are reported once per value.
   private warnedBudgetValue: string | null = null;
   private warnedConflictModeValue: string | null = null;
+  // Invalid task ids skipped at the Planner boundary, bounded so a hostile
+  // Planner cannot grow the set without limit.
+  private warnedInvalidTaskIds = new Set<string>();
   // Planner user id of the agent itself, cached at every poll: the
   // new-comment check excludes the comments authored by this user (they are
   // the agent's own start/summary comments). One agent process per agent
@@ -356,12 +405,16 @@ export class Agent {
 
   private pollingIntervalSeconds(): number {
     const value = this.config.TASK_POLLING_INTERVAL;
-    return Number.isFinite(value) && value > 0 ? value : 60;
+    return Number.isFinite(value) && value > 0 && value <= MAX_DELAY_SECONDS
+      ? value
+      : 60;
   }
 
   private configuredMaxPollingIntervalSeconds(): number {
     const value = this.config.TASK_POLLING_MAX_INTERVAL;
-    return Number.isFinite(value) && value > 0 ? value : 300;
+    return Number.isFinite(value) && value > 0 && value <= MAX_DELAY_SECONDS
+      ? value
+      : 300;
   }
 
   private updatePollCadence(outcome: PollOutcome): void {
@@ -404,10 +457,11 @@ export class Agent {
         actions,
         loadProjects,
       );
-      const tasks = await this.planner.listAssignedTasks(
+      const fetchedTasks = await this.planner.listAssignedTasks(
         user,
         projectScope ?? undefined,
       );
+      const tasks = this.filterTasksWithValidIds(fetchedTasks);
       await this.cleanupCompletedTasks(tasks);
       // Records of the tasks that are no longer assigned can never be
       // finalized: drop them.
@@ -529,6 +583,29 @@ export class Agent {
       await this.retryDueFinalizations();
     }
     return outcome;
+  }
+
+  // Defense in depth against a compromised Planner: task ids feed filesystem
+  // paths, so only canonical UUIDs are accepted. An invalid task is skipped
+  // (logged once) and never crashes the poll loop.
+  private filterTasksWithValidIds(tasks: PlannerTask[]): PlannerTask[] {
+    const valid: PlannerTask[] = [];
+    for (const task of tasks) {
+      if (isCanonicalTaskId(task.id)) {
+        valid.push(task);
+        continue;
+      }
+      if (
+        !this.warnedInvalidTaskIds.has(task.id) &&
+        this.warnedInvalidTaskIds.size < MAX_WARNED_INVALID_TASK_IDS
+      ) {
+        this.warnedInvalidTaskIds.add(task.id);
+        logger.warn(
+          `Skipping task '${task.title}' with an invalid id '${task.id}' returned by Planner: task ids must be canonical UUIDs`,
+        );
+      }
+    }
+    return valid;
   }
 
   // The project ids the task fetch is scoped to, or null for the unscoped
@@ -1607,7 +1684,11 @@ export class Agent {
   // startup only, so a hot-reloaded invalid value disables the heartbeats.
   private progressCommentIntervalSeconds(): number {
     const value = this.config.TASK_PROGRESS_COMMENT_INTERVAL;
-    return Number.isInteger(value) && value > 0 ? value : 0;
+    return Number.isInteger(value) &&
+      value > 0 &&
+      value <= MAX_DELAY_SECONDS
+      ? value
+      : 0;
   }
 
   // Finalizes a task aborted at user request (its status was moved to the
@@ -1675,20 +1756,27 @@ export class Agent {
     };
   }
 
+  // Invariant of the path builders: every id reaching them is a canonical
+  // task id, so a path can never escape DATA_DIR. Call sites receive ids
+  // validated at the Planner boundary or canonical ids from extractTaskId.
   private getTaskNotesFile(taskId: string): string {
-    return path.join(this.config.DATA_DIR, "tasks", `${taskId}-Agent.md`);
+    return path.join(
+      this.config.DATA_DIR,
+      "tasks",
+      `${taskIdForPath(taskId)}-Agent.md`,
+    );
   }
 
   private getTaskSummaryFile(taskId: string): string {
     return path.join(
       this.config.DATA_DIR,
       "tasks",
-      `${taskId}-Agent-Summary.md`,
+      `${taskIdForPath(taskId)}-Agent-Summary.md`,
     );
   }
 
   private getTaskDir(taskId: string): string {
-    return path.join(this.config.DATA_DIR, "tasks", taskId);
+    return path.join(this.config.DATA_DIR, "tasks", taskIdForPath(taskId));
   }
 
   private async writeTaskNotes(
@@ -1716,9 +1804,10 @@ export class Agent {
           `- **${comment.userName || comment.userId}** (${comment.dateCreated}): ${comment.text}`,
       )
       .join("\n");
-    const downloadedAttachments = await this.downloadAttachments(task);
+    const attachmentOutcomes = await this.downloadAttachments(task);
     // One line per attachment: unsafe names are always reported as skipped,
-    // the downloaded ones with their local path, the others as failed.
+    // the downloaded/reused ones with their local path, the oversized ones
+    // as skipped and the others as failed.
     const attachmentLines =
       task.attachments.length > 0
         ? task.attachments.map((attachment) => {
@@ -1726,12 +1815,18 @@ export class Agent {
             if (name === null) {
               return "- (unsafe file name, skipped)";
             }
-            const downloadedPath = downloadedAttachments.find(
-              (filePath) => path.basename(filePath) === name,
-            );
-            return downloadedPath !== undefined
-              ? `- ${name} (${downloadedPath})`
-              : `- ${name} (download failed)`;
+            const outcome = attachmentOutcomes.get(attachment.id);
+            if (
+              (outcome?.status === "downloaded" ||
+                outcome?.status === "reused") &&
+              outcome.filePath !== undefined
+            ) {
+              return `- ${name} (${outcome.filePath})`;
+            }
+            if (outcome?.status === "skipped") {
+              return `- ${name} (skipped: exceeds the maximum attachment size)`;
+            }
+            return `- ${name} (download failed)`;
           })
         : ["*(none)*"];
     const brief = [
@@ -1768,49 +1863,187 @@ export class Agent {
     await fse.writeFile(notesFile, brief + agentNotes);
   }
 
-  private async downloadAttachments(task: PlannerTask): Promise<string[]> {
-    if (task.attachments.length === 0) {
-      return [];
-    }
+  private async downloadAttachments(
+    task: PlannerTask,
+  ): Promise<Map<string, AttachmentOutcome>> {
+    const outcomes = new Map<string, AttachmentOutcome>();
     const attachmentsDir = path.join(this.getTaskDir(task.id), "attachments");
+    if (task.attachments.length === 0) {
+      // The task no longer has attachments: clean up whatever a previous
+      // brief downloaded, when the directory exists.
+      if (await fse.pathExists(attachmentsDir)) {
+        await this.pruneAttachmentManifest(attachmentsDir, new Set());
+      }
+      return outcomes;
+    }
     await fse.ensureDir(attachmentsDir);
-    const downloaded: string[] = [];
+    const manifest = await this.readAttachmentManifest(attachmentsDir);
+    const entries = new Map(
+      manifest.attachments.map((entry) => [entry.id, entry]),
+    );
+    const taskAttachmentIds = new Set(
+      task.attachments.map((attachment) => attachment.id),
+    );
+    const resolvedDir = `${path.resolve(attachmentsDir)}${path.sep}`;
+    let manifestChanged = false;
+
     for (const attachment of task.attachments) {
+      const fileName = sanitizeAttachmentFileName(attachment.fileName);
+      const filePath =
+        fileName !== null ? path.join(attachmentsDir, fileName) : null;
+      // Containment is enforced again after resolution, on top of the name
+      // sanitization, so no attachment can ever be written outside the task
+      // attachments directory.
+      if (
+        fileName === null ||
+        filePath === null ||
+        !path.resolve(filePath).startsWith(resolvedDir)
+      ) {
+        logger.warn(
+          `Skipping attachment with unsafe file name '${attachment.fileName}' for task '${task.title}' (${task.id})`,
+        );
+        outcomes.set(attachment.id, { status: "unsafe" });
+        continue;
+      }
+      // Reuse the local copy when the manifest records the same version of
+      // the same attachment and the file still exists.
+      const existing = entries.get(attachment.id);
+      if (
+        existing !== undefined &&
+        existing.dateCreated === attachment.dateCreated &&
+        existing.fileName === fileName &&
+        (await fse.pathExists(filePath))
+      ) {
+        outcomes.set(attachment.id, { status: "reused", filePath });
+        continue;
+      }
       try {
         const data = await this.planner.downloadTaskAttachment(
           task.id,
           attachment.id,
         );
-        const fileName = sanitizeAttachmentFileName(attachment.fileName);
-        if (fileName === null) {
-          logger.warn(
-            `Skipping attachment with unsafe file name '${attachment.fileName}' for task '${task.title}' (${task.id})`,
-          );
-          continue;
-        }
-        const filePath = path.join(attachmentsDir, fileName);
-        // Containment is enforced again after resolution, on top of the
-        // name sanitization, so no attachment can ever be written outside
-        // the task attachments directory.
-        const resolvedDir = `${path.resolve(attachmentsDir)}${path.sep}`;
-        if (!path.resolve(filePath).startsWith(resolvedDir)) {
-          logger.warn(
-            `Skipping attachment with unsafe file name '${attachment.fileName}' for task '${task.title}' (${task.id})`,
-          );
-          continue;
-        }
         await fse.writeFile(filePath, data);
-        downloaded.push(filePath);
+        entries.set(attachment.id, {
+          id: attachment.id,
+          dateCreated: attachment.dateCreated,
+          fileName,
+        });
+        manifestChanged = true;
+        outcomes.set(attachment.id, { status: "downloaded", filePath });
         logger.info(
           `Downloaded attachment '${attachment.fileName}' for task '${task.title}' (${task.id})`,
         );
       } catch (error) {
+        if (error instanceof AttachmentTooLargeError) {
+          logger.warn(
+            `Skipping attachment '${attachment.fileName}' for task '${task.title}' (${task.id}): it exceeds the maximum attachment size (${error.limit} bytes)`,
+          );
+          outcomes.set(attachment.id, { status: "skipped" });
+          continue;
+        }
         logger.error(
           `Failed to download attachment '${attachment.fileName}' for task '${task.title}' (${task.id}): ${(error as Error).message}`,
         );
+        outcomes.set(attachment.id, { status: "failed" });
       }
     }
-    return downloaded;
+
+    // Entries (and files) of attachments that no longer exist on the task.
+    for (const id of entries.keys()) {
+      if (taskAttachmentIds.has(id)) {
+        continue;
+      }
+      const entry = entries.get(id)!;
+      entries.delete(id);
+      manifestChanged = true;
+      const staleFile = path.join(attachmentsDir, entry.fileName);
+      if (path.resolve(staleFile).startsWith(resolvedDir)) {
+        await fse.remove(staleFile).catch(() => undefined);
+      }
+    }
+
+    if (manifestChanged) {
+      await this.writeAttachmentManifest(attachmentsDir, [...entries.values()]);
+    }
+    return outcomes;
+  }
+
+  private async pruneAttachmentManifest(
+    attachmentsDir: string,
+    keepIds: Set<string>,
+  ): Promise<void> {
+    const manifest = await this.readAttachmentManifest(attachmentsDir);
+    if (manifest.attachments.length === 0) {
+      return;
+    }
+    const kept = manifest.attachments.filter((entry) =>
+      keepIds.has(entry.id),
+    );
+    if (kept.length === manifest.attachments.length) {
+      return;
+    }
+    const resolvedDir = `${path.resolve(attachmentsDir)}${path.sep}`;
+    for (const entry of manifest.attachments) {
+      if (keepIds.has(entry.id)) {
+        continue;
+      }
+      const staleFile = path.join(attachmentsDir, entry.fileName);
+      if (path.resolve(staleFile).startsWith(resolvedDir)) {
+        await fse.remove(staleFile).catch(() => undefined);
+      }
+    }
+    await this.writeAttachmentManifest(attachmentsDir, kept);
+  }
+
+  private async readAttachmentManifest(
+    attachmentsDir: string,
+  ): Promise<AttachmentManifest> {
+    const manifestFile = path.join(attachmentsDir, ATTACHMENT_MANIFEST_FILE);
+    const empty: AttachmentManifest = {
+      version: ATTACHMENT_MANIFEST_VERSION,
+      attachments: [],
+    };
+    if (!(await fse.pathExists(manifestFile))) {
+      return empty;
+    }
+    try {
+      const content = await fse.readJson(manifestFile);
+      if (!Array.isArray(content?.attachments)) {
+        throw new Error("missing attachments list");
+      }
+      const attachments = content.attachments.filter(
+        (entry: Partial<AttachmentManifestEntry> | null) =>
+          entry !== null &&
+          typeof entry.id === "string" &&
+          typeof entry.dateCreated === "string" &&
+          typeof entry.fileName === "string",
+      );
+      return { version: ATTACHMENT_MANIFEST_VERSION, attachments };
+    } catch (error) {
+      logger.warn(
+        `Ignoring the unreadable attachment manifest '${manifestFile}' (rebuilding it): ${(error as Error).message}`,
+      );
+      return empty;
+    }
+  }
+
+  private async writeAttachmentManifest(
+    attachmentsDir: string,
+    attachments: AttachmentManifestEntry[],
+  ): Promise<void> {
+    const manifestFile = path.join(attachmentsDir, ATTACHMENT_MANIFEST_FILE);
+    try {
+      // Atomic, locked write: a concurrent read always sees valid JSON.
+      await writeJsonAtomic(manifestFile, {
+        version: ATTACHMENT_MANIFEST_VERSION,
+        attachments,
+      });
+    } catch (error) {
+      // Best-effort: a missing manifest only costs a re-download later.
+      logger.warn(
+        `Failed to write the attachment manifest '${manifestFile}': ${(error as Error).message}`,
+      );
+    }
   }
 
   private async cleanupCompletedTasks(tasks: PlannerTask[]): Promise<void> {
@@ -1870,10 +2103,17 @@ export class Agent {
 
 // Extracts a Planner task id (UUID) from a task file or directory name.
 function extractTaskId(entry: string): string | undefined {
-  const match = entry.match(
-    /^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i,
-  );
-  return match ? match[1].toLowerCase() : undefined;
+  const candidate = entry.slice(0, 36);
+  return isCanonicalTaskId(candidate) ? candidate.toLowerCase() : undefined;
+}
+
+// Lowercased canonical id used in the local paths (independent of the case
+// the Planner returned), after the containment invariant is enforced.
+function taskIdForPath(taskId: string): string {
+  if (!isCanonicalTaskId(taskId)) {
+    throw new Error(`Invalid task id '${taskId}'`);
+  }
+  return taskId.toLowerCase();
 }
 
 // What a poll found: actionable work (scheduler candidates), nothing to

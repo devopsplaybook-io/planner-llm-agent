@@ -6,6 +6,7 @@ import {
   buildTaskLabel,
   commentsPickupPending,
   hasAgentComment,
+  isCanonicalTaskId,
   lastCommentOf,
   mergeLabels,
   normalizeLabelValue,
@@ -16,7 +17,13 @@ import { FinalizationStore } from "./FinalizationStore";
 import { CliAbortedError } from "./CliUtils";
 import { createCliAgent } from "./clients/CliAgentRegistry";
 import type { CliAgentClient, TaskOptions } from "./clients/CliAgent";
-import { PlannerClient, PlannerRequestError, PlannerTask } from "./PlannerClient";
+import {
+  AttachmentTooLargeError,
+  PlannerClient,
+  PlannerRequestError,
+  PlannerTask,
+  PlannerTaskAttachment,
+} from "./PlannerClient";
 
 jest.mock("./PlannerClient", () => {
   class PlannerRequestError extends Error {
@@ -28,7 +35,18 @@ jest.mock("./PlannerClient", () => {
       this.status = status;
     }
   }
-  return { PlannerClient: jest.fn(), PlannerRequestError };
+  class AttachmentTooLargeError extends Error {
+    public readonly limit: number;
+    public readonly size: number | null;
+
+    constructor(limit: number, size: number | null = null) {
+      super(`Attachment exceeds the maximum size of ${limit} bytes`);
+      this.name = "AttachmentTooLargeError";
+      this.limit = limit;
+      this.size = size;
+    }
+  }
+  return { PlannerClient: jest.fn(), PlannerRequestError, AttachmentTooLargeError };
 });
 
 jest.mock("./clients/CliAgentRegistry", () => ({
@@ -91,6 +109,28 @@ const mockCopilot = {
 const AGENT_NOTES_MARKER =
   "<!-- AGENT-NOTES: the content below is maintained by the planner agent. Do not remove this marker. -->";
 
+// The agent only accepts canonical UUID task ids (they feed filesystem
+// paths), so every fixture uses a deterministic one.
+const TASK_1 = "11111111-1111-4111-8111-111111111111";
+const TASK_2 = "22222222-2222-4222-8222-222222222222";
+const TASK_3 = "33333333-3333-4333-8333-333333333333";
+const TASK_OLDEST = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+const TASK_NEWEST = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+const TASK_LOW = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
+const TASK_STALE = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+const TASK_UNKNOWN = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+const TASK_MIDDLE = "ffffffff-ffff-4fff-8fff-ffffffffffff";
+const TASK_MEDIUM = "a0000000-0000-4000-8000-000000000001";
+const TASK_HIGH = "a0000000-0000-4000-8000-000000000002";
+const TASK_GAMMA_HIGH = "a0000000-0000-4000-8000-000000000003";
+const TASK_DELTA_MEDIUM = "a0000000-0000-4000-8000-000000000004";
+const TASK_BETA_HIGH = "a0000000-0000-4000-8000-000000000005";
+const TASK_B = "a0000000-0000-4000-8000-000000000006";
+const TASK_ALPHA_LOW = "a0000000-0000-4000-8000-000000000007";
+const TASK_A = "a0000000-0000-4000-8000-000000000008";
+const TASK_C = "a0000000-0000-4000-8000-000000000009";
+const TASK_ALREADY_CLEAR = "a0000000-0000-4000-8000-00000000000a";
+
 // Wildcard actions (empty project) matching every task in 'To Do' and
 // moving it to 'Done': the default used by the task processing tests.
 const WILDCARD_ACTIONS: AgentActionsConfig = {
@@ -108,6 +148,46 @@ const WILDCARD_ACTIONS: AgentActionsConfig = {
       weight: null,
     },
   ],
+};
+
+// A Planner task fixture for the direct brief (writeTaskNotes) tests.
+function notesTask(attachments: PlannerTaskAttachment[]): PlannerTask {
+  return {
+    id: TASK_1,
+    projectId: "project-1",
+    title: "Implement feature",
+    status: "To Do",
+    priority: "medium",
+    description: "Add a feature",
+    dateUpdated: "2026-09-02T00:00:00.000Z",
+    comments: [],
+    attachments,
+  };
+}
+
+function attachmentFixture(
+  overrides: Partial<PlannerTaskAttachment> = {},
+): PlannerTaskAttachment {
+  return {
+    id: "attachment-1",
+    fileName: "screenshot.png",
+    filePath: "/uploads/screenshot.png",
+    dateCreated: "2026-09-02T00:00:00.000Z",
+    ...overrides,
+  };
+}
+
+// The private helpers exercised directly: the path builders must reject
+// non-canonical ids and the brief writer exposes the attachment manifest.
+type NotesWriter = {
+  writeTaskNotes(
+    task: PlannerTask,
+    notesFile: string,
+    project: null,
+  ): Promise<void>;
+  getTaskDir(taskId: string): string;
+  getTaskNotesFile(taskId: string): string;
+  getTaskSummaryFile(taskId: string): string;
 };
 
 // Wait for the asynchronous processing chain (which performs real file I/O)
@@ -322,7 +402,7 @@ describe("Agent", () => {
   it("should dispatch an action to its configured CLI agent", async () => {
     mockPlannerTasks([
       {
-        id: "task-1",
+        id: TASK_1,
         title: "Project task",
         status: "To Do",
         description: "Implement the project change",
@@ -355,7 +435,7 @@ describe("Agent", () => {
     await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
 
     expect(mockCopilot.performTask).toHaveBeenCalledWith(
-      expect.objectContaining({ id: "task-1" }),
+      expect.objectContaining({ id: TASK_1 }),
       expect.any(String),
       expect.objectContaining({ cwd: expect.any(String) }),
     );
@@ -366,7 +446,7 @@ describe("Agent", () => {
   it("should prepare a CLI agent introduced by an action loaded after startup", async () => {
     mockPlannerTasks([
       {
-        id: "task-1",
+        id: TASK_1,
         title: "Hot-reloaded task",
         status: "To Do",
         description: "Implement the project change",
@@ -488,7 +568,7 @@ describe("Agent", () => {
     // base interval again.
     mockPlannerTasks([
       {
-        id: "task-1",
+        id: TASK_1,
         title: "New task",
         status: "To Do",
         description: "Work to do",
@@ -598,7 +678,7 @@ describe("Agent", () => {
     jest.useFakeTimers();
     mockPlanner.listAssignedTasks.mockResolvedValue([
       {
-        id: "task-1",
+        id: TASK_1,
         title: "Fix the build",
         status: "In Progress",
         description: "",
@@ -606,7 +686,7 @@ describe("Agent", () => {
         attachments: [],
       },
       {
-        id: "task-2",
+        id: TASK_2,
         title: "Review PR",
         status: "Blocked",
         description: "",
@@ -647,7 +727,7 @@ describe("Agent", () => {
   it("should only process tasks in the start status", async () => {
     mockPlanner.listAssignedTasks.mockResolvedValue([
       {
-        id: "task-1",
+        id: TASK_1,
         title: "Implement feature",
         status: "To Do",
         description: "Add a feature",
@@ -655,7 +735,7 @@ describe("Agent", () => {
         attachments: [],
       },
       {
-        id: "task-2",
+        id: TASK_2,
         title: "Already running",
         status: "In Progress",
         description: "Another task",
@@ -671,15 +751,15 @@ describe("Agent", () => {
 
     expect(mockQoder.performTask).toHaveBeenCalledTimes(1);
     expect(mockQoder.performTask).toHaveBeenCalledWith(
-      expect.objectContaining({ id: "task-1" }),
-      path.join(dataDir, "tasks", "task-1-Agent.md"),
+      expect.objectContaining({ id: TASK_1 }),
+      path.join(dataDir, "tasks", `${TASK_1}-Agent.md`),
       expect.objectContaining({ model: "", instruction: "" }),
     );
     expect(mockPlanner.addTaskComment).toHaveBeenCalledWith(
-      "task-1",
+      TASK_1,
       "Feature implemented",
     );
-    expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith("task-1", "Done");
+    expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith(TASK_1, "Done");
     agent.stop();
   });
 
@@ -691,14 +771,14 @@ describe("Agent", () => {
           resolvePoll = () =>
             resolve([
               {
-                id: "task-1",
+                id: TASK_1,
                 title: "Blocked work",
                 status: "To Do",
                 description: "Add a feature",
                 comments: [],
                 attachments: [],
                 dependencies: [
-                  { taskId: "task-2", title: "First step", status: "In Progress" },
+                  { taskId: TASK_2, title: "First step", status: "In Progress" },
                 ],
               },
             ]);
@@ -726,13 +806,13 @@ describe("Agent", () => {
           resolvePoll = () =>
             resolve([
               {
-                id: "task-1",
+                id: TASK_1,
                 title: "Blocked work",
                 status: "To Do",
                 description: "Add a feature",
                 comments: [],
                 attachments: [],
-                dependencies: [{ taskId: "task-2" }],
+                dependencies: [{ taskId: TASK_2 }],
               },
             ]);
         }),
@@ -752,14 +832,14 @@ describe("Agent", () => {
   it("should process a task whose dependencies are all Done", async () => {
     mockPlanner.listAssignedTasks.mockResolvedValue([
       {
-        id: "task-1",
+        id: TASK_1,
         title: "Unblocked work",
         status: "To Do",
         description: "Add a feature",
         comments: [],
         attachments: [],
         dependencies: [
-          { taskId: "task-2", title: "First step", status: "Done" },
+          { taskId: TASK_2, title: "First step", status: "Done" },
         ],
       },
     ]);
@@ -770,11 +850,11 @@ describe("Agent", () => {
     await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
 
     expect(mockQoder.performTask).toHaveBeenCalledWith(
-      expect.objectContaining({ id: "task-1" }),
-      path.join(dataDir, "tasks", "task-1-Agent.md"),
+      expect.objectContaining({ id: TASK_1 }),
+      path.join(dataDir, "tasks", `${TASK_1}-Agent.md`),
       expect.objectContaining({ model: "", instruction: "" }),
     );
-    expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith("task-1", "Done");
+    expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith(TASK_1, "Done");
     agent.stop();
   });
 
@@ -782,15 +862,15 @@ describe("Agent", () => {
     config.TASK_STATUS_CLEANUP = "Archived";
     mockPlanner.listAssignedTasks.mockResolvedValue([
       {
-        id: "task-1",
+        id: TASK_1,
         title: "Follow-up work",
         status: "To Do",
         description: "Add a feature",
         comments: [],
         attachments: [],
         dependencies: [
-          { taskId: "task-2", title: "First step", status: "Done" },
-          { taskId: "task-3", status: "Done" },
+          { taskId: TASK_2, title: "First step", status: "Done" },
+          { taskId: TASK_3, status: "Done" },
         ],
       },
     ]);
@@ -800,12 +880,12 @@ describe("Agent", () => {
     agent.start();
     await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
 
-    const notesFile = path.join(dataDir, "tasks", "task-1-Agent.md");
+    const notesFile = path.join(dataDir, "tasks", `${TASK_1}-Agent.md`);
     expect(await fse.pathExists(notesFile)).toBe(true);
     const content = await fse.readFile(notesFile, "utf8");
     expect(content).toContain("## Dependencies");
-    expect(content).toContain("- First step (task-2) — status: Done");
-    expect(content).toContain("- task-3 (task-3) — status: Done");
+    expect(content).toContain(`- First step (${TASK_2}) — status: Done`);
+    expect(content).toContain(`- ${TASK_3} (${TASK_3}) — status: Done`);
     agent.stop();
   });
 
@@ -813,7 +893,7 @@ describe("Agent", () => {
     config.TASK_STATUS_CLEANUP = "Archived";
     mockPlanner.listAssignedTasks.mockResolvedValue([
       {
-        id: "task-1",
+        id: TASK_1,
         title: "Implement feature",
         status: "To Do",
         description: "Add a feature",
@@ -835,7 +915,7 @@ describe("Agent", () => {
     agent.start();
     await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
 
-    const notesFile = path.join(dataDir, "tasks", "task-1-Agent.md");
+    const notesFile = path.join(dataDir, "tasks", `${TASK_1}-Agent.md`);
     expect(await fse.pathExists(notesFile)).toBe(true);
     const content = await fse.readFile(notesFile, "utf8");
     expect(content).toContain("# Task: Implement feature");
@@ -850,7 +930,7 @@ describe("Agent", () => {
 
   it("should preserve existing agent notes across runs", async () => {
     config.TASK_STATUS_CLEANUP = "Archived";
-    const notesFile = path.join(dataDir, "tasks", "task-1-Agent.md");
+    const notesFile = path.join(dataDir, "tasks", `${TASK_1}-Agent.md`);
     await fse.ensureDir(path.dirname(notesFile));
     await fse.writeFile(
       notesFile,
@@ -870,7 +950,7 @@ describe("Agent", () => {
     );
     mockPlanner.listAssignedTasks.mockResolvedValue([
       {
-        id: "task-1",
+        id: TASK_1,
         title: "Implement feature",
         status: "To Do",
         description: "New description",
@@ -893,7 +973,7 @@ describe("Agent", () => {
 
   it("should preserve the Agent Notes when a comment quotes the marker", async () => {
     config.TASK_STATUS_CLEANUP = "Archived";
-    const notesFile = path.join(dataDir, "tasks", "task-1-Agent.md");
+    const notesFile = path.join(dataDir, "tasks", `${TASK_1}-Agent.md`);
     const quotedMarkerComment = `Please use this marker: ${AGENT_NOTES_MARKER}`;
     await fse.ensureDir(path.dirname(notesFile));
     await fse.writeFile(
@@ -922,7 +1002,7 @@ describe("Agent", () => {
     );
     mockPlanner.listAssignedTasks.mockResolvedValue([
       {
-        id: "task-1",
+        id: TASK_1,
         title: "Implement feature",
         status: "To Do",
         description: "New description",
@@ -963,7 +1043,7 @@ describe("Agent", () => {
   it("should move a failing task to the end status with an explanation", async () => {
     mockPlanner.listAssignedTasks.mockResolvedValue([
       {
-        id: "task-1",
+        id: TASK_1,
         title: "Implement feature",
         status: "To Do",
         description: "Add a feature",
@@ -981,25 +1061,25 @@ describe("Agent", () => {
 
     expect(console.log).toHaveBeenCalledWith(
       expect.stringContaining(
-        "Failed to process task 'Implement feature' (task-1)",
+        `Failed to process task 'Implement feature' (${TASK_1})`,
       ),
     );
     expect(mockPlanner.addTaskComment).toHaveBeenCalledWith(
-      "task-1",
+      TASK_1,
       expect.stringContaining("Task processing failed:"),
     );
     expect(mockPlanner.addTaskComment).toHaveBeenCalledWith(
-      "task-1",
+      TASK_1,
       expect.stringContaining("boom"),
     );
-    expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith("task-1", "Done");
+    expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith(TASK_1, "Done");
     agent.stop();
   });
 
   it("should move a failing task to the action error status when configured", async () => {
     mockPlanner.listAssignedTasks.mockResolvedValue([
       {
-        id: "task-1",
+        id: TASK_1,
         title: "Implement feature",
         status: "To Do",
         description: "Add a feature",
@@ -1032,11 +1112,11 @@ describe("Agent", () => {
     await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
 
     expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith(
-      "task-1",
+      TASK_1,
       "Blocked",
     );
     expect(mockPlanner.addTaskComment).toHaveBeenCalledWith(
-      "task-1",
+      TASK_1,
       expect.stringContaining("The task was moved to 'Blocked'"),
     );
     agent.stop();
@@ -1045,7 +1125,7 @@ describe("Agent", () => {
   it("should move a failing task to the default error status when the action has none", async () => {
     mockPlanner.listAssignedTasks.mockResolvedValue([
       {
-        id: "task-1",
+        id: TASK_1,
         title: "Implement feature",
         status: "To Do",
         description: "Add a feature",
@@ -1077,11 +1157,11 @@ describe("Agent", () => {
     await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
 
     expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith(
-      "task-1",
+      TASK_1,
       "Review",
     );
     expect(mockPlanner.addTaskComment).toHaveBeenCalledWith(
-      "task-1",
+      TASK_1,
       expect.stringContaining("The task was moved to 'Review'"),
     );
     agent.stop();
@@ -1090,7 +1170,7 @@ describe("Agent", () => {
   it("should truncate a long failure explanation", async () => {
     mockPlanner.listAssignedTasks.mockResolvedValue([
       {
-        id: "task-1",
+        id: TASK_1,
         title: "Implement feature",
         status: "To Do",
         description: "Add a feature",
@@ -1116,7 +1196,7 @@ describe("Agent", () => {
   it("should log an error when a failed task cannot be moved to the end status", async () => {
     mockPlanner.listAssignedTasks.mockResolvedValue([
       {
-        id: "task-1",
+        id: TASK_1,
         title: "Implement feature",
         status: "To Do",
         description: "Add a feature",
@@ -1132,7 +1212,7 @@ describe("Agent", () => {
     await waitFor(() =>
       logSpy.mock.calls.some((call) =>
         String(call[0]).includes(
-          "Failed to move task 'Implement feature' (task-1) to status 'Done'",
+          `Failed to move task 'Implement feature' (${TASK_1}) to status 'Done'`,
         ),
       ),
     );
@@ -1146,7 +1226,7 @@ describe("Agent", () => {
     let resolveTask: (value: string) => void = () => undefined;
     mockPlannerTasks([
       {
-        id: "task-1",
+        id: TASK_1,
         title: "Long task",
         status: "To Do",
         description: "Take your time",
@@ -1179,7 +1259,7 @@ describe("Agent", () => {
     let resolveFirst: (value: string) => void = () => undefined;
     mockPlannerTasks([
       {
-        id: "task-1",
+        id: TASK_1,
         title: "First task",
         status: "To Do",
         description: "",
@@ -1187,7 +1267,7 @@ describe("Agent", () => {
         attachments: [],
       },
       {
-        id: "task-2",
+        id: TASK_2,
         title: "Second task",
         status: "To Do",
         description: "",
@@ -1211,7 +1291,7 @@ describe("Agent", () => {
     await new Promise((resolve) => setTimeout(resolve, 1500));
     expect(mockQoder.performTask).toHaveBeenCalledTimes(1);
     expect(mockQoder.performTask).toHaveBeenCalledWith(
-      expect.objectContaining({ id: "task-1" }),
+      expect.objectContaining({ id: TASK_1 }),
       expect.any(String),
       expect.anything(),
     );
@@ -1220,7 +1300,7 @@ describe("Agent", () => {
     resolveFirst("First task done");
     await waitFor(() => mockQoder.performTask.mock.calls.length === 2);
     await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length === 2);
-    expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith("task-2", "Done");
+    expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith(TASK_2, "Done");
     agent.stop();
   });
 
@@ -1242,7 +1322,7 @@ describe("Agent", () => {
     let resolveFirst: (value: string) => void = () => undefined;
     mockPlannerTasks([
       {
-        id: "task-1",
+        id: TASK_1,
         title: "First task",
         status: "To Do",
         description: "",
@@ -1250,7 +1330,7 @@ describe("Agent", () => {
         attachments: [],
       },
       {
-        id: "task-2",
+        id: TASK_2,
         title: "Waiting task",
         status: "To Do",
         description: "",
@@ -1291,7 +1371,7 @@ describe("Agent", () => {
     const resolvers: ((value: string) => void)[] = [];
     mockPlannerTasks([
       {
-        id: "task-1",
+        id: TASK_1,
         title: "First task",
         status: "To Do",
         description: "",
@@ -1299,7 +1379,7 @@ describe("Agent", () => {
         attachments: [],
       },
       {
-        id: "task-2",
+        id: TASK_2,
         title: "Second task",
         status: "To Do",
         description: "",
@@ -1307,7 +1387,7 @@ describe("Agent", () => {
         attachments: [],
       },
       {
-        id: "task-3",
+        id: TASK_3,
         title: "Third task",
         status: "To Do",
         description: "",
@@ -1329,12 +1409,12 @@ describe("Agent", () => {
     await new Promise((resolve) => setTimeout(resolve, 1500));
     expect(mockQoder.performTask).toHaveBeenCalledTimes(2);
     expect(mockQoder.performTask).toHaveBeenCalledWith(
-      expect.objectContaining({ id: "task-1" }),
+      expect.objectContaining({ id: TASK_1 }),
       expect.any(String),
       expect.anything(),
     );
     expect(mockQoder.performTask).toHaveBeenCalledWith(
-      expect.objectContaining({ id: "task-2" }),
+      expect.objectContaining({ id: TASK_2 }),
       expect.any(String),
       expect.anything(),
     );
@@ -1344,7 +1424,7 @@ describe("Agent", () => {
     resolvers[1]("Second done");
     await waitFor(() => mockQoder.performTask.mock.calls.length === 3);
     expect(mockQoder.performTask).toHaveBeenCalledWith(
-      expect.objectContaining({ id: "task-3" }),
+      expect.objectContaining({ id: TASK_3 }),
       expect.any(String),
       expect.anything(),
     );
@@ -1387,7 +1467,7 @@ describe("Agent", () => {
     config.TASK_STATUS_CLEANUP = "Archived";
     mockPlanner.listAssignedTasks.mockResolvedValue([
       {
-        id: "task-1",
+        id: TASK_1,
         title: "Implement feature",
         status: "To Do",
         description: "Add a feature",
@@ -1410,17 +1490,17 @@ describe("Agent", () => {
     await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
 
     expect(mockPlanner.downloadTaskAttachment).toHaveBeenCalledWith(
-      "task-1",
+      TASK_1,
       "attachment-1",
     );
-    const notesFile = path.join(dataDir, "tasks", "task-1-Agent.md");
+    const notesFile = path.join(dataDir, "tasks", `${TASK_1}-Agent.md`);
     const content = await fse.readFile(notesFile, "utf8");
     expect(content).toContain("## Attachments");
     expect(content).toContain("screenshot.png");
     const attachmentFile = path.join(
       dataDir,
       "tasks",
-      "task-1",
+      TASK_1,
       "attachments",
       "screenshot.png",
     );
@@ -1443,7 +1523,7 @@ describe("Agent", () => {
     ];
     mockPlanner.listAssignedTasks.mockResolvedValue([
       {
-        id: "task-1",
+        id: TASK_1,
         title: "Implement feature",
         status: "To Do",
         description: "Add a feature",
@@ -1472,22 +1552,315 @@ describe("Agent", () => {
     await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
 
     // Only the safe attachment is written, inside the attachments directory.
-    const attachmentsDir = path.join(dataDir, "tasks", "task-1", "attachments");
-    expect((await fse.readdir(attachmentsDir)).sort()).toEqual(["notes.txt"]);
+    const attachmentsDir = path.join(dataDir, "tasks", TASK_1, "attachments");
+    expect((await fse.readdir(attachmentsDir)).sort()).toEqual([
+      "attachments.json",
+      "notes.txt",
+    ]);
     const tasksDir = path.join(dataDir, "tasks");
     const taskDirEntries = await fse.readdir(tasksDir);
-    expect(taskDirEntries).toContain("task-1");
+    expect(taskDirEntries).toContain(TASK_1);
     expect(taskDirEntries).not.toContain("escaped.txt");
     expect(taskDirEntries).not.toContain("deep");
 
     // The notes file lists the safe attachment and marks the unsafe ones.
     const content = await fse.readFile(
-      path.join(dataDir, "tasks", "task-1-Agent.md"),
+      path.join(dataDir, "tasks", `${TASK_1}-Agent.md`),
       "utf8",
     );
     expect(content).toContain("notes.txt");
     expect(content).toContain("(unsafe file name, skipped)");
     agent.stop();
+  });
+
+  it("should skip tasks with a non-canonical id and keep processing the other tasks", async () => {
+    config.TASK_POLLING_INTERVAL = 0.05;
+    mockPlannerTasks([
+      {
+        id: "../../escape",
+        title: "Escape attempt",
+        status: "To Do",
+        description: "Write outside the data directory",
+        comments: [],
+        attachments: [],
+      },
+      {
+        id: TASK_1,
+        title: "Implement feature",
+        status: "To Do",
+        description: "Add a feature",
+        comments: [],
+        attachments: [],
+      },
+    ]);
+    mockQoder.performTask.mockResolvedValue("Feature implemented");
+
+    const agent = createAgent();
+    agent.start();
+    await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
+    // The invalid entry does not break the polling loop.
+    await waitFor(() => mockPlanner.listAssignedTasks.mock.calls.length >= 2);
+
+    expect(mockPlanner.updateTaskStatus).toHaveBeenCalledTimes(1);
+    expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith(TASK_1, "Done");
+    expect(mockQoder.performTask).toHaveBeenCalledTimes(1);
+    expect(console.log).toHaveBeenCalledWith(
+      expect.stringContaining(
+        "Skipping task 'Escape attempt' with an invalid id '../../escape'",
+      ),
+    );
+    // No file or folder was created for the invalid id, inside or outside
+    // the tasks directory.
+    const tasksDir = path.join(dataDir, "tasks");
+    const entries = (await fse.pathExists(tasksDir))
+      ? await fse.readdir(tasksDir)
+      : [];
+    expect(entries.some((entry) => entry.includes("escape"))).toBe(false);
+    expect(
+      await fse.pathExists(path.join(dataDir, "..", "escape-Agent.md")),
+    ).toBe(false);
+    expect(await fse.pathExists(path.join(dataDir, "..", "escape"))).toBe(
+      false,
+    );
+    agent.stop();
+  });
+
+  it("should only build task paths from canonical UUIDs", () => {
+    const agent = createAgent();
+    const writer = agent as unknown as NotesWriter;
+
+    expect(isCanonicalTaskId(TASK_1)).toBe(true);
+    expect(isCanonicalTaskId(TASK_OLDEST.toUpperCase())).toBe(true);
+    expect(isCanonicalTaskId("task-1")).toBe(false);
+    expect(writer.getTaskDir(TASK_OLDEST.toUpperCase())).toBe(
+      path.join(dataDir, "tasks", TASK_OLDEST),
+    );
+    expect(writer.getTaskNotesFile(TASK_OLDEST)).toBe(
+      path.join(dataDir, "tasks", `${TASK_OLDEST}-Agent.md`),
+    );
+    for (const invalidId of ["../../etc", "/etc/passwd", "task-1", ""]) {
+      expect(() => writer.getTaskDir(invalidId)).toThrow(
+        `Invalid task id '${invalidId}'`,
+      );
+      expect(() => writer.getTaskNotesFile(invalidId)).toThrow(
+        `Invalid task id '${invalidId}'`,
+      );
+      expect(() => writer.getTaskSummaryFile(invalidId)).toThrow(
+        `Invalid task id '${invalidId}'`,
+      );
+    }
+  });
+
+  it("should skip an oversized attachment and still process the task", async () => {
+    config.TASK_STATUS_CLEANUP = "Archived";
+    mockPlannerTasks([
+      {
+        id: TASK_1,
+        title: "Implement feature",
+        status: "To Do",
+        description: "Add a feature",
+        comments: [],
+        attachments: [attachmentFixture()],
+      },
+    ]);
+    mockPlanner.downloadTaskAttachment.mockRejectedValue(
+      new AttachmentTooLargeError(1024, 2048),
+    );
+    mockQoder.performTask.mockResolvedValue("Feature implemented");
+
+    const agent = createAgent();
+    agent.start();
+    await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
+
+    const attachmentFile = path.join(
+      dataDir,
+      "tasks",
+      TASK_1,
+      "attachments",
+      "screenshot.png",
+    );
+    expect(await fse.pathExists(attachmentFile)).toBe(false);
+    const content = await fse.readFile(
+      path.join(dataDir, "tasks", `${TASK_1}-Agent.md`),
+      "utf8",
+    );
+    expect(content).toContain(
+      "screenshot.png (skipped: exceeds the maximum attachment size)",
+    );
+    expect(mockQoder.performTask).toHaveBeenCalledTimes(1);
+    agent.stop();
+  });
+
+  it("should reuse an attachment recorded in the manifest on the next brief", async () => {
+    const agent = createAgent();
+    const writer = agent as unknown as NotesWriter;
+    const task = notesTask([attachmentFixture()]);
+    const notesFile = writer.getTaskNotesFile(task.id);
+    mockPlanner.downloadTaskAttachment.mockResolvedValue(Buffer.from("v1"));
+
+    await writer.writeTaskNotes(task, notesFile, null);
+    await writer.writeTaskNotes(task, notesFile, null);
+
+    expect(mockPlanner.downloadTaskAttachment).toHaveBeenCalledTimes(1);
+    const attachmentsDir = path.join(dataDir, "tasks", TASK_1, "attachments");
+    const manifest = await fse.readJson(
+      path.join(attachmentsDir, "attachments.json"),
+    );
+    expect(manifest).toEqual({
+      version: 1,
+      attachments: [
+        {
+          id: "attachment-1",
+          dateCreated: "2026-09-02T00:00:00.000Z",
+          fileName: "screenshot.png",
+        },
+      ],
+    });
+    const content = await fse.readFile(notesFile, "utf8");
+    expect(content).toContain(
+      `screenshot.png (${path.join(attachmentsDir, "screenshot.png")})`,
+    );
+  });
+
+  it("should re-download an attachment whose dateCreated changed", async () => {
+    const agent = createAgent();
+    const writer = agent as unknown as NotesWriter;
+    const notesFile = writer.getTaskNotesFile(TASK_1);
+    mockPlanner.downloadTaskAttachment.mockResolvedValue(Buffer.from("v1"));
+    await writer.writeTaskNotes(
+      notesTask([attachmentFixture()]),
+      notesFile,
+      null,
+    );
+
+    mockPlanner.downloadTaskAttachment.mockResolvedValue(Buffer.from("v2"));
+    await writer.writeTaskNotes(
+      notesTask([
+        attachmentFixture({ dateCreated: "2026-09-03T00:00:00.000Z" }),
+      ]),
+      notesFile,
+      null,
+    );
+
+    expect(mockPlanner.downloadTaskAttachment).toHaveBeenCalledTimes(2);
+    const attachmentFile = path.join(
+      dataDir,
+      "tasks",
+      TASK_1,
+      "attachments",
+      "screenshot.png",
+    );
+    expect(await fse.readFile(attachmentFile)).toEqual(Buffer.from("v2"));
+  });
+
+  it("should drop the local copy of an attachment removed from the task", async () => {
+    const agent = createAgent();
+    const writer = agent as unknown as NotesWriter;
+    const notesFile = writer.getTaskNotesFile(TASK_1);
+    const attachmentsDir = path.join(dataDir, "tasks", TASK_1, "attachments");
+    mockPlanner.downloadTaskAttachment.mockResolvedValue(
+      Buffer.from("old image"),
+    );
+    await writer.writeTaskNotes(
+      notesTask([attachmentFixture()]),
+      notesFile,
+      null,
+    );
+    expect(
+      await fse.pathExists(path.join(attachmentsDir, "screenshot.png")),
+    ).toBe(true);
+
+    mockPlanner.downloadTaskAttachment.mockResolvedValue(
+      Buffer.from("new image"),
+    );
+    await writer.writeTaskNotes(
+      notesTask([
+        attachmentFixture({ id: "attachment-2", fileName: "new.png" }),
+      ]),
+      notesFile,
+      null,
+    );
+
+    expect(
+      await fse.pathExists(path.join(attachmentsDir, "screenshot.png")),
+    ).toBe(false);
+    expect(await fse.pathExists(path.join(attachmentsDir, "new.png"))).toBe(
+      true,
+    );
+    const manifest = await fse.readJson(
+      path.join(attachmentsDir, "attachments.json"),
+    );
+    expect(
+      manifest.attachments.map((entry: { id: string }) => entry.id),
+    ).toEqual(["attachment-2"]);
+  });
+
+  it("should prune the attachments folder when the task loses its attachments", async () => {
+    const agent = createAgent();
+    const writer = agent as unknown as NotesWriter;
+    const notesFile = writer.getTaskNotesFile(TASK_1);
+    const attachmentsDir = path.join(dataDir, "tasks", TASK_1, "attachments");
+    mockPlanner.downloadTaskAttachment.mockResolvedValue(Buffer.from("data"));
+    await writer.writeTaskNotes(
+      notesTask([attachmentFixture()]),
+      notesFile,
+      null,
+    );
+
+    await writer.writeTaskNotes(notesTask([]), notesFile, null);
+
+    expect(
+      await fse.pathExists(path.join(attachmentsDir, "screenshot.png")),
+    ).toBe(false);
+    const manifest = await fse.readJson(
+      path.join(attachmentsDir, "attachments.json"),
+    );
+    expect(manifest.attachments).toEqual([]);
+  });
+
+  it("should rebuild an unreadable attachment manifest", async () => {
+    const agent = createAgent();
+    const writer = agent as unknown as NotesWriter;
+    const attachmentsDir = path.join(dataDir, "tasks", TASK_1, "attachments");
+    await fse.ensureDir(attachmentsDir);
+    await fse.writeFile(
+      path.join(attachmentsDir, "attachments.json"),
+      "{not json",
+    );
+    mockPlanner.downloadTaskAttachment.mockResolvedValue(Buffer.from("data"));
+
+    await writer.writeTaskNotes(
+      notesTask([attachmentFixture()]),
+      writer.getTaskNotesFile(TASK_1),
+      null,
+    );
+
+    expect(console.log).toHaveBeenCalledWith(
+      expect.stringContaining("Ignoring the unreadable attachment manifest"),
+    );
+    const manifest = await fse.readJson(
+      path.join(attachmentsDir, "attachments.json"),
+    );
+    expect(manifest.attachments).toHaveLength(1);
+  });
+
+  it("should keep the attachment manifest valid under concurrent briefs", async () => {
+    const agent = createAgent();
+    const writer = agent as unknown as NotesWriter;
+    const notesFile = writer.getTaskNotesFile(TASK_1);
+    mockPlanner.downloadTaskAttachment.mockImplementation(async () =>
+      Buffer.from("data"),
+    );
+
+    await Promise.all([
+      writer.writeTaskNotes(notesTask([attachmentFixture()]), notesFile, null),
+      writer.writeTaskNotes(notesTask([attachmentFixture()]), notesFile, null),
+    ]);
+
+    const manifest = await fse.readJson(
+      path.join(dataDir, "tasks", TASK_1, "attachments", "attachments.json"),
+    );
+    expect(manifest.attachments).toHaveLength(1);
   });
 
   it("should clean up the task folder immediately when the task reaches the cleanup status", async () => {
@@ -1546,7 +1919,7 @@ describe("Agent", () => {
     config.TASK_POLLING_INTERVAL = 0.05;
     mockPlannerTasks([
       {
-        id: "task-1",
+        id: TASK_1,
         title: "Implement feature",
         status: "To Do",
         description: "Add a feature",
@@ -1576,7 +1949,7 @@ describe("Agent", () => {
     await waitFor(
       () =>
         mockPlanner.updateTaskStatus.mock.calls.some(
-          (call) => call[0] === "task-1" && call[1] === "Done",
+          (call) => call[0] === TASK_1 && call[1] === "Done",
         ),
       5000,
     );
@@ -1585,14 +1958,14 @@ describe("Agent", () => {
     // the Planner updates were retried.
     expect(mockQoder.performTask).toHaveBeenCalledTimes(1);
     expect(summaryCommentAttempts).toBe(2);
-    expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith("task-1", "Done");
+    expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith(TASK_1, "Done");
   });
 
   it("should not post the summary comment twice when only the status update fails", async () => {
     config.TASK_POLLING_INTERVAL = 0.05;
     mockPlanner.listAssignedTasks.mockResolvedValue([
       {
-        id: "task-1",
+        id: TASK_1,
         title: "Implement feature",
         status: "To Do",
         description: "Add a feature",
@@ -1611,7 +1984,7 @@ describe("Agent", () => {
     await waitFor(
       () =>
         mockPlanner.updateTaskStatus.mock.calls.filter(
-          (call) => call[0] === "task-1" && call[1] === "Done",
+          (call) => call[0] === TASK_1 && call[1] === "Done",
         ).length >= 2,
       5000,
     );
@@ -1630,7 +2003,7 @@ describe("Agent", () => {
     ]);
     mockPlanner.listAssignedTasks.mockResolvedValue([
       {
-        id: "task-1",
+        id: TASK_1,
         projectId: "p1",
         title: "Fix the build",
         status: "To Do",
@@ -1639,7 +2012,7 @@ describe("Agent", () => {
         attachments: [],
       },
       {
-        id: "task-2",
+        id: TASK_2,
         projectId: "p2",
         title: "Other project task",
         status: "To Do",
@@ -1648,7 +2021,7 @@ describe("Agent", () => {
         attachments: [],
       },
       {
-        id: "task-3",
+        id: TASK_3,
         projectId: "p1",
         title: "Wrong status",
         status: "In Progress",
@@ -1680,20 +2053,20 @@ describe("Agent", () => {
 
     expect(mockQoder.performTask).toHaveBeenCalledTimes(1);
     expect(mockQoder.performTask).toHaveBeenCalledWith(
-      expect.objectContaining({ id: "task-1" }),
+      expect.objectContaining({ id: TASK_1 }),
       expect.any(String),
       expect.anything(),
     );
     expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith(
-      "task-1",
+      TASK_1,
       "In Review",
     );
     expect(mockPlanner.updateTaskStatus).not.toHaveBeenCalledWith(
-      "task-2",
+      TASK_2,
       expect.anything(),
     );
     expect(mockPlanner.updateTaskStatus).not.toHaveBeenCalledWith(
-      "task-3",
+      TASK_3,
       expect.anything(),
     );
     agent.stop();
@@ -1705,7 +2078,7 @@ describe("Agent", () => {
     ]);
     mockPlanner.listAssignedTasks.mockResolvedValue([
       {
-        id: "task-1",
+        id: TASK_1,
         projectId: "p-deleted",
         title: "Fix the build",
         status: "To Do",
@@ -1746,7 +2119,7 @@ describe("Agent", () => {
     ]);
     mockPlanner.listAssignedTasks.mockResolvedValue([
       {
-        id: "task-1",
+        id: TASK_1,
         projectId: "p1",
         title: "Fix the build",
         status: "To Do",
@@ -1755,7 +2128,7 @@ describe("Agent", () => {
         attachments: [],
       },
       {
-        id: "task-2",
+        id: TASK_2,
         projectId: "p2",
         title: "Other project task",
         status: "To Do",
@@ -1787,16 +2160,16 @@ describe("Agent", () => {
 
     expect(mockQoder.performTask).toHaveBeenCalledTimes(1);
     expect(mockQoder.performTask).toHaveBeenCalledWith(
-      expect.objectContaining({ id: "task-1" }),
+      expect.objectContaining({ id: TASK_1 }),
       expect.any(String),
       expect.anything(),
     );
     expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith(
-      "task-1",
+      TASK_1,
       "In Review",
     );
     expect(mockPlanner.updateTaskStatus).not.toHaveBeenCalledWith(
-      "task-2",
+      TASK_2,
       expect.anything(),
     );
     agent.stop();
@@ -1808,7 +2181,7 @@ describe("Agent", () => {
     ]);
     mockPlanner.listAssignedTasks.mockResolvedValue([
       {
-        id: "task-1",
+        id: TASK_1,
         projectId: "p-deleted",
         title: "Fix the build",
         status: "To Do",
@@ -1848,7 +2221,7 @@ describe("Agent", () => {
     ]);
     mockPlanner.listAssignedTasks.mockResolvedValue([
       {
-        id: "task-1",
+        id: TASK_1,
         projectId: "p1",
         title: "Fix the build",
         status: "To Do",
@@ -1895,7 +2268,7 @@ describe("Agent", () => {
     ]);
     mockPlanner.listAssignedTasks.mockResolvedValue([
       {
-        id: "task-1",
+        id: TASK_1,
         projectId: "p1",
         title: "Fix the build",
         status: "To Do",
@@ -1939,7 +2312,7 @@ describe("Agent", () => {
     ]);
     mockPlanner.listAssignedTasks.mockResolvedValue([
       {
-        id: "task-1",
+        id: TASK_1,
         projectId: "p1",
         title: "Fix the build",
         status: "To Do",
@@ -1982,7 +2355,7 @@ describe("Agent", () => {
     config.AGENT_START_COMMENT = true;
     mockPlanner.listAssignedTasks.mockResolvedValue([
       {
-        id: "task-1",
+        id: TASK_1,
         title: "Implement feature",
         status: "To Do",
         description: "Add a feature",
@@ -2004,14 +2377,14 @@ describe("Agent", () => {
     await waitFor(() => mockQoder.performTask.mock.calls.length === 1);
     expect(mockPlanner.addTaskComment).toHaveBeenCalledTimes(1);
     expect(mockPlanner.addTaskComment).toHaveBeenCalledWith(
-      "task-1",
+      TASK_1,
       "Agent 'test-agent' started working on this task.",
     );
 
     resolveTask("Feature implemented");
     await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
     expect(mockPlanner.addTaskComment).toHaveBeenCalledWith(
-      "task-1",
+      TASK_1,
       "Feature implemented",
     );
     agent.stop();
@@ -2021,7 +2394,7 @@ describe("Agent", () => {
     config.AGENT_START_COMMENT = true;
     mockPlanner.listAssignedTasks.mockResolvedValue([
       {
-        id: "task-1",
+        id: TASK_1,
         title: "Implement feature",
         status: "To Do",
         description: "Add a feature",
@@ -2040,13 +2413,13 @@ describe("Agent", () => {
 
     expect(mockQoder.performTask).toHaveBeenCalledTimes(1);
     expect(mockPlanner.addTaskComment).toHaveBeenCalledWith(
-      "task-1",
+      TASK_1,
       "Feature implemented",
     );
-    expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith("task-1", "Done");
+    expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith(TASK_1, "Done");
     expect(console.log).toHaveBeenCalledWith(
       expect.stringContaining(
-        "Failed to post the start notification for task 'Implement feature' (task-1)",
+        `Failed to post the start notification for task 'Implement feature' (${TASK_1})`,
       ),
     );
     agent.stop();
@@ -2058,7 +2431,7 @@ describe("Agent", () => {
     ]);
     mockPlanner.listAssignedTasks.mockResolvedValue([
       {
-        id: "task-1",
+        id: TASK_1,
         projectId: "p1",
         title: "Implement feature",
         status: "To Do",
@@ -2102,7 +2475,7 @@ describe("Agent", () => {
     ]);
     mockPlanner.listAssignedTasks.mockResolvedValue([
       {
-        id: "task-1",
+        id: TASK_1,
         projectId: "p1",
         title: "Implement feature",
         status: "To Do",
@@ -2147,7 +2520,7 @@ describe("Agent", () => {
     ]);
     mockPlanner.listAssignedTasks.mockResolvedValue([
       {
-        id: "task-1",
+        id: TASK_1,
         projectId: "p1",
         title: "Implement feature",
         status: "To Do",
@@ -2188,7 +2561,7 @@ describe("Agent", () => {
   it("should fetch the projects when a task is processed so the notes carry the project info", async () => {
     mockPlanner.listAssignedTasks.mockResolvedValue([
       {
-        id: "task-1",
+        id: TASK_1,
         projectId: "p1",
         title: "Fix the build",
         status: "To Do",
@@ -2215,7 +2588,7 @@ describe("Agent", () => {
     const resolvers: ((value: string) => void)[] = [];
     mockPlannerTasks([
       {
-        id: "task-low",
+        id: TASK_LOW,
         title: "Low priority task",
         status: "To Do",
         description: "",
@@ -2224,7 +2597,7 @@ describe("Agent", () => {
         priority: "low",
       },
       {
-        id: "task-high",
+        id: TASK_HIGH,
         title: "High priority task",
         status: "To Do",
         description: "",
@@ -2233,7 +2606,7 @@ describe("Agent", () => {
         priority: "high",
       },
       {
-        id: "task-medium",
+        id: TASK_MEDIUM,
         title: "Medium priority task",
         status: "To Do",
         description: "",
@@ -2253,7 +2626,7 @@ describe("Agent", () => {
     agent.start();
     await waitFor(() => mockQoder.performTask.mock.calls.length === 1);
     expect(mockQoder.performTask).toHaveBeenCalledWith(
-      expect.objectContaining({ id: "task-high" }),
+      expect.objectContaining({ id: TASK_HIGH }),
       expect.any(String),
       expect.anything(),
     );
@@ -2261,7 +2634,7 @@ describe("Agent", () => {
     resolvers[0]("High done");
     await waitFor(() => mockQoder.performTask.mock.calls.length === 2);
     expect(mockQoder.performTask).toHaveBeenCalledWith(
-      expect.objectContaining({ id: "task-medium" }),
+      expect.objectContaining({ id: TASK_MEDIUM }),
       expect.any(String),
       expect.anything(),
     );
@@ -2269,7 +2642,7 @@ describe("Agent", () => {
     resolvers[1]("Medium done");
     await waitFor(() => mockQoder.performTask.mock.calls.length === 3);
     expect(mockQoder.performTask).toHaveBeenCalledWith(
-      expect.objectContaining({ id: "task-low" }),
+      expect.objectContaining({ id: TASK_LOW }),
       expect.any(String),
       expect.anything(),
     );
@@ -2283,7 +2656,7 @@ describe("Agent", () => {
     const resolvers: ((value: string) => void)[] = [];
     mockPlannerTasks([
       {
-        id: "task-newest",
+        id: TASK_NEWEST,
         title: "Newest task",
         status: "To Do",
         description: "",
@@ -2293,7 +2666,7 @@ describe("Agent", () => {
         dateUpdated: "2026-09-10T00:00:00.000Z",
       },
       {
-        id: "task-oldest",
+        id: TASK_OLDEST,
         title: "Oldest task",
         status: "To Do",
         description: "",
@@ -2303,7 +2676,7 @@ describe("Agent", () => {
         dateUpdated: "2026-09-01T00:00:00.000Z",
       },
       {
-        id: "task-middle",
+        id: TASK_MIDDLE,
         title: "Middle task",
         status: "To Do",
         description: "",
@@ -2324,7 +2697,7 @@ describe("Agent", () => {
     agent.start();
     await waitFor(() => mockQoder.performTask.mock.calls.length === 1);
     expect(mockQoder.performTask).toHaveBeenCalledWith(
-      expect.objectContaining({ id: "task-oldest" }),
+      expect.objectContaining({ id: TASK_OLDEST }),
       expect.any(String),
       expect.anything(),
     );
@@ -2332,7 +2705,7 @@ describe("Agent", () => {
     resolvers[0]("Oldest done");
     await waitFor(() => mockQoder.performTask.mock.calls.length === 2);
     expect(mockQoder.performTask).toHaveBeenCalledWith(
-      expect.objectContaining({ id: "task-middle" }),
+      expect.objectContaining({ id: TASK_MIDDLE }),
       expect.any(String),
       expect.anything(),
     );
@@ -2340,7 +2713,7 @@ describe("Agent", () => {
     resolvers[1]("Middle done");
     await waitFor(() => mockQoder.performTask.mock.calls.length === 3);
     expect(mockQoder.performTask).toHaveBeenCalledWith(
-      expect.objectContaining({ id: "task-newest" }),
+      expect.objectContaining({ id: TASK_NEWEST }),
       expect.any(String),
       expect.anything(),
     );
@@ -2354,7 +2727,7 @@ describe("Agent", () => {
     const resolvers: ((value: string) => void)[] = [];
     mockPlannerTasks([
       {
-        id: "task-low",
+        id: TASK_LOW,
         title: "Low priority task",
         status: "To Do",
         description: "",
@@ -2363,7 +2736,7 @@ describe("Agent", () => {
         priority: "low",
       },
       {
-        id: "task-unknown",
+        id: TASK_UNKNOWN,
         title: "Unknown priority task",
         status: "To Do",
         description: "",
@@ -2383,7 +2756,7 @@ describe("Agent", () => {
     agent.start();
     await waitFor(() => mockQoder.performTask.mock.calls.length === 1);
     expect(mockQoder.performTask).toHaveBeenCalledWith(
-      expect.objectContaining({ id: "task-unknown" }),
+      expect.objectContaining({ id: TASK_UNKNOWN }),
       expect.any(String),
       expect.anything(),
     );
@@ -2391,7 +2764,7 @@ describe("Agent", () => {
     resolvers[0]("Unknown done");
     await waitFor(() => mockQoder.performTask.mock.calls.length === 2);
     expect(mockQoder.performTask).toHaveBeenCalledWith(
-      expect.objectContaining({ id: "task-low" }),
+      expect.objectContaining({ id: TASK_LOW }),
       expect.any(String),
       expect.anything(),
     );
@@ -2409,7 +2782,7 @@ describe("Agent", () => {
     ]);
     mockPlannerTasks([
       {
-        id: "task-alpha-low",
+        id: TASK_ALPHA_LOW,
         projectId: "p1",
         title: "Low priority task of a high-priority action",
         status: "To Do",
@@ -2419,7 +2792,7 @@ describe("Agent", () => {
         priority: "low",
       },
       {
-        id: "task-beta-high",
+        id: TASK_BETA_HIGH,
         projectId: "p2",
         title: "High priority task of a default action",
         status: "To Do",
@@ -2466,7 +2839,7 @@ describe("Agent", () => {
     agent.start();
     await waitFor(() => mockQoder.performTask.mock.calls.length === 1);
     expect(mockQoder.performTask).toHaveBeenCalledWith(
-      expect.objectContaining({ id: "task-alpha-low" }),
+      expect.objectContaining({ id: TASK_ALPHA_LOW }),
       expect.any(String),
       expect.anything(),
     );
@@ -2474,7 +2847,7 @@ describe("Agent", () => {
     resolvers[0]("Alpha done");
     await waitFor(() => mockQoder.performTask.mock.calls.length === 2);
     expect(mockQoder.performTask).toHaveBeenCalledWith(
-      expect.objectContaining({ id: "task-beta-high" }),
+      expect.objectContaining({ id: TASK_BETA_HIGH }),
       expect.any(String),
       expect.anything(),
     );
@@ -2492,7 +2865,7 @@ describe("Agent", () => {
     ]);
     mockPlannerTasks([
       {
-        id: "task-gamma-high",
+        id: TASK_GAMMA_HIGH,
         projectId: "p1",
         title: "High priority task of a low-priority action",
         status: "To Do",
@@ -2502,7 +2875,7 @@ describe("Agent", () => {
         priority: "high",
       },
       {
-        id: "task-delta-medium",
+        id: TASK_DELTA_MEDIUM,
         projectId: "p2",
         title: "Medium priority task of a default action",
         status: "To Do",
@@ -2549,7 +2922,7 @@ describe("Agent", () => {
     agent.start();
     await waitFor(() => mockQoder.performTask.mock.calls.length === 1);
     expect(mockQoder.performTask).toHaveBeenCalledWith(
-      expect.objectContaining({ id: "task-delta-medium" }),
+      expect.objectContaining({ id: TASK_DELTA_MEDIUM }),
       expect.any(String),
       expect.anything(),
     );
@@ -2557,7 +2930,7 @@ describe("Agent", () => {
     resolvers[0]("Delta done");
     await waitFor(() => mockQoder.performTask.mock.calls.length === 2);
     expect(mockQoder.performTask).toHaveBeenCalledWith(
-      expect.objectContaining({ id: "task-gamma-high" }),
+      expect.objectContaining({ id: TASK_GAMMA_HIGH }),
       expect.any(String),
       expect.anything(),
     );
@@ -2574,7 +2947,7 @@ describe("Agent", () => {
     ]);
     mockPlannerTasks([
       {
-        id: "task-newest",
+        id: TASK_NEWEST,
         projectId: "p1",
         title: "Newest task",
         status: "To Do",
@@ -2585,7 +2958,7 @@ describe("Agent", () => {
         dateUpdated: "2026-09-10T00:00:00.000Z",
       },
       {
-        id: "task-oldest",
+        id: TASK_OLDEST,
         projectId: "p1",
         title: "Oldest task",
         status: "To Do",
@@ -2623,7 +2996,7 @@ describe("Agent", () => {
     agent.start();
     await waitFor(() => mockQoder.performTask.mock.calls.length === 1);
     expect(mockQoder.performTask).toHaveBeenCalledWith(
-      expect.objectContaining({ id: "task-oldest" }),
+      expect.objectContaining({ id: TASK_OLDEST }),
       expect.any(String),
       expect.anything(),
     );
@@ -2631,7 +3004,7 @@ describe("Agent", () => {
     resolvers[0]("Oldest done");
     await waitFor(() => mockQoder.performTask.mock.calls.length === 2);
     expect(mockQoder.performTask).toHaveBeenCalledWith(
-      expect.objectContaining({ id: "task-newest" }),
+      expect.objectContaining({ id: TASK_NEWEST }),
       expect.any(String),
       expect.anything(),
     );
@@ -2651,7 +3024,7 @@ describe("Agent", () => {
     ]);
     mockPlanner.listAssignedTasks.mockResolvedValue([
       {
-        id: "task-1",
+        id: TASK_1,
         projectId: "p1",
         title: "Fix the build",
         status: "To Do",
@@ -2667,7 +3040,7 @@ describe("Agent", () => {
     await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
 
     const content = await fse.readFile(
-      path.join(dataDir, "tasks", "task-1-Agent.md"),
+      path.join(dataDir, "tasks", `${TASK_1}-Agent.md`),
       "utf8",
     );
     expect(content).toContain("- **Project**: Web");
@@ -2683,7 +3056,7 @@ describe("Agent", () => {
     ]);
     mockPlanner.listAssignedTasks.mockResolvedValue([
       {
-        id: "task-1",
+        id: TASK_1,
         projectId: "p1",
         title: "Fix the build",
         status: "To Do",
@@ -2699,7 +3072,7 @@ describe("Agent", () => {
     await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
 
     const content = await fse.readFile(
-      path.join(dataDir, "tasks", "task-1-Agent.md"),
+      path.join(dataDir, "tasks", `${TASK_1}-Agent.md`),
       "utf8",
     );
     expect(content).toContain("- **Project**: Web");
@@ -2710,7 +3083,7 @@ describe("Agent", () => {
   it("should not process any task without an actions configuration", async () => {
     mockPlanner.listAssignedTasks.mockResolvedValue([
       {
-        id: "task-1",
+        id: TASK_1,
         title: "Fix the build",
         status: "To Do",
         description: "",
@@ -2748,7 +3121,7 @@ describe("Agent", () => {
     };
     mockPlannerTasks([
       {
-        id: "task-1",
+        id: TASK_1,
         title: "Implement feature",
         status: "To Do",
         description: "",
@@ -2756,7 +3129,7 @@ describe("Agent", () => {
         attachments: [],
       },
       {
-        id: "task-2",
+        id: TASK_2,
         title: "Fix the bug",
         status: "Backlog",
         description: "",
@@ -2769,7 +3142,7 @@ describe("Agent", () => {
     const agent = createAgent(actions);
     agent.start();
     await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
-    expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith("task-1", "Done");
+    expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith(TASK_1, "Done");
 
     // The actions object is updated in place, as AgentActionsManager does on
     // a configuration change: the next poll uses the new actions.
@@ -2791,7 +3164,7 @@ describe("Agent", () => {
       4000,
     );
     expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith(
-      "task-2",
+      TASK_2,
       "Archived",
     );
     agent.stop();
@@ -2803,7 +3176,7 @@ describe("Agent", () => {
     const resolvers: ((value: string) => void)[] = [];
     mockPlannerTasks([
       {
-        id: "task-a",
+        id: TASK_A,
         title: "Heavy task",
         status: "To Do",
         description: "agent-weight: 1\nDo the heavy work",
@@ -2811,7 +3184,7 @@ describe("Agent", () => {
         attachments: [],
       },
       {
-        id: "task-b",
+        id: TASK_B,
         title: "Small task",
         status: "To Do",
         description: "agent-weight: 0.5\nDo a small fix",
@@ -2819,7 +3192,7 @@ describe("Agent", () => {
         attachments: [],
       },
       {
-        id: "task-c",
+        id: TASK_C,
         title: "Overflowing task",
         status: "To Do",
         description: "agent-weight: 0.5\nWould exceed the budget",
@@ -2842,12 +3215,12 @@ describe("Agent", () => {
     await new Promise((resolve) => setTimeout(resolve, 1200));
     expect(mockQoder.performTask).toHaveBeenCalledTimes(2);
     expect(mockQoder.performTask).toHaveBeenCalledWith(
-      expect.objectContaining({ id: "task-a" }),
+      expect.objectContaining({ id: TASK_A }),
       expect.any(String),
       expect.anything(),
     );
     expect(mockQoder.performTask).toHaveBeenCalledWith(
-      expect.objectContaining({ id: "task-b" }),
+      expect.objectContaining({ id: TASK_B }),
       expect.any(String),
       expect.anything(),
     );
@@ -2873,7 +3246,7 @@ describe("Agent", () => {
     );
     mockPlannerTasks(
       [1, 2, 3, 4, 5, 6].map((n) => ({
-        id: `task-${n}`,
+        id: `a1000000-0000-4000-8000-00000000000${n}`,
         title: `Small task ${n}`,
         status: "To Do",
         description: "Hint-less work",
@@ -2925,7 +3298,7 @@ describe("Agent", () => {
     ]);
     mockPlannerTasks([
       {
-        id: "task-1",
+        id: TASK_1,
         projectId: "p1",
         title: "Web migration",
         status: "To Do",
@@ -2935,7 +3308,7 @@ describe("Agent", () => {
         attachments: [],
       },
       {
-        id: "task-2",
+        id: TASK_2,
         projectId: "p1",
         title: "Web follow-up",
         status: "To Do",
@@ -2944,7 +3317,7 @@ describe("Agent", () => {
         attachments: [],
       },
       {
-        id: "task-3",
+        id: TASK_3,
         projectId: "p1",
         title: "API fix",
         status: "To Do",
@@ -2979,12 +3352,12 @@ describe("Agent", () => {
     // round (no head-of-line blocking).
     await waitFor(() => mockQoder.performTask.mock.calls.length === 2);
     expect(mockQoder.performTask).toHaveBeenCalledWith(
-      expect.objectContaining({ id: "task-1" }),
+      expect.objectContaining({ id: TASK_1 }),
       expect.any(String),
       expect.anything(),
     );
     expect(mockQoder.performTask).toHaveBeenCalledWith(
-      expect.objectContaining({ id: "task-3" }),
+      expect.objectContaining({ id: TASK_3 }),
       expect.any(String),
       expect.anything(),
     );
@@ -2998,24 +3371,24 @@ describe("Agent", () => {
 
     // Round 2: the API task completes, but the migration still claims
     // 'repo:acme/web' while running, so the follow-up stays deferred.
-    resolveTask("task-3", "API fix done");
+    resolveTask(TASK_3, "API fix done");
     await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length === 1);
     await new Promise((resolve) => setTimeout(resolve, 1300));
     expect(mockQoder.performTask).toHaveBeenCalledTimes(2);
 
     // Round 3: the migration completes and releases the lock; the follow-up
     // is finally picked.
-    resolveTask("task-1", "Web migration done");
+    resolveTask(TASK_1, "Web migration done");
     await waitFor(
       () => mockQoder.performTask.mock.calls.length === 3,
       5000,
     );
     expect(mockQoder.performTask).toHaveBeenCalledWith(
-      expect.objectContaining({ id: "task-2" }),
+      expect.objectContaining({ id: TASK_2 }),
       expect.any(String),
       expect.anything(),
     );
-    resolveTask("task-2", "Web follow-up done");
+    resolveTask(TASK_2, "Web follow-up done");
     agent.stop();
   });
 
@@ -3025,7 +3398,7 @@ describe("Agent", () => {
     config.AGENT_UTILITY_MODEL = "utility-model";
     mockPlannerTasks([
       {
-        id: "task-1",
+        id: TASK_1,
         title: "Refactor the service",
         status: "To Do",
         description: "Refactor the billing service",
@@ -3033,7 +3406,7 @@ describe("Agent", () => {
         attachments: [],
       },
       {
-        id: "task-2",
+        id: TASK_2,
         title: "Update the billing docs",
         status: "To Do",
         description: "Update the documentation of the billing service",
@@ -3095,7 +3468,7 @@ describe("Agent", () => {
     config.TASK_MAX_PARALLEL = 2;
     mockPlannerTasks([
       {
-        id: "task-1",
+        id: TASK_1,
         title: "Plain task",
         status: "To Do",
         description: "No hints at all",
@@ -3122,7 +3495,7 @@ describe("Agent", () => {
     const resolvers: ((value: string) => void)[] = [];
     mockPlannerTasks([
       {
-        id: "task-1",
+        id: TASK_1,
         title: "Locked task",
         status: "To Do",
         description: "agent-lock: repo:acme/web\nFirst work",
@@ -3130,7 +3503,7 @@ describe("Agent", () => {
         attachments: [],
       },
       {
-        id: "task-2",
+        id: TASK_2,
         title: "Conflicting task",
         status: "To Do",
         description: "agent-lock: repo:acme/web\nSecond work",
@@ -3151,12 +3524,12 @@ describe("Agent", () => {
     // share a lock and the utility model is never consulted.
     await waitFor(() => mockQoder.performTask.mock.calls.length === 2);
     expect(mockQoder.performTask).toHaveBeenCalledWith(
-      expect.objectContaining({ id: "task-1" }),
+      expect.objectContaining({ id: TASK_1 }),
       expect.any(String),
       expect.anything(),
     );
     expect(mockQoder.performTask).toHaveBeenCalledWith(
-      expect.objectContaining({ id: "task-2" }),
+      expect.objectContaining({ id: TASK_2 }),
       expect.any(String),
       expect.anything(),
     );
@@ -3169,7 +3542,7 @@ describe("Agent", () => {
     config.TASK_STATUS_CLEANUP = "Archived";
     mockPlannerTasks([
       {
-        id: "task-1",
+        id: TASK_1,
         title: "Implement feature",
         status: "To Do",
         description: "Add a feature",
@@ -3183,7 +3556,7 @@ describe("Agent", () => {
     agent.start();
     await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
 
-    const taskDir = path.join(dataDir, "tasks", "task-1");
+    const taskDir = path.join(dataDir, "tasks", TASK_1);
     expect(mockQoder.performTask).toHaveBeenCalledWith(
       expect.anything(),
       expect.any(String),
@@ -3199,7 +3572,7 @@ describe("Agent", () => {
     const resolvers: ((value: string) => void)[] = [];
     mockPlannerTasks([
       {
-        id: "task-1",
+        id: TASK_1,
         title: "Small task",
         status: "To Do",
         description: "agent-weight: 0.5\nSmall work",
@@ -3207,7 +3580,7 @@ describe("Agent", () => {
         attachments: [],
       },
       {
-        id: "task-2",
+        id: TASK_2,
         title: "Large task",
         status: "To Do",
         description: "agent-weight: 1\nLarge work",
@@ -3271,7 +3644,7 @@ describe("Agent", () => {
     );
     mockPlannerTasks([
       {
-        id: "task-1",
+        id: TASK_1,
         title: "Single task",
         status: "To Do",
         description: "",
@@ -3304,7 +3677,7 @@ describe("Agent", () => {
     // again by a later poll while the assertions run.
     mockPlannerTasks([
       {
-        id: "task-1",
+        id: TASK_1,
         title: "Implement feature",
         status: "To Do",
         description: "Add a feature",
@@ -3323,17 +3696,17 @@ describe("Agent", () => {
     expect(mockQoder.performTask).toHaveBeenCalledTimes(1);
     expect(mockPlanner.getTask).toHaveBeenCalledTimes(1);
     expect(mockPlanner.addTaskComment).toHaveBeenCalledWith(
-      "task-1",
+      TASK_1,
       "Feature implemented",
     );
     expect(mockPlanner.updateTaskStatus).toHaveBeenCalledTimes(1);
-    expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith("task-1", "Done");
+    expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith(TASK_1, "Done");
     agent.stop();
   });
 
   it("should re-run the CLI with the new comments before finalizing when a human comments during the run", async () => {
     config.TASK_STATUS_CLEANUP = "Archived";
-    const notesFile = path.join(dataDir, "tasks", "task-1-Agent.md");
+    const notesFile = path.join(dataDir, "tasks", `${TASK_1}-Agent.md`);
     await fse.ensureDir(path.dirname(notesFile));
     await fse.writeFile(
       notesFile,
@@ -3349,7 +3722,7 @@ describe("Agent", () => {
     );
     mockPlanner.listAssignedTasks.mockResolvedValue([
       {
-        id: "task-1",
+        id: TASK_1,
         title: "Implement feature",
         status: "To Do",
         description: "Add a feature",
@@ -3367,7 +3740,7 @@ describe("Agent", () => {
     ]);
     // A human comment arrives while the CLI runs: the fresh fetch sees it.
     mockPlanner.getTask.mockResolvedValue({
-      id: "task-1",
+      id: TASK_1,
       projectId: "",
       title: "Implement feature",
       status: "To Do",
@@ -3415,18 +3788,18 @@ describe("Agent", () => {
     expect(content).toContain("Please also update the docs");
     expect(content).toContain("Notes from a previous run");
     expect(mockPlanner.addTaskComment).toHaveBeenCalledWith(
-      "task-1",
+      TASK_1,
       "Adjusted summary",
     );
     expect(mockPlanner.updateTaskStatus).toHaveBeenCalledTimes(1);
-    expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith("task-1", "Done");
+    expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith(TASK_1, "Done");
     agent.stop();
   });
 
   it("should not count the agent's own comments as new messages", async () => {
     mockPlanner.listAssignedTasks.mockResolvedValue([
       {
-        id: "task-1",
+        id: TASK_1,
         title: "Implement feature",
         status: "To Do",
         description: "Add a feature",
@@ -3436,7 +3809,7 @@ describe("Agent", () => {
     ]);
     // The agent's start comment (its own Planner user) is the only new one.
     mockPlanner.getTask.mockResolvedValue({
-      id: "task-1",
+      id: TASK_1,
       projectId: "",
       title: "Implement feature",
       status: "To Do",
@@ -3463,7 +3836,7 @@ describe("Agent", () => {
 
     expect(mockQoder.performTask).toHaveBeenCalledTimes(1);
     expect(mockPlanner.addTaskComment).toHaveBeenCalledWith(
-      "task-1",
+      TASK_1,
       "Feature implemented",
     );
     agent.stop();
@@ -3472,7 +3845,7 @@ describe("Agent", () => {
   it("should finalize the task as-is when the new-comment check fails", async () => {
     mockPlanner.listAssignedTasks.mockResolvedValue([
       {
-        id: "task-1",
+        id: TASK_1,
         title: "Implement feature",
         status: "To Do",
         description: "Add a feature",
@@ -3482,7 +3855,7 @@ describe("Agent", () => {
     ]);
     mockPlanner.getTask.mockRejectedValue(
       new Error(
-        "Planner request to '/api/tasks/task-1' failed with status 500",
+        `Planner request to '/api/tasks/${TASK_1}' failed with status 500`,
       ),
     );
     mockQoder.performTask.mockResolvedValue("Feature implemented");
@@ -3493,14 +3866,14 @@ describe("Agent", () => {
 
     expect(mockQoder.performTask).toHaveBeenCalledTimes(1);
     expect(mockPlanner.addTaskComment).toHaveBeenCalledWith(
-      "task-1",
+      TASK_1,
       "Feature implemented",
     );
-    expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith("task-1", "Done");
+    expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith(TASK_1, "Done");
     expect(
       logSpy.mock.calls.some((call) =>
         String(call[0]).includes(
-          "Failed to check task 'Implement feature' (task-1) for new comments",
+          `Failed to check task 'Implement feature' (${TASK_1}) for new comments`,
         ),
       ),
     ).toBe(true);
@@ -3513,7 +3886,7 @@ describe("Agent", () => {
     // again by a later poll while the assertions run.
     mockPlannerTasks([
       {
-        id: "task-1",
+        id: TASK_1,
         title: "Implement feature",
         status: "To Do",
         description: "Add a feature",
@@ -3526,7 +3899,7 @@ describe("Agent", () => {
     mockPlanner.getTask.mockImplementation(async () => {
       fetchRound++;
       return {
-        id: "task-1",
+        id: TASK_1,
         projectId: "",
         title: "Implement feature",
         status: "To Do",
@@ -3560,7 +3933,7 @@ describe("Agent", () => {
     expect(mockQoder.performTask).toHaveBeenCalledTimes(3);
     expect(mockPlanner.getTask).toHaveBeenCalledTimes(3);
     expect(mockPlanner.addTaskComment).toHaveBeenCalledWith(
-      "task-1",
+      TASK_1,
       "Summary after call 3",
     );
     expect(
@@ -3577,7 +3950,7 @@ describe("Agent", () => {
     // again by a later poll while the assertions run.
     mockPlannerTasks([
       {
-        id: "task-1",
+        id: TASK_1,
         title: "Implement feature",
         status: "To Do",
         description: "Add a feature",
@@ -3586,7 +3959,7 @@ describe("Agent", () => {
       },
     ]);
     mockPlanner.getTask.mockResolvedValue({
-      id: "task-1",
+      id: TASK_1,
       projectId: "",
       title: "Implement feature",
       status: "To Do",
@@ -3616,7 +3989,7 @@ describe("Agent", () => {
     expect(mockQoder.performTask).toHaveBeenCalledTimes(1);
     expect(mockPlanner.getTask).toHaveBeenCalledTimes(1);
     expect(mockPlanner.addTaskComment).toHaveBeenCalledWith(
-      "task-1",
+      TASK_1,
       "Feature implemented",
     );
     expect(
@@ -3630,7 +4003,7 @@ describe("Agent", () => {
   it("should finalize with the last successful summary when an adjustment run fails", async () => {
     mockPlannerTasks([
       {
-        id: "task-1",
+        id: TASK_1,
         title: "Implement feature",
         status: "To Do",
         description: "Add a feature",
@@ -3639,7 +4012,7 @@ describe("Agent", () => {
       },
     ]);
     mockPlanner.getTask.mockResolvedValue({
-      id: "task-1",
+      id: TASK_1,
       projectId: "",
       title: "Implement feature",
       status: "To Do",
@@ -3670,7 +4043,7 @@ describe("Agent", () => {
     // summary is posted with a note, and the task reaches its end status.
     expect(mockQoder.performTask).toHaveBeenCalledTimes(2);
     const comments = mockPlanner.addTaskComment.mock.calls
-      .filter((call) => call[0] === "task-1")
+      .filter((call) => call[0] === TASK_1)
       .map((call) => String(call[1]));
     expect(comments).toHaveLength(1);
     expect(comments[0]).toContain("First run summary");
@@ -3678,14 +4051,14 @@ describe("Agent", () => {
     expect(
       comments.some((text) => text.includes("Task processing failed:")),
     ).toBe(false);
-    expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith("task-1", "Done");
+    expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith(TASK_1, "Done");
     agent.stop();
   });
 
   it("should finalize with the last successful summary when an adjustment run times out", async () => {
     mockPlannerTasks([
       {
-        id: "task-1",
+        id: TASK_1,
         title: "Implement feature",
         status: "To Do",
         description: "Add a feature",
@@ -3694,7 +4067,7 @@ describe("Agent", () => {
       },
     ]);
     mockPlanner.getTask.mockResolvedValue({
-      id: "task-1",
+      id: TASK_1,
       projectId: "",
       title: "Implement feature",
       status: "To Do",
@@ -3725,11 +4098,11 @@ describe("Agent", () => {
 
     expect(mockQoder.performTask).toHaveBeenCalledTimes(2);
     expect(mockPlanner.addTaskComment).toHaveBeenCalledWith(
-      "task-1",
+      TASK_1,
       expect.stringContaining("First run summary"),
     );
     expect(mockPlanner.addTaskComment).toHaveBeenCalledWith(
-      "task-1",
+      TASK_1,
       expect.stringContaining("an adjustment round failed"),
     );
     expect(
@@ -3737,7 +4110,7 @@ describe("Agent", () => {
         String(call[0]).includes("adjustment round 1/2 failed"),
       ),
     ).toBe(true);
-    expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith("task-1", "Done");
+    expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith(TASK_1, "Done");
     agent.stop();
   });
 
@@ -3745,7 +4118,7 @@ describe("Agent", () => {
     config.TASK_ADJUSTMENT_MAX_ROUNDS = 2;
     mockPlannerTasks([
       {
-        id: "task-1",
+        id: TASK_1,
         title: "Implement feature",
         status: "To Do",
         description: "Add a feature",
@@ -3764,17 +4137,17 @@ describe("Agent", () => {
     expect(mockQoder.performTask).toHaveBeenCalledTimes(1);
     expect(mockPlanner.getTask).not.toHaveBeenCalled();
     expect(mockPlanner.addTaskComment).toHaveBeenCalledWith(
-      "task-1",
+      TASK_1,
       expect.stringContaining("Task processing failed:"),
     );
-    expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith("task-1", "Done");
+    expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith(TASK_1, "Done");
     agent.stop();
   });
 
   it("should still abort when an adjustment run is aborted", async () => {
     mockPlannerTasks([
       {
-        id: "task-1",
+        id: TASK_1,
         title: "Implement feature",
         status: "To Do",
         description: "Add a feature",
@@ -3783,7 +4156,7 @@ describe("Agent", () => {
       },
     ]);
     mockPlanner.getTask.mockResolvedValue({
-      id: "task-1",
+      id: TASK_1,
       projectId: "",
       title: "Implement feature",
       status: "To Do",
@@ -3830,7 +4203,7 @@ describe("Agent", () => {
     expect(mockQoder.performTask).toHaveBeenCalledTimes(2);
     expect(mockPlanner.addTaskComment).toHaveBeenCalledTimes(1);
     expect(mockPlanner.updateTaskStatus).not.toHaveBeenCalled();
-    expect(store.has("task-1")).toBe(false);
+    expect(store.has(TASK_1)).toBe(false);
     agent.stop();
   });
 
@@ -3838,7 +4211,7 @@ describe("Agent", () => {
     const store = new FinalizationStore({ retryBaseMs: 60000 });
     mockPlanner.listAssignedTasks.mockResolvedValue([
       {
-        id: "task-1",
+        id: TASK_1,
         title: "Implement feature",
         status: "To Do",
         description: "Add a feature",
@@ -3847,7 +4220,7 @@ describe("Agent", () => {
       },
     ]);
     mockPlanner.getTask.mockResolvedValue({
-      id: "task-1",
+      id: TASK_1,
       projectId: "",
       title: "Implement feature",
       status: "To Do",
@@ -3885,11 +4258,11 @@ describe("Agent", () => {
     const agent = createAgent(WILDCARD_ACTIONS, store);
     agent.start();
     await waitFor(
-      () => store.has("task-1") && store.get("task-1")!.attempts >= 1,
+      () => store.has(TASK_1) && store.get(TASK_1)!.attempts >= 1,
       5000,
     );
 
-    const record = store.get("task-1")!;
+    const record = store.get(TASK_1)!;
     expect(record.summary).toBe("Adjusted summary");
     expect(record.contentVersion).toBe("2026-10-15T01:00:00.000Z");
     agent.stop();
@@ -3901,7 +4274,7 @@ describe("Agent", () => {
     ]);
     mockPlanner.listAssignedTasks.mockResolvedValue([
       {
-        id: "task-1",
+        id: TASK_1,
         projectId: "p1",
         title: "Implement feature",
         status: "To Do",
@@ -3943,7 +4316,7 @@ describe("Agent", () => {
   it("should use the default in-progress status when the action has none", async () => {
     mockPlanner.listAssignedTasks.mockResolvedValue([
       {
-        id: "task-1",
+        id: TASK_1,
         title: "Implement feature",
         status: "To Do",
         description: "Add a feature",
@@ -3987,7 +4360,7 @@ describe("Agent", () => {
     ]);
     mockPlanner.listAssignedTasks.mockResolvedValue([
       {
-        id: "task-1",
+        id: TASK_1,
         projectId: "p1",
         title: "Implement feature",
         status: "To Do",
@@ -4025,14 +4398,14 @@ describe("Agent", () => {
       ),
     );
     expect(mockPlanner.updateTaskStatus).toHaveBeenCalledTimes(1);
-    expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith("task-1", "Done");
+    expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith(TASK_1, "Done");
     agent.stop();
   });
 
   it("should not fail the task when the in-progress transition fails", async () => {
     mockPlanner.listAssignedTasks.mockResolvedValue([
       {
-        id: "task-1",
+        id: TASK_1,
         title: "Implement feature",
         status: "To Do",
         description: "Add a feature",
@@ -4068,11 +4441,11 @@ describe("Agent", () => {
 
     expect(console.log).toHaveBeenCalledWith(
       expect.stringContaining(
-        "Failed to move task 'Implement feature' (task-1) to the in-progress status 'In Progress' (continuing)",
+        `Failed to move task 'Implement feature' (${TASK_1}) to the in-progress status 'In Progress' (continuing)`,
       ),
     );
     expect(mockQoder.performTask).toHaveBeenCalledTimes(1);
-    expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith("task-1", "Done");
+    expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith(TASK_1, "Done");
     agent.stop();
   });
 
@@ -4081,7 +4454,7 @@ describe("Agent", () => {
     config.AGENT_START_COMMENT = true;
     mockPlanner.listAssignedTasks.mockResolvedValue([
       {
-        id: "task-1",
+        id: TASK_1,
         title: "Implement feature",
         status: "To Do",
         description: "Add a feature",
@@ -4112,7 +4485,7 @@ describe("Agent", () => {
     await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
 
     expect(mockPlanner.addTaskComment).toHaveBeenCalledWith(
-      "task-1",
+      TASK_1,
       "Agent 'test-agent' started working on this task (model task-model).",
     );
     agent.stop();
@@ -4122,7 +4495,7 @@ describe("Agent", () => {
     config.TASK_PROGRESS_COMMENT_INTERVAL = 1;
     mockPlanner.listAssignedTasks.mockResolvedValue([
       {
-        id: "task-1",
+        id: TASK_1,
         title: "Implement feature",
         status: "To Do",
         description: "Add a feature",
@@ -4157,7 +4530,7 @@ describe("Agent", () => {
     resolveTask("Feature implemented");
     await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
     expect(mockPlanner.addTaskComment).toHaveBeenCalledWith(
-      "task-1",
+      TASK_1,
       "Feature implemented",
     );
     agent.stop();
@@ -4168,7 +4541,7 @@ describe("Agent", () => {
     const store = new FinalizationStore({ retryBaseMs: 60000 });
     const tasks = [
       {
-        id: "task-1",
+        id: TASK_1,
         title: "Implement feature",
         status: "To Do",
         description: "Add a feature",
@@ -4222,19 +4595,19 @@ describe("Agent", () => {
     );
 
     expect(mockPlanner.addTaskComment).toHaveBeenCalledWith(
-      "task-1",
+      TASK_1,
       expect.stringContaining("the task status was moved to 'Aborted' on Planner"),
     );
     // The user-set status is kept: no end status, no error status, no
     // finalization record (the CLI work is never re-run either way).
     expect(mockPlanner.updateTaskStatus).not.toHaveBeenCalled();
-    expect(store.has("task-1")).toBe(false);
+    expect(store.has(TASK_1)).toBe(false);
     agent.stop();
   });
 
   it("should post the summary but keep the user abort status when the task is aborted during finalization", async () => {
     const task = {
-      id: "task-1",
+      id: TASK_1,
       title: "Implement feature",
       status: "To Do",
       description: "Add a feature",
@@ -4260,19 +4633,19 @@ describe("Agent", () => {
 
     const agent = createAgent(actions, store);
     agent.start();
-    await waitFor(() => !store.has("task-1") && mockPlanner.addTaskComment.mock.calls.length > 0);
+    await waitFor(() => !store.has(TASK_1) && mockPlanner.addTaskComment.mock.calls.length > 0);
 
     // The aborted work is still reported, but the user-set status is kept:
     // no end status and no folder cleanup.
     expect(mockPlanner.addTaskComment).toHaveBeenCalledWith(
-      "task-1",
+      TASK_1,
       "Feature implemented",
     );
     expect(mockPlanner.updateTaskStatus).not.toHaveBeenCalled();
     await expect(
-      fse.pathExists(path.join(dataDir, "tasks", "task-1-Agent.md")),
+      fse.pathExists(path.join(dataDir, "tasks", `${TASK_1}-Agent.md`)),
     ).resolves.toBe(true);
-    expect(store.has("task-1")).toBe(false);
+    expect(store.has(TASK_1)).toBe(false);
     expect(console.log).toHaveBeenCalledWith(
       expect.stringContaining("is in its abort status 'Aborted'"),
     );
@@ -4282,7 +4655,7 @@ describe("Agent", () => {
   it("should keep the abort status on a finalization retry", async () => {
     config.TASK_POLLING_INTERVAL = 0.05;
     const task = {
-      id: "task-1",
+      id: TASK_1,
       title: "Implement feature",
       status: "To Do",
       description: "Add a feature",
@@ -4318,7 +4691,7 @@ describe("Agent", () => {
     const agent = createAgent(actions, store);
     agent.start();
     await waitFor(
-      () => summaryCommentAttempts === 2 && !store.has("task-1"),
+      () => summaryCommentAttempts === 2 && !store.has(TASK_1),
       5000,
     );
 
@@ -4326,7 +4699,7 @@ describe("Agent", () => {
     expect(mockQoder.performTask).toHaveBeenCalledTimes(1);
     expect(mockPlanner.updateTaskStatus).not.toHaveBeenCalled();
     await expect(
-      fse.pathExists(path.join(dataDir, "tasks", "task-1-Agent.md")),
+      fse.pathExists(path.join(dataDir, "tasks", `${TASK_1}-Agent.md`)),
     ).resolves.toBe(true);
     expect(console.log).toHaveBeenCalledWith(
       expect.stringContaining(
@@ -4338,7 +4711,7 @@ describe("Agent", () => {
 
   it("should schedule a retry when the abort-status re-fetch fails", async () => {
     const task = {
-      id: "task-1",
+      id: TASK_1,
       title: "Implement feature",
       status: "To Do",
       description: "Add a feature",
@@ -4377,23 +4750,23 @@ describe("Agent", () => {
     const agent = createAgent(actions, store);
     agent.start();
     await waitFor(
-      () => store.has("task-1") && store.get("task-1")!.attempts >= 1,
+      () => store.has(TASK_1) && store.get(TASK_1)!.attempts >= 1,
       5000,
     );
 
     // The failed re-fetch defers the decision to a retry: no status update
     // is attempted and the summary is not re-posted.
     expect(mockPlanner.updateTaskStatus).not.toHaveBeenCalled();
-    expect(store.get("task-1")?.commentPosted).toBe(true);
+    expect(store.get(TASK_1)?.commentPosted).toBe(true);
     await expect(
-      fse.pathExists(path.join(dataDir, "tasks", "task-1-Agent.md")),
+      fse.pathExists(path.join(dataDir, "tasks", `${TASK_1}-Agent.md`)),
     ).resolves.toBe(true);
     agent.stop();
   });
 
   it("should mark the task running and record the model, then clear the running label", async () => {
     const task = {
-      id: "task-1",
+      id: TASK_1,
       title: "Implement feature",
       status: "To Do",
       description: "Add a feature",
@@ -4420,12 +4793,12 @@ describe("Agent", () => {
       ["urgent", "model:qwen3.8-flash"],
     ]);
     // Atomic quiet mutations: add before the run, remove when it ends.
-    expect(mockPlanner.mutateTaskLabels).toHaveBeenCalledWith("task-1", {
+    expect(mockPlanner.mutateTaskLabels).toHaveBeenCalledWith(TASK_1, {
       add: ["agent:running", "model:qwen3.8-flash"],
       remove: [],
       quiet: true,
     });
-    expect(mockPlanner.mutateTaskLabels).toHaveBeenCalledWith("task-1", {
+    expect(mockPlanner.mutateTaskLabels).toHaveBeenCalledWith(TASK_1, {
       add: [],
       remove: ["agent:running"],
       quiet: true,
@@ -4436,17 +4809,17 @@ describe("Agent", () => {
     // The legacy start comment is off by default: only the summary is posted.
     expect(mockPlanner.addTaskComment).toHaveBeenCalledTimes(1);
     expect(mockPlanner.addTaskComment).toHaveBeenCalledWith(
-      "task-1",
+      TASK_1,
       "Feature implemented",
     );
-    expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith("task-1", "Done");
+    expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith(TASK_1, "Done");
     agent.stop();
   });
 
   it("should record the CLI agent label when a prefix is configured", async () => {
     config.TASK_CLI_LABEL_PREFIX = "agent:";
     const task = {
-      id: "task-1",
+      id: TASK_1,
       title: "Implement feature",
       status: "To Do",
       description: "Add a feature",
@@ -4467,7 +4840,7 @@ describe("Agent", () => {
 
   it("should remove the originally added running label after TASK_RUNNING_LABEL is hot-reloaded during a run", async () => {
     const task = {
-      id: "task-1",
+      id: TASK_1,
       title: "Implement feature",
       status: "To Do",
       description: "Add a feature",
@@ -4487,12 +4860,12 @@ describe("Agent", () => {
     // Only the label added at start is removed: the hot-reloaded value is
     // never removed from the task.
     expect(writes).toEqual([["agent:running"], []]);
-    expect(mockPlanner.mutateTaskLabels).toHaveBeenCalledWith("task-1", {
+    expect(mockPlanner.mutateTaskLabels).toHaveBeenCalledWith(TASK_1, {
       add: [],
       remove: ["agent:running"],
       quiet: true,
     });
-    expect(mockPlanner.mutateTaskLabels).not.toHaveBeenCalledWith("task-1", {
+    expect(mockPlanner.mutateTaskLabels).not.toHaveBeenCalledWith(TASK_1, {
       add: [],
       remove: ["agent:busy"],
       quiet: true,
@@ -4502,7 +4875,7 @@ describe("Agent", () => {
 
   it("should still remove the running label when TASK_LABELS is disabled during the run", async () => {
     const task = {
-      id: "task-1",
+      id: TASK_1,
       title: "Implement feature",
       status: "To Do",
       description: "Add a feature",
@@ -4525,7 +4898,7 @@ describe("Agent", () => {
 
   it("should skip a no-op label write when the running label is already set", async () => {
     const task = {
-      id: "task-1",
+      id: TASK_1,
       title: "Implement feature",
       status: "To Do",
       description: "Add a feature",
@@ -4553,7 +4926,7 @@ describe("Agent", () => {
 
   it("should fall back to a whole-list label replace on a Planner without the PATCH endpoint", async () => {
     const task = {
-      id: "task-1",
+      id: TASK_1,
       title: "Implement feature",
       status: "To Do",
       description: "Add a feature",
@@ -4564,7 +4937,7 @@ describe("Agent", () => {
     const writes = mockTaskLabels(task);
     mockPlanner.mutateTaskLabels.mockRejectedValue(
       new PlannerRequestError(
-        "Planner request to '/api/tasks/task-1/labels' failed with status 405",
+        `Planner request to '/api/tasks/${TASK_1}/labels' failed with status 405`,
         405,
       ),
     );
@@ -4578,7 +4951,7 @@ describe("Agent", () => {
     // list, preserving the human label.
     expect(writes).toEqual([["urgent", "agent:running"], ["urgent"]]);
     expect(mockPlanner.getTask).toHaveBeenCalled();
-    expect(mockPlanner.updateTaskLabels).toHaveBeenCalledWith("task-1", [
+    expect(mockPlanner.updateTaskLabels).toHaveBeenCalledWith(TASK_1, [
       "urgent",
       "agent:running",
     ]);
@@ -4587,7 +4960,7 @@ describe("Agent", () => {
 
   it("should clear the running label when the task fails", async () => {
     const task = {
-      id: "task-1",
+      id: TASK_1,
       title: "Implement feature",
       status: "To Do",
       description: "Add a feature",
@@ -4603,7 +4976,7 @@ describe("Agent", () => {
 
     expect(writes[0]).toContain("agent:running");
     expect(writes[1]).not.toContain("agent:running");
-    expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith("task-1", "Done");
+    expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith(TASK_1, "Done");
     agent.stop();
   });
 
@@ -4611,7 +4984,7 @@ describe("Agent", () => {
     config.TASK_POLLING_INTERVAL = 1;
     const tasks = [
       {
-        id: "task-1",
+        id: TASK_1,
         title: "Implement feature",
         status: "To Do",
         description: "Add a feature",
@@ -4674,7 +5047,7 @@ describe("Agent", () => {
   it("should not fail the task when the label writes fail", async () => {
     mockPlanner.listAssignedTasks.mockResolvedValue([
       {
-        id: "task-1",
+        id: TASK_1,
         title: "Implement feature",
         status: "To Do",
         description: "Add a feature",
@@ -4693,15 +5066,15 @@ describe("Agent", () => {
 
     expect(mockQoder.performTask).toHaveBeenCalledTimes(1);
     expect(mockPlanner.addTaskComment).toHaveBeenCalledWith(
-      "task-1",
+      TASK_1,
       "Feature implemented",
     );
-    expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith("task-1", "Done");
+    expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith(TASK_1, "Done");
     // An operational failure is not an unsupported endpoint: no fallback.
     expect(mockPlanner.updateTaskLabels).not.toHaveBeenCalled();
     expect(console.log).toHaveBeenCalledWith(
       expect.stringContaining(
-        "Failed to add the agent labels (agent:running) for task 'Implement feature' (task-1)",
+        `Failed to add the agent labels (agent:running) for task 'Implement feature' (${TASK_1})`,
       ),
     );
     agent.stop();
@@ -4710,7 +5083,7 @@ describe("Agent", () => {
   it("should not write labels when TASK_LABELS is false", async () => {
     config.TASK_LABELS = false;
     const task = {
-      id: "task-1",
+      id: TASK_1,
       title: "Implement feature",
       status: "To Do",
       description: "Add a feature",
@@ -4736,7 +5109,7 @@ describe("Agent", () => {
     jest.useFakeTimers();
     const tasks = [
       {
-        id: "task-stale",
+        id: TASK_STALE,
         title: "Stale task",
         status: "Done",
         description: "",
@@ -4745,7 +5118,7 @@ describe("Agent", () => {
         labels: ["agent:running", "model:qwen3.8-flash"],
       },
       {
-        id: "task-already-clear",
+        id: TASK_ALREADY_CLEAR,
         title: "Already clear task",
         status: "Done",
         description: "",
@@ -4760,7 +5133,7 @@ describe("Agent", () => {
     );
     // The second task reports no change (labeled meanwhile by someone else).
     mockPlanner.mutateTaskLabels.mockImplementation(async (taskId: string) =>
-      taskId === "task-stale"
+      taskId === TASK_STALE
         ? { labels: ["model:qwen3.8-flash"], changed: true }
         : { labels: ["agent:running"], changed: false },
     );
@@ -4776,7 +5149,7 @@ describe("Agent", () => {
       undefined,
       ["agent:running"],
     );
-    expect(mockPlanner.mutateTaskLabels).toHaveBeenCalledWith("task-stale", {
+    expect(mockPlanner.mutateTaskLabels).toHaveBeenCalledWith(TASK_STALE, {
       add: [],
       remove: ["agent:running"],
       quiet: true,
@@ -4809,7 +5182,7 @@ describe("Agent", () => {
   it("should salvage the partial summary and CLI output into the failure comment", async () => {
     mockPlanner.listAssignedTasks.mockResolvedValue([
       {
-        id: "task-1",
+        id: TASK_1,
         title: "Implement feature",
         status: "To Do",
         description: "Add a feature",
@@ -4818,7 +5191,7 @@ describe("Agent", () => {
       },
     ]);
     fse.outputFileSync(
-      path.join(dataDir, "tasks", "task-1-Agent-Summary.md"),
+      path.join(dataDir, "tasks", `${TASK_1}-Agent-Summary.md`),
       "## Partial progress\n- Implemented the first module",
     );
     mockQoder.performTask.mockRejectedValue(
@@ -4849,7 +5222,7 @@ describe("Agent", () => {
     ]);
     mockPlannerTasks([
       {
-        id: "task-1",
+        id: TASK_1,
         projectId: "p1",
         title: "First task",
         status: "To Do",
@@ -4858,7 +5231,7 @@ describe("Agent", () => {
         attachments: [],
       },
       {
-        id: "task-2",
+        id: TASK_2,
         projectId: "p1",
         title: "Second task",
         status: "To Do",
@@ -4935,7 +5308,7 @@ describe("Agent", () => {
       ]);
       mockPlannerTasks([
         {
-          id: "task-1",
+          id: TASK_1,
           projectId: "p1",
           title: "Fix the build",
           status: "To Do",
@@ -4957,7 +5330,7 @@ describe("Agent", () => {
       ).toBe("FIRST_INSTRUCTION");
       expect(mockPlanner.updateTaskStatus).toHaveBeenCalledTimes(1);
       expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith(
-        "task-1",
+        TASK_1,
         "Done",
       );
       agent.stop();
@@ -4970,7 +5343,7 @@ describe("Agent", () => {
       ]);
       mockPlanner.listAssignedTasks.mockResolvedValue([
         {
-          id: "task-1",
+          id: TASK_1,
           projectId: "p1",
           title: "Blocked work",
           status: "To Do",
@@ -4978,7 +5351,7 @@ describe("Agent", () => {
           comments: [],
           attachments: [],
           dependencies: [
-            { taskId: "task-2", title: "First step", status: "In Progress" },
+            { taskId: TASK_2, title: "First step", status: "In Progress" },
           ],
         },
       ]);
@@ -4995,7 +5368,7 @@ describe("Agent", () => {
       );
       expect(deferralRound).toBeDefined();
       expect(deferralRound).toContain(
-        "deferred: 'Blocked work' (dependency:task-2)",
+        `deferred: 'Blocked work' (dependency:${TASK_2})`,
       );
       // The claim is taken before the dependency gate: the task is reported
       // once, not once per matching action.
@@ -5029,7 +5402,7 @@ describe("Agent", () => {
     it("should process a fresh task with zero comments without changing its status", async () => {
       mockPlannerTasks([
         {
-          id: "task-1",
+          id: TASK_1,
           title: "Discuss the plan",
           status: "Plan",
           description: "Design the conversational flow",
@@ -5052,7 +5425,7 @@ describe("Agent", () => {
       expect(mockPlanner.updateTaskStatus).not.toHaveBeenCalled();
       // The task never reaches an end status, so its folder is kept.
       await expect(
-        fse.pathExists(path.join(dataDir, "tasks", "task-1-Agent.md")),
+        fse.pathExists(path.join(dataDir, "tasks", `${TASK_1}-Agent.md`)),
       ).resolves.toBe(true);
       agent.stop();
     });
@@ -5060,7 +5433,7 @@ describe("Agent", () => {
     it("should not pick up a task whose last comment is the agent's own reply", async () => {
       config.TASK_POLLING_INTERVAL = 1;
       const task = {
-        id: "task-1",
+        id: TASK_1,
         title: "Discuss the plan",
         status: "Plan",
         description: "Design the conversational flow",
@@ -5128,7 +5501,7 @@ describe("Agent", () => {
         },
       ]);
       const task = {
-        id: "task-1",
+        id: TASK_1,
         projectId: "p1",
         title: "Investigate the failure",
         status: "Doing",
@@ -5228,7 +5601,7 @@ describe("Agent", () => {
         { id: "p1", name: "Weekly Plan", description: "" },
       ]);
       const task = {
-        id: "task-1",
+        id: TASK_1,
         projectId: "p1",
         title: "Discuss the plan",
         status: "Plan",
@@ -5304,7 +5677,7 @@ describe("Agent", () => {
     it("should post only the failure comment when a comment-triggered task fails", async () => {
       mockPlannerTasks([
         {
-          id: "task-1",
+          id: TASK_1,
           title: "Discuss the plan",
           status: "Plan",
           description: "Design the conversational flow",
@@ -5313,7 +5686,7 @@ describe("Agent", () => {
         },
       ]);
       fse.outputFileSync(
-        path.join(dataDir, "tasks", "task-1-Agent-Summary.md"),
+        path.join(dataDir, "tasks", `${TASK_1}-Agent-Summary.md`),
         "## Partial progress",
       );
       mockQoder.performTask.mockRejectedValue(new Error("CLI failed"));
@@ -5341,7 +5714,7 @@ describe("Agent", () => {
       config.TASK_POLLING_INTERVAL = 1;
       const tasks = [
         {
-          id: "task-1",
+          id: TASK_1,
           title: "Discuss the plan",
           status: "Plan",
           description: "Design the conversational flow",
@@ -5386,7 +5759,7 @@ describe("Agent", () => {
       config.TASK_ADJUSTMENT_MAX_ROUNDS = 2;
       mockPlannerTasks([
         {
-          id: "task-1",
+          id: TASK_1,
           title: "Discuss the plan",
           status: "Plan",
           description: "Design the conversational flow",
@@ -5399,7 +5772,7 @@ describe("Agent", () => {
       mockPlanner.getTask.mockImplementation(async () => {
         fetchRound++;
         return {
-          id: "task-1",
+          id: TASK_1,
           projectId: "",
           title: "Discuss the plan",
           status: "Plan",
@@ -5439,7 +5812,7 @@ describe("Agent", () => {
     it("should finalize with the last successful summary when an adjustment run fails", async () => {
       mockPlannerTasks([
         {
-          id: "task-1",
+          id: TASK_1,
           title: "Discuss the plan",
           status: "Plan",
           description: "Design the conversational flow",
@@ -5448,7 +5821,7 @@ describe("Agent", () => {
         },
       ]);
       mockPlanner.getTask.mockResolvedValue({
-        id: "task-1",
+        id: TASK_1,
         projectId: "",
         title: "Discuss the plan",
         status: "Plan",
@@ -5484,7 +5857,7 @@ describe("Agent", () => {
       // Comments mode: the first summary is posted with the note and the
       // task keeps its status (no status move anyway).
       expect(mockPlanner.addTaskComment).toHaveBeenCalledWith(
-        "task-1",
+        TASK_1,
         expect.stringContaining("Agent analysis"),
       );
       expect(
@@ -5499,7 +5872,7 @@ describe("Agent", () => {
     it("should never re-fetch the task for a comment-only finalization", async () => {
       mockPlannerTasks([
         {
-          id: "task-1",
+          id: TASK_1,
           title: "Discuss the plan",
           status: "Plan",
           description: "Design the conversational flow",
@@ -5530,7 +5903,7 @@ describe("Agent", () => {
       config.TASK_POLLING_INTERVAL = 1;
       config.AGENT_START_COMMENT = true;
       const task = {
-        id: "task-1",
+        id: TASK_1,
         title: "Discuss the plan",
         status: "Plan",
         description: "Design the conversational flow",
@@ -5615,7 +5988,7 @@ describe("Agent", () => {
         dateCreated: string;
       }[]): PlannerTask =>
         ({
-          id: "task-1",
+          id: TASK_1,
           projectId: "p1",
           title: "Task",
           status: "Plan",

@@ -2,9 +2,15 @@ import * as fse from "fs-extra";
 import * as path from "path";
 import type { AgentActionsConfig } from "../AgentActions";
 import { getAgentConfigContentPath } from "../AgentConfigRepository";
+import { writeJsonAtomic } from "../AtomicFile";
 import { getCoreSkillsPath, listAvailableSkills, listCoreSkills } from "../CoreSkills";
 import { AgentSessionMetrics } from "../AgentSessionMetrics";
-import { Config, githubTokenEnvName } from "../Config";
+import {
+  Config,
+  DEFAULT_TASK_TIMEOUT_SECONDS,
+  MAX_DELAY_SECONDS,
+  githubTokenEnvName,
+} from "../Config";
 import { CliAbortedError, ExecFileError, extractErrorDetail, isCliAbortError, runCli, RunCliOptions } from "../CliUtils";
 import { OTelLogger, OTelTracer } from "../OTelContext";
 import type { PlannerTask } from "../PlannerClient";
@@ -16,32 +22,12 @@ const AUTH_CHECK_TIMEOUT_MS = 120000;
 const PROMPT_TIMEOUT_MS = 600000;
 export const PROBE_PROMPT = "Reply with exactly: OK";
 
+// A failed (or empty) model listing is cached this long before it is
+// retried: a broken listing costs up to AUTH_CHECK_TIMEOUT_MS on every task
+// start otherwise, while a transient failure still recovers automatically.
+export const MODEL_LIST_FAILURE_TTL_MS = 5 * 60 * 1000;
+
 const MAX_BUFFER_BYTES = 10 * 1024 * 1024;
-
-// Serializes the usage-file writes per file path: concurrent task
-// executions and prompts share one file, and their non-atomic interleaved
-// writes can corrupt it. Each operation chains on the previous one for the
-// same path; the chain is dropped once it becomes the tail and settles.
-const usageWriteLocks = new Map<string, Promise<void>>();
-
-function withUsageWriteLock<T>(
-  filePath: string,
-  operation: () => Promise<T>,
-): Promise<T> {
-  const previous = usageWriteLocks.get(filePath) ?? Promise.resolve();
-  const result = previous.then(operation, operation);
-  const release = result.then(
-    () => undefined,
-    () => undefined,
-  );
-  usageWriteLocks.set(filePath, release);
-  void release.then(() => {
-    if (usageWriteLocks.get(filePath) === release) {
-      usageWriteLocks.delete(filePath);
-    }
-  });
-  return result;
-}
 
 /**
  * CLI-agnostic implementation of a coding-agent client: task prompt
@@ -58,6 +44,12 @@ export abstract class BaseCliAgent implements CliAgentClient {
   // Models available to the account, fetched once from the CLI and cached
   // for the lifetime of the client (undefined until the first fetch).
   private availableModels: string[] | undefined;
+  // Until this time a failed listing is not retried; the cause was already
+  // logged when it was recorded, so it stays visible at most once per TTL.
+  private modelListFailureUntil: number | null = null;
+  // Concurrent callers share one listing invocation instead of each paying
+  // the CLI timeout.
+  private modelListInFlight: Promise<string[] | null> | null = null;
 
   abstract readonly name: string;
   abstract readonly displayName: string;
@@ -132,20 +124,10 @@ export abstract class BaseCliAgent implements CliAgentClient {
   }
 
   protected async writeUsage(usage: number): Promise<void> {
-    const filePath = this.usageFilePath();
     try {
       // Atomic write (temp file + rename) under the per-path lock: a
       // concurrent reader never sees a half-written JSON file.
-      await withUsageWriteLock(filePath, async () => {
-        const tempFile = `${filePath}.${process.pid}.${Date.now()}.tmp`;
-        try {
-          await fse.outputJson(tempFile, { usage });
-          await fse.rename(tempFile, filePath);
-        } finally {
-          // A failed rename leaves the temp file behind: remove it.
-          await fse.remove(tempFile).catch(() => undefined);
-        }
-      });
+      await writeJsonAtomic(this.usageFilePath(), { usage });
     } catch {
       // Non-fatal: the usage display is best-effort.
     }
@@ -251,8 +233,7 @@ export abstract class BaseCliAgent implements CliAgentClient {
         result = await this.runAgentCli(
           args,
           {
-            timeout:
-              (options?.timeoutSeconds ?? this.config.TASK_TIMEOUT) * 1000,
+            timeout: this.taskTimeoutSeconds(options) * 1000,
             windowsHide: true,
             cwd: workingDir,
             maxBuffer: MAX_BUFFER_BYTES,
@@ -398,10 +379,36 @@ export abstract class BaseCliAgent implements CliAgentClient {
     }
   }
 
-  // The models available to the account, listed once by the CLI and
-  // cached for the lifetime of the client. Returns null when the list
-  // cannot be obtained or the CLI has no listing: the model validation is
-  // best-effort and is then skipped.
+  // The task timeout in seconds: the per-action timeout, then TASK_TIMEOUT,
+  // then the built-in default. A hot-reloaded value above the timer maximum
+  // would overflow the millisecond delay (Node clamps it to about 1 ms), so
+  // it falls back instead of arming an immediate timeout.
+  private taskTimeoutSeconds(options?: TaskOptions): number {
+    const resolved = options?.timeoutSeconds;
+    if (this.isValidTimeoutSeconds(resolved)) {
+      return resolved;
+    }
+    const configured = this.config.TASK_TIMEOUT;
+    return this.isValidTimeoutSeconds(configured)
+      ? configured
+      : DEFAULT_TASK_TIMEOUT_SECONDS;
+  }
+
+  private isValidTimeoutSeconds(value: number | undefined): value is number {
+    return (
+      typeof value === "number" &&
+      Number.isInteger(value) &&
+      value > 0 &&
+      value <= MAX_DELAY_SECONDS
+    );
+  }
+
+  // The models available to the account, listed once by the CLI and cached
+  // for the lifetime of the client. A failed or empty listing is cached for
+  // MODEL_LIST_FAILURE_TTL_MS before it is retried, so a broken listing
+  // cannot add its full timeout to every task start. Returns null when the
+  // list cannot be obtained or the CLI has no listing: the model validation
+  // is best-effort and is then skipped.
   public async listModels(): Promise<string[] | null> {
     if (this.availableModels !== undefined) {
       return this.availableModels;
@@ -410,6 +417,25 @@ export abstract class BaseCliAgent implements CliAgentClient {
     if (args === null) {
       return null;
     }
+    if (
+      this.modelListFailureUntil !== null &&
+      Date.now() < this.modelListFailureUntil
+    ) {
+      // The failure was logged when it was recorded.
+      return null;
+    }
+    if (this.modelListInFlight !== null) {
+      return this.modelListInFlight;
+    }
+    this.modelListInFlight = this.fetchAvailableModels(args).finally(() => {
+      this.modelListInFlight = null;
+    });
+    return this.modelListInFlight;
+  }
+
+  private async fetchAvailableModels(
+    args: string[],
+  ): Promise<string[] | null> {
     try {
       const result = await runCli(this.cliCommand(), args, {
         timeout: AUTH_CHECK_TIMEOUT_MS,
@@ -418,14 +444,25 @@ export abstract class BaseCliAgent implements CliAgentClient {
       });
       const models = this.parseModelList(result.stdout);
       if (models.length === 0) {
+        this.recordModelListFailure("the CLI returned no models");
         return null;
       }
       this.availableModels = models;
+      this.modelListFailureUntil = null;
       return models;
-    } catch {
-      // A failed listing only disables the validation for this call.
+    } catch (error) {
+      this.recordModelListFailure((error as Error).message);
       return null;
     }
+  }
+
+  private recordModelListFailure(reason: string): void {
+    this.modelListFailureUntil = Date.now() + MODEL_LIST_FAILURE_TTL_MS;
+    logger.warn(
+      `${this.displayName} model listing failed (${reason}): the model check is skipped for ${Math.round(
+        MODEL_LIST_FAILURE_TTL_MS / 60000,
+      )} minutes`,
+    );
   }
 
   // When a task starts, the resolved model is checked against the models

@@ -413,7 +413,9 @@ export function selectTasks(
  * The kill-switch selection (TASK_SMART_SCHEDULING=false): exactly the
  * historical count-based behavior — the first candidates of the queue order
  * fill the free count-based slots; weights, conflicts and the utility model
- * are ignored.
+ * are ignored. The budget is treated as a count: a fractional budget is
+ * floored, and any positive remaining budget admits at least one task (a
+ * budget below 1 no longer selects nothing silently).
  */
 export function selectTasksLegacy(
   candidates: { task: PlannerTask; action: AgentAction }[],
@@ -421,5 +423,8 @@ export function selectTasksLegacy(
   runningCount: number,
 ): { task: PlannerTask; action: AgentAction }[] {
   const freeSlots = maxParallel - runningCount;
-  return candidates.slice(0, Math.max(freeSlots, 0));
+  if (!(freeSlots > 0)) {
+    return [];
+  }
+  return candidates.slice(0, Math.max(1, Math.floor(freeSlots)));
 }

@@ -2,7 +2,7 @@
 
 LLM agent that connects to a [Planner](https://github.com/devopsplaybook-io/planner) instance and can be assigned tasks to execute.
 
-The agent polls the Planner API for tasks assigned to its user and executes the tasks selected by its _actions_ configuration (a YAML file, see [Agent actions](#agent-actions)). It runs the tasks with a coding-agent CLI (Qoder by default; Claude Code, Copilot CLI, Codex and Gemini CLI are also supported, see [CLI agent](#cli-agent)), marks the task as running with an agent-managed label while it works on it, accumulates the models that worked on the task as provenance labels (see [Task labels](#task-labels)), posts the result as a task comment and moves the task to the end status of the matching action. For each task it maintains a documentation file at `/data/tasks/[id]-Agent.md` that keeps the context of the task across runs and includes the name and description of the task project. Task attachments are downloaded to `/data/tasks/[id]/attachments/` and listed in the documentation file so the LLM can use them. When a task reaches the cleanup status (default `Done`) the agent deletes its local task folder, and periodically removes folders for tasks that are no longer assigned or have reached the cleanup status. The poll is scoped server-side to the agent's own user with the `assigneeUserId` filter and `fields` sparse fieldsets (the client-side assignee filter is kept as a safety net for older Planner deploys).
+The agent polls the Planner API for tasks assigned to its user and executes the tasks selected by its _actions_ configuration (a YAML file, see [Agent actions](#agent-actions)). It runs the tasks with a coding-agent CLI (Qoder by default; Claude Code, Copilot CLI, Codex and Gemini CLI are also supported, see [CLI agent](#cli-agent)), marks the task as running with an agent-managed label while it works on it, accumulates the models that worked on the task as provenance labels (see [Task labels](#task-labels)), posts the result as a task comment and moves the task to the end status of the matching action. For each task it maintains a documentation file at `/data/tasks/[id]-Agent.md` that keeps the context of the task across runs and includes the name and description of the task project. Task attachments are downloaded to `/data/tasks/[id]/attachments/` (bounded by `TASK_ATTACHMENT_MAX_BYTES`), recorded in an `attachments.json` manifest so a later run reuses the local copy instead of downloading it again, and listed in the documentation file so the LLM can use them. When a task reaches the cleanup status (default `Done`) the agent deletes its local task folder, and periodically removes folders for tasks that are no longer assigned or have reached the cleanup status. The poll is scoped server-side to the agent's own user with the `assigneeUserId` filter and `fields` sparse fieldsets (the client-side assignee filter is kept as a safety net for older Planner deploys).
 
 Polling stays quiet: log entries are only emitted when a task is ready to be processed and during its processing (plus errors), not on every poll cycle.
 
@@ -42,9 +42,12 @@ Configuration values are resolved with the following priority:
 | `AGENT_UTILITY_MODEL`   | (empty)                       | Fast/cheap model (on the configured CLI) pre-evaluating the weight and repositories of hint-less tasks; empty disables it (zero LLM calls) |
 | `AGENT_EVALUATION_TIMEOUT` | `30`                       | Maximum duration in seconds of one scheduling round's utility-model evaluations (see [Utility model](#utility-model-optional)) |
 | `TASK_TIMEOUT`          | `3600`                        | Maximum duration of a task execution in seconds (fallback when the actions configuration defines no timeout) |
+| `TASK_ATTACHMENT_MAX_BYTES` | `52428800` (50 MiB)       | Maximum size in bytes of one downloaded task attachment: a larger attachment is skipped (streaming download aborted) and reported as skipped in the task brief; `0` disables the cap |
 | `DATA_DIR`              | `/data`                       | Persistent data directory (task documentation files)                      |
 | `TMP_DIR`               | `/tmp`                        | Temporary directory                                                       |
 | `DEV_MODE`              | `false`                       | Development mode flag                                                     |
+
+Every duration setting expressed in seconds (`TASK_POLLING_INTERVAL`, `TASK_POLLING_MAX_INTERVAL`, `TASK_TIMEOUT`, `TASK_PROGRESS_COMMENT_INTERVAL`, `AGENT_EVALUATION_TIMEOUT`, `AGENT_CONFIG_SYNC_INTERVAL`, `AGENT_NOTE_INTERVAL` and the actions timeouts) is capped at `2147483` seconds (about 24.8 days): the largest delay Node.js timers accept. A larger value is rejected at startup instead of silently overflowing into a hot loop, and an invalid value hot-reloaded at runtime falls back to the built-in default.
 
 ### CLI agent
 
@@ -76,7 +79,7 @@ The model used for a task is resolved with the following priority:
 3. The `default.model` of the actions configuration
 4. The CLI default model (when none of the above is set)
 
-When a task starts and the selected CLI supports a model listing (Qoder), the resolved model is checked against the models available to the account (`qoder --list-models`, fetched once and cached). A model outside of that list is logged as a warning (with the available models) but the task still runs — the CLI remains the authority on what it can execute. For the other CLIs the validation is skipped.
+When a task starts and the selected CLI supports a model listing (Qoder), the resolved model is checked against the models available to the account (`qoder --list-models`, fetched once and cached). A failed or empty listing is cached as a negative result for 5 minutes, so a broken CLI or account does not pay the probe on every task (concurrent tasks share the same in-flight fetch). A model outside of that list is logged as a warning (with the available models) but the task still runs — the CLI remains the authority on what it can execute. For the other CLIs the validation is skipped.
 
 Example task description requesting a specific model:
 
@@ -145,8 +148,8 @@ When no default token is configured and exactly one organization token exists, t
 | ---------------------------- | ------- | ------------------------------------------------------------------- |
 | `AGENT_CONFIG_REPOSITORY`    | (empty) | Git URL of the agent config repository (empty disables the feature) |
 | `AGENT_CONFIG_BRANCH`        | `main`  | Branch to sync                                                      |
-| `AGENT_CONFIG_FOLDER`        | (empty) | Only sync this folder of the repository (sparse checkout)           |
-| `AGENT_CONFIG_SYNC_INTERVAL` | `300`   | Seconds between refreshes of the local copy                         |
+| `AGENT_CONFIG_FOLDER`        | (empty) | Only sync this folder of the repository (sparse checkout; a relative path without `..` or empty segments) |
+| `AGENT_CONFIG_SYNC_INTERVAL` | `300`   | Seconds between refreshes of the local copy (at most `2147483`)     |
 | `CORE_SKILLS_PATH`           | (empty) | Core skills directory override (empty resolves to the skills directory shipped with the image, next to the compiled code) |
 
 ### Agent note
@@ -260,7 +263,7 @@ Every poll with picks or deferrals logs one `Scheduling round:` line (`picked:` 
 
 Every task execution (an agent session) records the `session.duration` histogram (exported as `session.duration`, in seconds), labeled with `agent` (CLI name, e.g. `qoder`), `model` (the resolved model, `auto` when the CLI default is used) and `status` (`success`, or `error` for the failed executions: timeouts and CLI errors are recorded too).
 
-Setting `TASK_SMART_SCHEDULING=false` restores the historical behavior exactly: `TASK_MAX_PARALLEL` is a plain task count, weights, conflict keys and the utility model are ignored (no LLM call).
+Setting `TASK_SMART_SCHEDULING=false` restores the historical behavior exactly: `TASK_MAX_PARALLEL` is a plain task count, weights, conflict keys and the utility model are ignored (no LLM call). A positive fractional budget (e.g. `0.5`) still admits at least one task per round instead of stalling the queue.
 
 ## Task labels
 
@@ -324,7 +327,7 @@ For every poll, the agent checks if an assigned task matches the project pattern
 - `weight` is the scheduling weight of the tasks handled by the action (a number greater than 0 and at most 1, e.g. `0.5` for a batch of small routine tasks); an `agent-weight:` line in the task description still takes precedence (see [Parallel scheduling](#parallel-scheduling)).
 - `priority` overrides the queue priority of the tasks handled by the action: `high`, `medium` or `low` (case-insensitive; validated at startup like the other fields). When unset, the task's own Planner priority applies. It only changes the order in which ready tasks are picked (see [Parallel scheduling](#parallel-scheduling)); a task is still processed by the first matching action.
 - `default.model` is the fallback model for actions without their own model, and `default.timeout` is the fallback timeout for actions without their own timeout. A model id must be accepted by the selected CLI (`gpt-6-luna` and not the display name `GPT-6 Luna`, for example): a bad id fails the task immediately with the CLI error.
-- The task timeout is resolved per task with the following priority: the `timeout` of the matching action, then `default.timeout`, then the global `TASK_TIMEOUT` configuration (default `3600` = 1 hour). It must be a positive integer in seconds.
+- The task timeout is resolved per task with the following priority: the `timeout` of the matching action, then `default.timeout`, then the global `TASK_TIMEOUT` configuration (default `3600` = 1 hour). It must be a positive integer in seconds, at most `2147483` (the largest delay Node.js timers accept); a larger value is rejected when the actions file is loaded.
 - `status_error` is the status a failed task is moved to (a CLI error, a task timeout, a preparation failure): it is resolved per task with the following priority: the `status_error` of the matching action, then `default.status_error`, then the action `status_end` (the historical behavior). A successfully processed task is always moved to the `status_end`. The resolved status must be one of the statuses of the target project on Planner.
 - `status_in_progress` is the status a task is moved to while the agent works on it, so its processing state is visible on Planner. Resolved like `status_error` (action, then `default.status_in_progress`); when neither is set, no transition happens (the historical behavior). The transition is best-effort: when the project status catalog is known and does not contain the status, or when the transition fails, a warning is logged and the task keeps its current status while the processing continues.
 - `status_abort` enables per-task cancellation (see [Cancelling a running task](#cancelling-a-running-task)). Resolved like `status_error` (action, then `default.status_abort`); when neither is set, no task of the action can be cancelled.
@@ -386,6 +389,7 @@ Skills, configuration files and other resources the agent should use are defined
 - A failed periodic refresh keeps the last synced copy and only logs an error.
 - The working tree is forced to match the remote branch on every refresh, so the local copy is always a faithful mirror of the repository.
 - Authentication uses the Git and GitHub settings above (GitHub token or SSH key); public repositories need no authentication.
+- `AGENT_CONFIG_FOLDER` must be a relative path inside the repository: an absolute path, a backslash, a `..` segment or an empty segment is rejected at startup (a trailing slash is accepted and trimmed), so the sparse checkout can never escape the synced copy.
 - Every task prompt tells the agent where the configuration is synced, so skills and resources are directly usable during task execution.
 - Every task prompt also lists the available skills — the core skills shipped with the image plus the `skills/<name>/SKILL.md` entries of the repository (a synced skill with the same name wins), with a one-line description each — so the LLM knows which skill to read before starting. The Copilot CLI does not discover the image skills or the synced repository on its own: at startup the agent registers both skills directories with `copilot skill add`, which makes the CLI expose the skills to the model in every run (best-effort, see [CLI agent](#cli-agent)).
 

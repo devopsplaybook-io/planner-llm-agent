@@ -27,8 +27,44 @@ export function getAgentConfigContentPath(config: Config): string {
     : getAgentConfigPath(config);
 }
 
+/**
+ * Checks an AGENT_CONFIG_FOLDER value: it must name a relative folder inside
+ * the synced repository. Returns the reason when invalid, null when valid.
+ * An empty value (repository root) is valid; a trailing slash is accepted.
+ */
+export function validateAgentConfigFolder(value: string): string | null {
+  const trimmed = value.trim();
+  if (trimmed.length === 0) {
+    return null;
+  }
+  if (trimmed.includes("\\")) {
+    return "backslashes are not allowed";
+  }
+  const folder = trimmed.replace(/\/+$/, "");
+  if (
+    folder.length === 0 ||
+    folder.startsWith("/") ||
+    /^[A-Za-z]:/.test(folder)
+  ) {
+    return "the path must be relative";
+  }
+  const segments = folder.split("/");
+  if (segments.some((segment) => segment.length === 0)) {
+    return "empty path segments are not allowed";
+  }
+  if (segments.some((segment) => segment === "." || segment === "..")) {
+    return "'.' and '..' segments are not allowed";
+  }
+  return null;
+}
+
+// Fails safe to the repository root for an invalid value: a hot-reloaded
+// bad value can never escape the synced repository.
 function normalizeFolderPath(value: string): string {
-  return value.trim().replace(/^\/+|\/+$/g, "");
+  if (validateAgentConfigFolder(value) !== null) {
+    return "";
+  }
+  return value.trim().replace(/\/+$/, "");
 }
 
 /**

@@ -1,5 +1,17 @@
 import * as fs from "fs-extra";
 import * as path from "path";
+import { validateAgentConfigFolder } from "./AgentConfigRepository";
+
+// Maximum value of a seconds-based delay: Node clamps setTimeout/setInterval
+// delays above 2^31-1 ms (about 24.8 days) to about 1 ms, which would turn a
+// timer into a hot loop. The value is the millisecond maximum in seconds.
+export const MAX_DELAY_SECONDS = 2147483;
+
+// Built-in task timeout, also the fallback for an invalid hot-reloaded value.
+export const DEFAULT_TASK_TIMEOUT_SECONDS = 3600;
+
+// Attachments larger than this are skipped (0 disables the cap).
+export const DEFAULT_TASK_ATTACHMENT_MAX_BYTES = 50 * 1024 * 1024;
 
 function isValidHttpUrl(value: string): boolean {
   try {
@@ -35,6 +47,9 @@ export class Config {
   // Periodic "still working" comment on tasks running longer than this
   // many seconds; 0 disables the progress comments.
   public TASK_PROGRESS_COMMENT_INTERVAL: number;
+  // Maximum size of one task attachment downloaded from Planner, in bytes;
+  // 0 disables the cap (see the README).
+  public TASK_ATTACHMENT_MAX_BYTES: number;
   // Agent-managed task labels: a transient running label and the model/CLI
   // provenance labels accumulated across runs (see README).
   public TASK_LABELS: boolean;
@@ -115,7 +130,7 @@ export class Config {
     this.TASK_POLLING_MAX_INTERVAL = 300;
     this.TASK_STATUS_CLEANUP = "Done";
     this.TASK_MAX_PARALLEL = 1;
-    this.TASK_TIMEOUT = 3600;
+    this.TASK_TIMEOUT = DEFAULT_TASK_TIMEOUT_SECONDS;
     this.TASK_SMART_SCHEDULING = true;
     this.TASK_CONFLICT_MODE = "repo";
     // Bound of the adjustment passes re-running the CLI when new comments
@@ -123,6 +138,7 @@ export class Config {
     this.TASK_ADJUSTMENT_MAX_ROUNDS = 2;
     // Progress heartbeats are opt-in: 0 posts no periodic comment.
     this.TASK_PROGRESS_COMMENT_INTERVAL = 0;
+    this.TASK_ATTACHMENT_MAX_BYTES = DEFAULT_TASK_ATTACHMENT_MAX_BYTES;
     this.TASK_LABELS = true;
     this.TASK_RUNNING_LABEL = "agent:running";
     this.TASK_MODEL_LABEL_PREFIX = "model:";
@@ -220,6 +236,11 @@ export class Config {
     if (config.TASK_PROGRESS_COMMENT_INTERVAL !== undefined) {
       this.TASK_PROGRESS_COMMENT_INTERVAL =
         config.TASK_PROGRESS_COMMENT_INTERVAL as number;
+    }
+    // 0 disables the cap: it is a valid configured value.
+    if (config.TASK_ATTACHMENT_MAX_BYTES !== undefined) {
+      this.TASK_ATTACHMENT_MAX_BYTES =
+        config.TASK_ATTACHMENT_MAX_BYTES as number;
     }
     if (config.TASK_LABELS !== undefined) {
       this.TASK_LABELS = config.TASK_LABELS === true;
@@ -394,6 +415,12 @@ export class Config {
         process.env.TASK_PROGRESS_COMMENT_INTERVAL,
       );
     }
+    if (process.env.TASK_ATTACHMENT_MAX_BYTES) {
+      this.TASK_ATTACHMENT_MAX_BYTES = parseInt(
+        process.env.TASK_ATTACHMENT_MAX_BYTES,
+        10,
+      );
+    }
     if (process.env.TASK_LABELS !== undefined) {
       this.TASK_LABELS = parseBooleanFlag(
         process.env.TASK_LABELS,
@@ -541,19 +568,21 @@ export class Config {
 
     if (
       !Number.isInteger(this.TASK_POLLING_INTERVAL) ||
-      this.TASK_POLLING_INTERVAL <= 0
+      this.TASK_POLLING_INTERVAL <= 0 ||
+      this.TASK_POLLING_INTERVAL > MAX_DELAY_SECONDS
     ) {
       errors.push(
-        `TASK_POLLING_INTERVAL must be a positive integer (current value: '${this.TASK_POLLING_INTERVAL}')`,
+        `TASK_POLLING_INTERVAL must be a positive integer of at most ${MAX_DELAY_SECONDS} seconds (current value: '${this.TASK_POLLING_INTERVAL}')`,
       );
     }
 
     if (
       !Number.isInteger(this.TASK_POLLING_MAX_INTERVAL) ||
-      this.TASK_POLLING_MAX_INTERVAL <= 0
+      this.TASK_POLLING_MAX_INTERVAL <= 0 ||
+      this.TASK_POLLING_MAX_INTERVAL > MAX_DELAY_SECONDS
     ) {
       errors.push(
-        `TASK_POLLING_MAX_INTERVAL must be a positive integer (current value: '${this.TASK_POLLING_MAX_INTERVAL}')`,
+        `TASK_POLLING_MAX_INTERVAL must be a positive integer of at most ${MAX_DELAY_SECONDS} seconds (current value: '${this.TASK_POLLING_MAX_INTERVAL}')`,
       );
     }
 
@@ -566,18 +595,23 @@ export class Config {
       );
     }
 
-    if (!Number.isInteger(this.TASK_TIMEOUT) || this.TASK_TIMEOUT <= 0) {
+    if (
+      !Number.isInteger(this.TASK_TIMEOUT) ||
+      this.TASK_TIMEOUT <= 0 ||
+      this.TASK_TIMEOUT > MAX_DELAY_SECONDS
+    ) {
       errors.push(
-        `TASK_TIMEOUT must be a positive integer (current value: '${this.TASK_TIMEOUT}')`,
+        `TASK_TIMEOUT must be a positive integer of at most ${MAX_DELAY_SECONDS} seconds (current value: '${this.TASK_TIMEOUT}')`,
       );
     }
 
     if (
       !Number.isInteger(this.AGENT_EVALUATION_TIMEOUT) ||
-      this.AGENT_EVALUATION_TIMEOUT <= 0
+      this.AGENT_EVALUATION_TIMEOUT <= 0 ||
+      this.AGENT_EVALUATION_TIMEOUT > MAX_DELAY_SECONDS
     ) {
       errors.push(
-        `AGENT_EVALUATION_TIMEOUT must be a positive integer (current value: '${this.AGENT_EVALUATION_TIMEOUT}')`,
+        `AGENT_EVALUATION_TIMEOUT must be a positive integer of at most ${MAX_DELAY_SECONDS} seconds (current value: '${this.AGENT_EVALUATION_TIMEOUT}')`,
       );
     }
 
@@ -598,10 +632,20 @@ export class Config {
 
     if (
       !Number.isInteger(this.TASK_PROGRESS_COMMENT_INTERVAL) ||
-      this.TASK_PROGRESS_COMMENT_INTERVAL < 0
+      this.TASK_PROGRESS_COMMENT_INTERVAL < 0 ||
+      this.TASK_PROGRESS_COMMENT_INTERVAL > MAX_DELAY_SECONDS
     ) {
       errors.push(
-        `TASK_PROGRESS_COMMENT_INTERVAL must be a non-negative integer (current value: '${this.TASK_PROGRESS_COMMENT_INTERVAL}')`,
+        `TASK_PROGRESS_COMMENT_INTERVAL must be a non-negative integer of at most ${MAX_DELAY_SECONDS} seconds (current value: '${this.TASK_PROGRESS_COMMENT_INTERVAL}')`,
+      );
+    }
+
+    if (
+      !Number.isInteger(this.TASK_ATTACHMENT_MAX_BYTES) ||
+      this.TASK_ATTACHMENT_MAX_BYTES < 0
+    ) {
+      errors.push(
+        `TASK_ATTACHMENT_MAX_BYTES must be a non-negative integer (0 disables the cap) (current value: '${this.TASK_ATTACHMENT_MAX_BYTES}')`,
       );
     }
 
@@ -688,12 +732,25 @@ export class Config {
       }
       if (
         !Number.isInteger(this.AGENT_CONFIG_SYNC_INTERVAL) ||
-        this.AGENT_CONFIG_SYNC_INTERVAL <= 0
+        this.AGENT_CONFIG_SYNC_INTERVAL <= 0 ||
+        this.AGENT_CONFIG_SYNC_INTERVAL > MAX_DELAY_SECONDS
       ) {
         errors.push(
-          `AGENT_CONFIG_SYNC_INTERVAL must be a positive integer (current value: '${this.AGENT_CONFIG_SYNC_INTERVAL}')`,
+          `AGENT_CONFIG_SYNC_INTERVAL must be a positive integer of at most ${MAX_DELAY_SECONDS} seconds (current value: '${this.AGENT_CONFIG_SYNC_INTERVAL}')`,
         );
       }
+    }
+
+    // A hot-reloaded value escaping the synced repository must fail
+    // validation explicitly instead of silently writing outside it (the
+    // normalizer fails safe to the repository root for such values).
+    if (
+      this.AGENT_CONFIG_FOLDER.trim().length > 0 &&
+      validateAgentConfigFolder(this.AGENT_CONFIG_FOLDER) !== null
+    ) {
+      errors.push(
+        `AGENT_CONFIG_FOLDER must be a relative path without '..' or empty segments (current value: '${this.AGENT_CONFIG_FOLDER}')`,
+      );
     }
 
     // The agent note is enabled by setting AGENT_NOTE_PROJECT (the interval
@@ -702,10 +759,11 @@ export class Config {
     if (this.AGENT_NOTE_PROJECT.trim().length > 0) {
       if (
         !Number.isInteger(this.AGENT_NOTE_INTERVAL) ||
-        this.AGENT_NOTE_INTERVAL < 0
+        this.AGENT_NOTE_INTERVAL < 0 ||
+        this.AGENT_NOTE_INTERVAL > MAX_DELAY_SECONDS
       ) {
         errors.push(
-          `AGENT_NOTE_INTERVAL must be a positive integer or 0 to disable (current value: '${this.AGENT_NOTE_INTERVAL}')`,
+          `AGENT_NOTE_INTERVAL must be a positive integer of at most ${MAX_DELAY_SECONDS} seconds or 0 to disable (current value: '${this.AGENT_NOTE_INTERVAL}')`,
         );
       }
     }
