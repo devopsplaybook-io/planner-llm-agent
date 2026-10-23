@@ -40,6 +40,11 @@ Promise.resolve().then(async () => {
     process.exit(1);
   }
 
+  const plainHttpWarning = config.plainHttpWarning();
+  if (plainHttpWarning !== null) {
+    logger.warn(plainHttpWarning);
+  }
+
   // Touch the heartbeat file early: the Kubernetes probes check its
   // freshness (the polling loop refreshes it every 30 seconds once
   // started, see Agent.startHeartbeat).

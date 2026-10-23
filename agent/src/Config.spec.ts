@@ -1,7 +1,7 @@
 import * as fs from "fs-extra";
 import * as os from "os";
 import * as path from "path";
-import { Config, githubTokenEnvName } from "./Config";
+import { Config, PLAIN_HTTP_WARNING, githubTokenEnvName } from "./Config";
 import { clearConfigEnvironment } from "../jest.setup";
 
 describe("Config", () => {
@@ -711,6 +711,37 @@ describe("Config", () => {
       expect(config.validate()).toEqual([
         "AGENT_CLI 'unknown-cli' is not supported (supported CLIs: qoder, claude-code, copilot-cli, codex, gemini-cli)",
       ]);
+    });
+  });
+
+  describe("plainHttpWarning", () => {
+    it("should warn for a plain HTTP PLANNER_URL", () => {
+      const config = new Config();
+      config.PLANNER_URL = "http://planner.planner.svc.cluster.local:8080";
+
+      expect(config.plainHttpWarning()).toBe(PLAIN_HTTP_WARNING);
+    });
+
+    it("should not warn for an HTTPS PLANNER_URL", () => {
+      const config = new Config();
+      config.PLANNER_URL = "https://planner.example.com";
+
+      expect(config.plainHttpWarning()).toBeNull();
+    });
+
+    it("should not warn for a malformed PLANNER_URL", () => {
+      const config = new Config();
+      config.PLANNER_URL = "not-a-url";
+
+      expect(config.plainHttpWarning()).toBeNull();
+    });
+
+    it("should still accept a valid HTTP PLANNER_URL", () => {
+      const config = new Config();
+      config.PLANNER_API_KEY = "key";
+      config.PLANNER_URL = "http://planner.planner.svc.cluster.local:8080";
+
+      expect(config.validate()).toEqual([]);
     });
   });
 });

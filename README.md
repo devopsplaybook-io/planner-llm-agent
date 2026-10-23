@@ -6,7 +6,9 @@ The agent polls the Planner API for tasks assigned to its user and executes the 
 
 Polling stays quiet: log entries are only emitted when a task is ready to be processed and during its processing (plus errors), not on every poll cycle.
 
-Tasks are processed with a bounded parallelism driven by a weighted capacity budget (`TASK_MAX_PARALLEL`, default `1`): every task consumes a scheduling weight between 0.25 and 1, and tasks are admitted while their total weight fits the budget, so several small tasks can share what a single large task would consume. Tasks that would exceed the budget or work on a resource already claimed by a running task are deferred to a later poll (with the reason logged) instead of blocking the queue, and a task already being processed is never picked again by a subsequent poll. Ready tasks are picked by priority first (high, then medium, then low; an unknown or missing priority ranks as medium) — the queue priority of a task is the `priority` of its matching action when set, and the task's own Planner priority otherwise — and, within the same priority, the task whose last update is the oldest is picked first, so the tasks waiting the longest without any update go first. A task that fails to process is not retried forever: it is moved to the end status with a comment explaining the error (kept concise in the comment; see the agent logs for full details), so it does not block the queue. The whole scheduling model is described in [Parallel scheduling](#parallel-scheduling) and can be reverted to the historical count-based behavior with `TASK_SMART_SCHEDULING=false`.
+> **Security:** anyone able to create or assign a task to the agent's Planner user can execute arbitrary commands in the agent container and read every configured secret. Use a dedicated Planner user, restrict who can assign tasks to it and treat every task author as trusted as the agent itself. See [Security and trust model](#security-and-trust-model) before deploying in a shared environment.
+
+Tasks are processed with a bounded parallelism driven by a weighted capacity budget (`TASK_MAX_PARALLEL`, default `1`): every task consumes a scheduling weight between 0.25 and 1, and tasks are admitted while their total weight fits the budget, so several small tasks can share what a single large task would consume. Tasks that would exceed the budget or work on a resource already claimed by a running task are deferred to a later poll (with the reason logged) instead of blocking the queue, and a task already being processed is never picked again by a subsequent poll. Ready tasks are picked by priority first (high, then medium, then low; an unknown or missing priority ranks as medium) — the queue priority of a task is the `priority` of its matching action when set, and the task's own Planner priority otherwise — and, within the same priority, the task whose last update is the oldest is picked first, so the tasks waiting the longest without any update go first. A task that fails to process is not retried forever: it is moved to the resolved error status (the `status_error` of the matching action, then `default.status_error`, then the action `status_end`) with a comment explaining the error (kept concise in the comment; see the agent logs for full details), so it does not block the queue. The whole scheduling model is described in [Parallel scheduling](#parallel-scheduling) and can be reverted to the historical count-based behavior with `TASK_SMART_SCHEDULING=false`.
 
 The container ships all the toolchains needed to perform the tasks (Node.js, Python, Go, Rust, Java, shellcheck, jq, yq, kubectl, helm), every supported coding-agent CLI (see [CLI agent](#cli-agent)) as well as a complete Git and GitHub tooling set (`git`, `gh`, `gnupg`, `openssh-client`).
 
@@ -17,6 +19,20 @@ Configuration values are resolved with the following priority:
 1. Environment variables (highest)
 2. `config.json` file
 3. Defaults (lowest)
+
+The location of `config.json` is set by `CONFIG_FILE` (environment only, default `config.json` next to the compiled code: `/opt/app/planner-llm-agent/config.json` in the image, `agent/config.json` in a source checkout). It cannot be set from `config.json` itself and is fixed at startup.
+
+### Configuration file and reload
+
+- On every reload, `config.json` is read first and the environment values are re-applied afterwards, so an environment-provided value always wins over the file. Changing an environment variable requires a process restart.
+- `config.json` is watched and applied without restarting the agent. When the new content is invalid JSON, the reload fails, the error is logged and the previous in-memory configuration stays active.
+- Most keys are applied only when **truthy**: removing a key, or setting it to `0`, `""` or `false`, does **not** reset the in-memory value to its default — the previous value stays until a restart. Keys that accept an explicit clearing/zero/false value are `DEV_MODE` (explicit `false`), `TASK_SMART_SCHEDULING`, `TASK_ADJUSTMENT_MAX_ROUNDS` (`0`), `TASK_PROGRESS_COMMENT_INTERVAL` (`0`), `TASK_ATTACHMENT_MAX_BYTES` (`0`), `TASK_LABELS`, `TASK_RUNNING_LABEL`, `TASK_MODEL_LABEL_PREFIX`, `TASK_CLI_LABEL_PREFIX` (empty disables), `AGENT_START_COMMENT`, `AGENT_UTILITY_MODEL` (empty disables) and `CORE_SKILLS_PATH`.
+- Caveat: `AGENT_NOTE_INTERVAL: 0` in `config.json` is ignored by the truthy guard, so it cannot disable the note from the file even though the table documents `0` as disabled; `AGENT_NOTE_INTERVAL=0` as an environment variable works (the string is truthy and parses to `0`).
+- Hot-reloaded values are **not** re-validated (`validate()` runs at startup only). Consumers of bounded durations fall back to their built-in defaults when a value is invalid; startup validation still rejects invalid values.
+- The actions YAML (`AGENT_ACTIONS_FILE`) has its own watcher and is applied without restart (see [Agent actions](#agent-actions)); an invalid new content keeps the last valid configuration.
+- Startup-only settings that a hot reload does not re-apply: `CONFIG_FILE`, the Git/GitHub environment prepared once at startup (`GITHUB_TOKEN`, `GITHUB_TOKENS`, the SSH/GPG keys and `~/.gitconfig` are not rewritten), the CLI authentication probe and the OpenTelemetry exporters initialized at startup. Changing them requires a restart.
+- A restart is required to revert removed keys or return to defaults.
+- `cd agent && npm run check-config` (`node dist/checkConfig.js` in the container) validates **the actions YAML** and prints the resolved actions offline; it does not validate `config.json` (see [Validating the configuration](#validating-the-configuration)).
 
 ### Agent
 
@@ -47,7 +63,7 @@ Configuration values are resolved with the following priority:
 | `TMP_DIR`               | `/tmp`                        | Temporary directory                                                       |
 | `DEV_MODE`              | `false`                       | Development mode flag                                                     |
 
-Every duration setting expressed in seconds (`TASK_POLLING_INTERVAL`, `TASK_POLLING_MAX_INTERVAL`, `TASK_TIMEOUT`, `TASK_PROGRESS_COMMENT_INTERVAL`, `AGENT_EVALUATION_TIMEOUT`, `AGENT_CONFIG_SYNC_INTERVAL`, `AGENT_NOTE_INTERVAL` and the actions timeouts) is capped at `2147483` seconds (about 24.8 days): the largest delay Node.js timers accept. A larger value is rejected at startup instead of silently overflowing into a hot loop, and an invalid value hot-reloaded at runtime falls back to the built-in default.
+Every duration setting expressed in seconds (`TASK_POLLING_INTERVAL`, `TASK_POLLING_MAX_INTERVAL`, `TASK_TIMEOUT`, `TASK_PROGRESS_COMMENT_INTERVAL`, `AGENT_EVALUATION_TIMEOUT`, `AGENT_CONFIG_SYNC_INTERVAL`, `AGENT_NOTE_INTERVAL` and the actions timeouts) is capped at `2147483` seconds (about 24.8 days): the largest delay Node.js timers accept. A larger value is rejected at startup instead of silently overflowing into a hot loop. Hot-reloaded values are not re-validated: when a value invalid at runtime is consumed, the consumer falls back to its built-in default (see [Configuration file and reload](#configuration-file-and-reload)).
 
 ### CLI agent
 
@@ -66,7 +82,7 @@ The command of each CLI is configurable, and the container ships every supported
 | `CODEX_CLI`   | `codex`   | [Codex](https://developers.openai.com/codex) | `OPENAI_API_KEY` or the ChatGPT login (`codex login`)         |
 | `GEMINI_CLI`  | `gemini`  | [Gemini CLI](https://google-gemini.github.io/gemini-cli/) | `GEMINI_API_KEY` or the OAuth login (`gemini`)  |
 
-Only Qoder supports a model listing; for the other CLIs the model validation is skipped. Some CLIs do not report a usage metric (credits or cost): the task report footer then only displays the model, without warning.
+Only Qoder supports a model listing; for the other CLIs the model validation is skipped. Some CLIs do not report a usage metric (credits or cost): the task report footer then displays the model and the duration, without a usage part (see [Task execution report](#task-execution-report)).
 
 The Copilot CLI runs with `--output-format text --silent` (only the final reply is captured) and the agent registers its skills directories at startup: the core skills directory shipped with the image is always registered and, when the agent config repository is configured, the synced skills directory joins it (`copilot skill add <path>`). Copilot does not discover the image skills or the synced repository on its own, so without this registration the model would not see the skills. The registration is idempotent and best-effort — a failure is logged and the tasks keep running with the skills listed in the task prompt.
 
@@ -92,20 +108,29 @@ When the actions configuration sets a `default.model`, the startup authenticatio
 
 ### Task execution report
 
-Every task comment posted to Planner ends with a footer that displays the model used, the usage metric reported by the CLI for the task execution and the elapsed duration of the run:
+Every task comment posted to Planner ends with a footer built as `---`, then `Model: <model> · <usage> · Duration: <duration>` (the usage part is omitted when the CLI reports no metric). The model is displayed as `auto` when no model is configured for the task, and the duration is compact (e.g. `23m`, `1h05m`). The usage part depends on the selected CLI:
+
+- Qoder: `Qoder credits used: <n.nn>` — the credits consumed by the run (`total_credits`), persisted in `<DATA_DIR>/qoder-credits.json`;
+- Claude Code: `Claude cost: $<n.nn>` — the cost of the run (`total_cost_usd`), persisted in `<DATA_DIR>/claude-code-usage.json`;
+- Copilot CLI, Codex and Gemini CLI: no usage part, the footer shows the model and the duration only.
+
+All reported values are per-run values, not account balances. Examples:
 
 ```
 ---
-Model: claude-sonnet-4-5 · Qoder credits: 12.00 -> 15.81 · Duration: 23m
+Model: qwen3.8-flash · Qoder credits used: 15.81 · Duration: 23m
 ```
 
-The usage metric is displayed as `before -> after` (the values persisted around the run) and depends on the selected CLI: the Qoder credits consumed by the run (`total_credits`, persisted in `<DATA_DIR>/qoder-credits.json`) or the cost of the Claude Code run (`total_cost_usd`). Both are per-run values, not account balances. CLIs that report no metric (Copilot CLI, Codex, Gemini CLI) only display the model and the duration in the footer. The model is displayed as `auto` when no model is configured for the task.
+```
+---
+Model: claude-sonnet-4-5 · Claude cost: $0.42 · Duration: 23m
+```
 
 When a task fails, the failure comment salvages what the CLI run left behind: the partial summary file written by the CLI (when any) and the tail of its captured output, so the state of the interrupted work is visible on Planner without digging through the agent logs.
 
 ### Git and GitHub
 
-All Git and GitHub settings are optional: the agent automatically prepares the environment based on what is configured, and skips the setup entirely when none of `GITHUB_TOKEN`, `GIT_SSH_PRIVATE_KEY` or `GIT_GPG_PRIVATE_KEY` is provided. The environment is prepared at startup, before the first task runs, and any invalid value makes the agent fail fast with a clear message.
+All Git and GitHub settings are optional: the agent automatically prepares the environment based on what is configured, and skips the setup entirely when none of `GITHUB_TOKEN`, `GITHUB_TOKENS`, `GIT_SSH_PRIVATE_KEY` or `GIT_GPG_PRIVATE_KEY` is provided. The environment is prepared at startup, before the first task runs, and any invalid value makes the agent fail fast with a clear message.
 
 | Variable              | Default                                      | Description                                                                |
 | --------------------- | -------------------------------------------- | -------------------------------------------------------------------------- |
@@ -159,6 +184,17 @@ When no default token is configured and exactly one organization token exists, t
 | `AGENT_NOTE_PROJECT`  | (empty) | Planner project where the agent note is published (id or name; empty disables the feature) |
 | `AGENT_NOTE_INTERVAL` | `86400` | Seconds between agent note updates (default: daily); `0` disables the updates              |
 
+### OpenTelemetry
+
+| Variable                                        | Default | Description                                                              |
+| ----------------------------------------------- | ------- | ------------------------------------------------------------------------ |
+| `OPENTELEMETRY_COLLECTOR_HTTP_TRACES`           | (empty) | OTLP HTTP endpoint for traces; empty means the signal is not exported    |
+| `OPENTELEMETRY_COLLECTOR_HTTP_METRICS`          | (empty) | OTLP HTTP endpoint for metrics; empty means the signal is not exported   |
+| `OPENTELEMETRY_COLLECTOR_HTTP_LOGS`             | (empty) | OTLP HTTP endpoint for logs; empty means the signal is not exported      |
+| `OPENTELEMETRY_COLLECT_AUTHORIZATION_HEADER`    | (empty) | Value sent as `Authorization: Bearer <value>` on every exported request  |
+
+These settings are consumed when OpenTelemetry initializes at startup, so changing them requires a restart.
+
 ## Git and GitHub authentication
 
 ### Personal Access Token (recommended)
@@ -180,7 +216,7 @@ Set `GIT_SSH_PRIVATE_KEY` to an SSH private key whose public part is registered 
 
 ### Commit signing (GPG)
 
-Set `GIT_GPG_PRIVATE_KEY` to an armored GPG private key. The agent imports it into `~/.gnupg`, resolves the signing key id (or uses `GIT_GPG_KEY_ID`), and enables `commit.gpgsign`. If the key is protected, set `GIT_GPG_PASSPHRASE`: the agent configures loopback pinentry, presets the passphrase in gpg-agent with a long cache TTL and restarts the agent, so signing never prompts in the container. A dedicated passphrase-less signing key is also a good option.
+Set `GIT_GPG_PRIVATE_KEY` to an armored GPG private key. The agent imports it into `~/.gnupg`, resolves the signing key id (or uses `GIT_GPG_KEY_ID`), and enables `commit.gpgsign`. If the key is protected, set `GIT_GPG_PASSPHRASE`: the agent configures loopback pinentry, presets the passphrase in `gpg-agent` with a long cache TTL (one year: `default-cache-ttl`/`max-cache-ttl 31536000`) and restarts `gpg-agent`, so signing never prompts in the container. A dedicated passphrase-less signing key is also a good option.
 
 ### Commit signing (SSH alternative)
 
@@ -200,6 +236,64 @@ When deployed on Kubernetes, these values are provided as environment variables 
 ```
 
 The agent actions file is provided by a ConfigMap mounted at `/etc/planner/llm-agent.yaml`. An example Kubernetes deployment (namespace, PVC, ConfigMap with the actions file, Deployment, Kustomize) is available in [`docs/deployments/kubernetes`](docs/deployments/kubernetes).
+
+## Security and trust model
+
+The agent is designed to run trusted tasks with broad credentials, not to sandbox untrusted work. This section states the trust boundary operators must understand before deploying it.
+
+### Who can execute code
+
+Every task runs a coding-agent CLI with permission bypass. Creating or assigning a task to the agent's Planner user is therefore equivalent to executing arbitrary commands in the agent container with the agent's credentials, and to reading every secret injected into it. Use a dedicated Planner user, restrict its projects and visibility, and keep a tight assignee list; treat every task author as trusted as the agent itself.
+
+### Secrets visible to every task
+
+The agent process environment is inherited by every CLI, `git` and `gh` child process, so any code a task runs can read all of:
+
+- `PLANNER_API_KEY` and `PLANNER_URL`;
+- `GITHUB_TOKEN` / `GH_TOKEN` and every `GH_TOKEN_<ORG>` organization token;
+- `GIT_SSH_PRIVATE_KEY` (written to `~/.ssh/id_github`, mode `0600`) and `GIT_GPG_PRIVATE_KEY` with `GIT_GPG_PASSPHRASE` (key in `~/.gnupg`, mode `0700`; the passphrase is cached in `gpg-agent` with a one-year cache TTL);
+- `OPENTELEMETRY_COLLECT_AUTHORIZATION_HEADER`;
+- the credentials the CLIs read themselves: `QODER_PERSONAL_ACCESS_TOKEN`, `ANTHROPIC_API_KEY` / `CLAUDE_CODE_OAUTH_TOKEN`, `OPENAI_API_KEY`, `GEMINI_API_KEY` (the Copilot CLI uses `GH_TOKEN`).
+
+### GitHub organization tokens
+
+Every configured organization token is exported as `GH_TOKEN_<ORG>` **to every task**, regardless of which repositories the task touches, and is written as a plaintext credential-helper command into `~/.gitconfig` (file mode `0600`, but readable by any code the agent runs). Git scopes each token by URL prefix `https://github.com/<organization>`, but this is git configuration, not process isolation: all configured tokens are present in the file. The default token is used host-wide through `gh auth git-credential`. An already-set `GH_TOKEN` in the environment is not overwritten.
+
+### Untrusted task input
+
+Task descriptions, comments, checklists, attachments and the repository content the agent reads are untrusted input: they can steer the model, which runs without a sandbox or approval gate. The agent bounds the accidental damage:
+
+- attachment file names containing `/` or `\`, empty names, `.` and `..` are skipped and reported in the task brief;
+- downloads are capped by `TASK_ATTACHMENT_MAX_BYTES` (default `52428800`, 50 MiB; `0` disables the cap): a larger attachment is aborted in streaming, skipped and reported, and the downloaded files are stored under `DATA_DIR/tasks/<taskId>/attachments/` with an `attachments.json` manifest so a later run reuses them;
+- tasks whose Planner id is not a canonical hyphenated UUID are skipped (defense against path traversal).
+
+These measures bound accidental damage, not a hostile task author.
+
+### Least-privilege recommendations
+
+- Use fine-grained, short-lived organization tokens with minimal scopes, and prefer per-organization tokens over one broad default token; keep the default token only when necessary.
+- Rotate every credential if a task, the Planner account or a CLI token is suspected compromised.
+- Restrict the container network egress (for example a NetworkPolicy allowlist for Planner, GitHub, the model providers and the package registries).
+- Run the agent in a dedicated namespace and service account, do not co-locate unrelated workloads in the same pod or namespace, and do not share volumes with them.
+- Keep the example deployment hardening: non-root user, no privilege escalation, dropped capabilities.
+
+### Transport security
+
+With an `http://` `PLANNER_URL`, the `PLANNER_API_KEY` and all Planner traffic travel in cleartext. The agent logs one startup warning in that case and keeps HTTP valid for trusted in-cluster or local networks:
+
+```
+PLANNER_URL uses plain HTTP: the Planner API key is sent in cleartext; use HTTPS unless Planner is reached over a trusted in-cluster or local network.
+```
+
+The warning is emitted once at startup (a hot reload of `PLANNER_URL` does not emit it again) and is non-fatal. The default `PLANNER_URL` is `http://localhost:8080`, so local development runs warn too. Prefer HTTPS everywhere else.
+
+### Dependency security
+
+At this revision both `npm audit` and `npm audit --omit=dev` report **0 vulnerabilities**. Dev-toolchain advisories, when they appear, are tracked with the periodic dependency-update tasks. The production image is built from the compiled output and copies the build stage's `node_modules` into the runtime image, so dev-only packages are present on disk but are not loaded by the agent process.
+
+### Current limitation and possible hardening
+
+Today every configured organization token is exposed to every task. Exposing only the tokens relevant to an action or task would require per-child-process environment and per-task git config/HOME isolation (plus prompt and token-selection changes); it is deliberately not implemented. The isolation boundary today is the container and its namespace: one agent identity per container, single replica.
 
 ## Parallel scheduling
 
@@ -243,7 +337,7 @@ When `AGENT_UTILITY_MODEL` is set to a model available on the configured CLI, th
 
 ### Adaptive polling
 
-The agent polls Planner immediately at startup, then again after every completed poll: the delay between polls is `TASK_POLLING_INTERVAL` (default `60` seconds), doubled after every consecutive poll that found nothing to do (no ready task, nothing running and no pending finalization), capped by `TASK_POLLING_MAX_INTERVAL` (default `300` seconds). Any activity — a task picked, tasks running, a pending Planner finalization — and every poll failure restore the base interval, so the pickup latency stays low whenever there is work while an idle agent reduces the Planner polling load to one request per `TASK_POLLING_MAX_INTERVAL` seconds at most. When at least one action is comment-triggered (`trigger: comments`), the idle backoff is capped at the base `TASK_POLLING_INTERVAL`: the polls never slow past the base interval, so a user comment on a conversational task is answered within one base interval.
+The agent polls Planner immediately at startup, then again after every completed poll: the delay between polls is `TASK_POLLING_INTERVAL` (default `60` seconds), doubled after every consecutive poll that found nothing to do (no ready task, nothing running and no pending finalization), capped by `TASK_POLLING_MAX_INTERVAL` (default `300` seconds). Any activity — a task picked, tasks running, a pending Planner finalization — resets the backoff to the base interval, so the pickup latency stays low whenever there is work while an idle agent reduces the Planner polling load to one request per `TASK_POLLING_MAX_INTERVAL` seconds at most. A poll failure keeps the current cadence and does not restore the base interval. When at least one action is comment-triggered (`trigger: comments`), the idle backoff is capped at the base `TASK_POLLING_INTERVAL`: the polls never slow past the base interval, so a user comment on a conversational task is answered within one base interval.
 
 ### Project-scoped task fetch
 
@@ -255,7 +349,7 @@ A task run can last a long time, and comments posted on the task while the CLI a
 
 ### Working directory and instances
 
-Each task runs in its own working directory `DATA_DIR/tasks/<taskId>/` (stated in the task prompt), so parallel tasks never share one and cannot collide on the filesystem. The scheduling state (running tasks, weights, locks, evaluation cache) is kept in memory: one agent process per agent identity is assumed and cross-instance scheduling is not supported — run a single replica per agent identity.
+Each task runs in its own working directory `DATA_DIR/tasks/<taskId>/` (stated in the task prompt), so parallel tasks never share one and cannot collide on the filesystem. Only canonical hyphenated UUIDs (8-4-4-4-12, case-insensitive) are accepted as task ids: a task returned by Planner with any other id is skipped and logged, so an id can never escape the tasks directory. The scheduling state (running tasks, weights, locks, evaluation cache) is kept in memory: one agent process per agent identity is assumed and cross-instance scheduling is not supported — run a single replica per agent identity.
 
 ### Observability and kill switch
 

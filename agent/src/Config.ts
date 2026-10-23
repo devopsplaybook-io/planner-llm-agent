@@ -13,6 +13,12 @@ export const DEFAULT_TASK_TIMEOUT_SECONDS = 3600;
 // Attachments larger than this are skipped (0 disables the cap).
 export const DEFAULT_TASK_ATTACHMENT_MAX_BYTES = 50 * 1024 * 1024;
 
+// Startup warning emitted when PLANNER_URL uses plain HTTP: the API key and
+// every Planner request then travel in cleartext.
+export const PLAIN_HTTP_WARNING =
+  "PLANNER_URL uses plain HTTP: the Planner API key is sent in cleartext; " +
+  "use HTTPS unless Planner is reached over a trusted in-cluster or local network.";
+
 function isValidHttpUrl(value: string): boolean {
   try {
     const url = new URL(value);
@@ -779,6 +785,20 @@ export class Config {
     }
 
     return errors;
+  }
+
+  /**
+   * Warning to log once at startup when PLANNER_URL uses plain HTTP, or null
+   * when it uses HTTPS (or is not a parsable URL, which validate() reports).
+   */
+  public plainHttpWarning(): string | null {
+    try {
+      return new URL(this.PLANNER_URL).protocol === "http:"
+        ? PLAIN_HTTP_WARNING
+        : null;
+    } catch {
+      return null;
+    }
   }
 }
 
