@@ -76,6 +76,12 @@ const MAX_SALVAGED_OUTPUT_LENGTH = 1000;
 const MAX_ADJUSTMENT_DIRECTIVE =
   "New comments were posted on this task after your previous run (listed below). They are also included in the Comments section of the task documentation file. Take the new messages into account, adjust the delivered work if needed, and update the summary file accordingly. If no adjustment is needed, update the summary to state that no adjustment was required.";
 
+// Appended to the final summary when an adjustment round failed: the
+// completed run is still reported, and the user sees that the comments
+// posted during the run were not taken into account.
+const ADJUSTMENT_FAILURE_NOTE =
+  "Note: an adjustment round failed, so comments posted during the run were not taken into account.";
+
 /**
  * Sanitizes a Planner attachment file name for a safe local write: only the
  * base name is kept, and names carrying path separators or dot-only names
@@ -912,6 +918,9 @@ export class Agent {
     const abortController = new AbortController();
     this.abortControllers.set(task.id, abortController);
     const startedAt = Date.now();
+    // The exact running label added at start, removed in the finally even if
+    // TASK_RUNNING_LABEL or TASK_LABELS is hot-reloaded during the run.
+    let runningLabel: string | null = null;
     try {
       // The model resolves to the action model, then the actions default
       // model; the task description still overrides both (see
@@ -931,7 +940,11 @@ export class Agent {
       // transient running label is removed on every exit path (finally),
       // while the model/CLI provenance labels accumulate across the task
       // lifecycle. Best-effort, like the legacy start comment.
-      await this.addTaskRunLabels(task, resolvedModel, selectedAgent);
+      runningLabel = await this.addTaskRunLabels(
+        task,
+        resolvedModel,
+        selectedAgent,
+      );
       // Pipeline actions notify on every run; a comments action only on
       // the first run of the task (stateless test: no agent-authored
       // comment exists yet), so a fast comment back-and-forth does not
@@ -1002,13 +1015,18 @@ export class Agent {
         contentVersion,
         summary: finalSummary,
         statusEnd: action.statusEnd,
+        // Pick-time snapshot, so the check matches abortRequestedTasks even
+        // if the actions config is hot-reloaded mid-run.
+        statusAbort: this.processingTasks.get(task.id)?.statusAbort,
       });
-      await this.finalizeCompletedTask(task.id);
+      const outcome = await this.finalizeCompletedTask(task.id);
       this.finalizationStore.delete(task.id);
       logger.info(
-        action.statusEnd === null
-          ? `Task '${task.title}' (${task.id}) completed (comment-only finalization)`
-          : `Task '${task.title}' (${task.id}) completed and moved to status '${action.statusEnd}'`,
+        outcome === "aborted"
+          ? `Task '${task.title}' (${task.id}) completed; its status '${this.processingTasks.get(task.id)?.statusAbort ?? "unknown"}' was kept (user abort)`
+          : action.statusEnd === null
+            ? `Task '${task.title}' (${task.id}) completed (comment-only finalization)`
+            : `Task '${task.title}' (${task.id}) completed and moved to status '${action.statusEnd}'`,
       );
     } catch (error) {
       const message = (error as Error).message;
@@ -1089,7 +1107,9 @@ export class Agent {
         );
       }
     } finally {
-      await this.clearTaskRunningLabel(task);
+      if (runningLabel !== null) {
+        await this.clearTaskRunningLabel(task, runningLabel);
+      }
       this.abortControllers.delete(task.id);
       this.processingTasks.delete(task.id);
     }
@@ -1101,10 +1121,13 @@ export class Agent {
   // brief is refreshed with them and the CLI agent runs again with a
   // directive listing the new messages, at most
   // TASK_ADJUSTMENT_MAX_ROUNDS times. Returns the summary of the last
-  // successful run and the freshest observed task content version. A failed
-  // Planner read never discards the completed run (the task finalizes
-  // as-is); a failed adjustment run propagates to the processTask error
-  // handling.
+  // successful run and the freshest observed task content version. The
+  // adjustment rounds are best-effort: a failed Planner read or a failed
+  // adjustment run never discards the completed work (the task finalizes
+  // with the summary of the last successful run, plus a note when an
+  // adjustment round failed). Only a user abort is rethrown, so it still
+  // wins over the finalization; only a failure of the initial run takes the
+  // processTask error path.
   private async adjustForNewComments(
     task: PlannerTask,
     project: PlannerProject | null,
@@ -1159,14 +1182,28 @@ export class Agent {
       logger.info(
         `Task '${task.title}' (${task.id}) received ${newComments.length} new comment(s) while the step ran: adjustment round ${roundsUsed}/${maxRounds}`,
       );
-      await this.writeTaskNotes(freshTask, notesFile, project);
-      summary = await cliAgent.performTask(freshTask, notesFile, {
-        ...taskOptions,
-        instruction: buildAdjustmentInstruction(
-          taskOptions.instruction,
-          newComments,
-        ),
-      });
+      try {
+        await this.writeTaskNotes(freshTask, notesFile, project);
+        summary = await cliAgent.performTask(freshTask, notesFile, {
+          ...taskOptions,
+          instruction: buildAdjustmentInstruction(
+            taskOptions.instruction,
+            newComments,
+          ),
+        });
+      } catch (error) {
+        if (isCliAbortError(error)) {
+          // A user abort always wins over the finalization.
+          throw error;
+        }
+        logger.warn(
+          `Task '${task.title}' (${task.id}) adjustment round ${roundsUsed}/${maxRounds} failed (finalizing with the summary of the last successful run): ${(error as Error).message}`,
+        );
+        return {
+          summary: `${summary}\n\n${ADJUSTMENT_FAILURE_NOTE}`,
+          contentVersion,
+        };
+      }
     }
   }
 
@@ -1202,22 +1239,40 @@ export class Agent {
   // Completes a finished task on Planner: posts the summary comment (unless
   // a previous attempt already did) and moves the task to its end status
   // unless the record is comment-only (comments mode: the task never
-  // changes status, so no folder cleanup applies either). Idempotent,
-  // driven by the FinalizationStore record of the task.
-  private async finalizeCompletedTask(taskId: string): Promise<void> {
+  // changes status, so no folder cleanup applies either). Before the
+  // end-status update the task is re-fetched: when the user moved it to the
+  // abort status after the CLI finished, the summary is still posted but the
+  // end status is not applied and the folder is not cleaned (an aborted
+  // work is still reported; the user-set status wins). A failed re-fetch
+  // propagates so the caller schedules a retry: the same Planner API is
+  // needed for the status update anyway. Idempotent, driven by the
+  // FinalizationStore record of the task.
+  private async finalizeCompletedTask(
+    taskId: string,
+  ): Promise<"finalized" | "aborted"> {
     const record = this.finalizationStore.get(taskId);
     if (!record) {
-      return;
+      return "finalized";
     }
     if (!record.commentPosted) {
       await this.planner.addTaskComment(taskId, record.summary);
       this.finalizationStore.markCommentPosted(taskId);
     }
     if (record.statusEnd === null) {
-      return;
+      return "finalized";
+    }
+    if (record.statusAbort !== null) {
+      const current = await this.planner.getTask(taskId);
+      if (current.status === record.statusAbort) {
+        logger.info(
+          `Task '${record.title}' (${taskId}) is in its abort status '${record.statusAbort}': keeping the user-set status (the summary comment was posted)`,
+        );
+        return "aborted";
+      }
     }
     await this.planner.updateTaskStatus(taskId, record.statusEnd);
     await this.cleanupTaskFolderIfNeeded(taskId, record.statusEnd);
+    return "finalized";
   }
 
   // Retries the pending finalizations of the completed tasks whose summary
@@ -1232,12 +1287,14 @@ export class Agent {
         continue;
       }
       try {
-        await this.finalizeCompletedTask(taskId);
+        const outcome = await this.finalizeCompletedTask(taskId);
         this.finalizationStore.delete(taskId);
         logger.info(
-          record.statusEnd === null
-            ? `Task '${record.title}' (${taskId}) finalized on retry (comment-only finalization)`
-            : `Task '${record.title}' (${taskId}) finalized on retry and moved to status '${record.statusEnd}'`,
+          outcome === "aborted"
+            ? `Task '${record.title}' (${taskId}) finalized on retry; its status '${record.statusAbort}' was kept (user abort)`
+            : record.statusEnd === null
+              ? `Task '${record.title}' (${taskId}) finalized on retry (comment-only finalization)`
+              : `Task '${record.title}' (${taskId}) finalized on retry and moved to status '${record.statusEnd}'`,
         );
       } catch (error) {
         this.finalizationStore.scheduleRetry(taskId);
@@ -1293,15 +1350,18 @@ export class Agent {
 
   // Marks the task as running and records its provenance in one atomic
   // mutation (the running label plus the model/CLI labels), without reading
-  // the task first. Best-effort: a label failure is logged but never fails
-  // the task processing.
+  // the task first. Returns the exact running label added (null when labels
+  // are disabled or no running label is configured), so the finally removes
+  // that label even if the configuration is hot-reloaded during the run.
+  // Best-effort: a label failure is logged but never fails the task
+  // processing.
   private async addTaskRunLabels(
     task: PlannerTask,
     model: string,
     cliAgent: string,
-  ): Promise<void> {
+  ): Promise<string | null> {
     if (!this.taskLabelsEnabled()) {
-      return;
+      return null;
     }
     const labelsToAdd = this.provenanceLabels(model, cliAgent);
     const runningLabel = this.runningLabel();
@@ -1309,7 +1369,7 @@ export class Agent {
       labelsToAdd.unshift(runningLabel);
     }
     if (labelsToAdd.length === 0) {
-      return;
+      return null;
     }
     const add = mergeLabels([], labelsToAdd);
     await this.applyLabelMutation(
@@ -1317,18 +1377,17 @@ export class Agent {
       { add },
       `add the agent labels (${add.join(", ")})`,
     );
+    return runningLabel.length > 0 ? runningLabel : null;
   }
 
-  // Removes the transient running label; the provenance labels stay. Called
-  // on every exit path of processTask through its finally.
-  private async clearTaskRunningLabel(task: PlannerTask): Promise<void> {
-    if (!this.taskLabelsEnabled()) {
-      return;
-    }
-    const runningLabel = this.runningLabel();
-    if (runningLabel.length === 0) {
-      return;
-    }
+  // Removes the exact running label added at task start; the provenance
+  // labels stay. Called on every exit path of processTask through its
+  // finally, with the snapshot taken when the run started (never the live
+  // configuration).
+  private async clearTaskRunningLabel(
+    task: PlannerTask,
+    runningLabel: string,
+  ): Promise<void> {
     await this.applyLabelMutation(
       task,
       { remove: [runningLabel] },
@@ -1642,7 +1701,10 @@ export class Agent {
     let agentNotes = "\n\n## Agent Notes\n";
     if (await fse.pathExists(notesFile)) {
       const existing = await fse.readFile(notesFile, "utf8");
-      const markerIndex = existing.indexOf(AGENT_NOTES_MARKER);
+      // The notes file embeds the previous brief, including the user
+      // comments: a comment quoting the marker must not truncate the
+      // preserved notes, so split after the last marker section.
+      const markerIndex = existing.lastIndexOf(AGENT_NOTES_MARKER);
       if (markerIndex >= 0) {
         agentNotes = existing.slice(markerIndex + AGENT_NOTES_MARKER.length);
       }

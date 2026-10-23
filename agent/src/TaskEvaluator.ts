@@ -236,11 +236,12 @@ export class TaskEvaluator {
   }
 
   private async acquire(limit: number): Promise<void> {
-    if (this.active < limit) {
-      this.active++;
-      return;
+    // Re-check after every wake-up: a fresh acquire can take the freed slot
+    // before a woken waiter resumes, so the waiters must not increment
+    // blindly past the limit.
+    while (this.active >= limit) {
+      await new Promise<void>((resolve) => this.waiters.push(resolve));
     }
-    await new Promise<void>((resolve) => this.waiters.push(resolve));
     this.active++;
   }
 
