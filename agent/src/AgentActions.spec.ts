@@ -517,16 +517,16 @@ describe("AgentActions", () => {
           ["default:", `  timeout: ${value}`, "actions: []"].join("\n"),
         );
       expect(failure('"3600"')).toThrow(
-        /'default\.timeout' must be a positive integer \(seconds\)/,
+        /'default\.timeout' must be a positive integer of at most 2147483 seconds/,
       );
       expect(failure("0")).toThrow(
-        /'default\.timeout' must be a positive integer \(seconds\)/,
+        /'default\.timeout' must be a positive integer of at most 2147483 seconds/,
       );
       expect(failure("-1")).toThrow(
-        /'default\.timeout' must be a positive integer \(seconds\)/,
+        /'default\.timeout' must be a positive integer of at most 2147483 seconds/,
       );
       expect(failure("1.5")).toThrow(
-        /'default\.timeout' must be a positive integer \(seconds\)/,
+        /'default\.timeout' must be a positive integer of at most 2147483 seconds/,
       );
     });
 
@@ -542,16 +542,54 @@ describe("AgentActions", () => {
           ].join("\n"),
         );
       expect(failure('"600"')).toThrow(
-        /'actions\[0\]\.timeout' must be a positive integer \(seconds\)/,
+        /'actions\[0\]\.timeout' must be a positive integer of at most 2147483 seconds/,
       );
       expect(failure("0")).toThrow(
-        /'actions\[0\]\.timeout' must be a positive integer \(seconds\)/,
+        /'actions\[0\]\.timeout' must be a positive integer of at most 2147483 seconds/,
       );
       expect(failure("-5")).toThrow(
-        /'actions\[0\]\.timeout' must be a positive integer \(seconds\)/,
+        /'actions\[0\]\.timeout' must be a positive integer of at most 2147483 seconds/,
       );
       expect(failure("0.5")).toThrow(
-        /'actions\[0\]\.timeout' must be a positive integer \(seconds\)/,
+        /'actions\[0\]\.timeout' must be a positive integer of at most 2147483 seconds/,
+      );
+    });
+
+    it("should accept the maximum timeout and reject one second more", () => {
+      const defaultConfig = parseAgentActions(
+        ["default:", "  timeout: 2147483", "actions: []"].join("\n"),
+      );
+      expect(defaultConfig.defaultTimeout).toBe(2147483);
+      expect(() =>
+        parseAgentActions(
+          ["default:", "  timeout: 2147484", "actions: []"].join("\n"),
+        ),
+      ).toThrow(
+        /'default\.timeout' must be a positive integer of at most 2147483 seconds/,
+      );
+
+      const actionConfig = parseAgentActions(
+        [
+          "actions:",
+          "  - project: Web",
+          "    status_start: To Do",
+          "    status_end: Done",
+          "    timeout: 2147483",
+        ].join("\n"),
+      );
+      expect(actionConfig.actions[0].timeout).toBe(2147483);
+      expect(() =>
+        parseAgentActions(
+          [
+            "actions:",
+            "  - project: Web",
+            "    status_start: To Do",
+            "    status_end: Done",
+            "    timeout: 2147484",
+          ].join("\n"),
+        ),
+      ).toThrow(
+        /'actions\[0\]\.timeout' must be a positive integer of at most 2147483 seconds/,
       );
     });
 

@@ -3,7 +3,7 @@ import * as os from "os";
 import * as path from "path";
 import type { AgentActionsConfig } from "./AgentActions";
 import { Config } from "./Config";
-import { BaseCliAgent, extractTaskModel, resolveModel } from "./clients/BaseCliAgent";
+import { BaseCliAgent, MODEL_LIST_FAILURE_TTL_MS, extractTaskModel, resolveModel } from "./clients/BaseCliAgent";
 import { CliAbortedError, runCli } from "./CliUtils";
 import type { RunCliOptions } from "./CliUtils";
 import type { PlannerTask } from "./PlannerClient";
@@ -64,7 +64,10 @@ const MockedRunCli = runCli as unknown as jest.Mock;
 // BaseCliAgent logs through the 'cli-agent' module logger: grab its info
 // mock to assert the logged lines.
 const otelMock = jest.requireMock("./OTelContext") as {
-  __moduleLoggers: Record<string, { info: jest.Mock }>;
+  __moduleLoggers: Record<
+    string,
+    { info: jest.Mock; warn: jest.Mock; error: jest.Mock }
+  >;
   __histograms: Record<string, { record: jest.Mock }>;
 };
 const moduleLoggers = otelMock.__moduleLoggers;
@@ -107,12 +110,26 @@ class TestCliAgent extends BaseCliAgent {
     return null;
   }
 
-  protected parseModelList(): string[] {
+  protected parseModelList(_stdout: string): string[] {
     return [];
   }
 
   protected onInvocationSettled(args: string[]): void {
     this.settledCalls.push(args);
+  }
+}
+
+// Adapter exposing a model listing, for the listing-cache tests.
+class ListableTestCliAgent extends TestCliAgent {
+  protected buildListModelArgs(): string[] | null {
+    return ["--list-models"];
+  }
+
+  protected parseModelList(stdout: string): string[] {
+    return stdout
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0);
   }
 }
 
@@ -364,6 +381,111 @@ describe("BaseCliAgent", () => {
 
       const { options } = lastCall();
       expect(options.abortSignal).toBe(controller.signal);
+    });
+  });
+
+  describe("model listing cache", () => {
+    let listable: ListableTestCliAgent;
+    let warn: jest.Mock;
+
+    const listingCalls = (): number =>
+      MockedRunCli.mock.calls.filter(
+        (call) => (call[1] as string[]).includes("--list-models"),
+      ).length;
+
+    beforeEach(() => {
+      const config = new Config();
+      config.DATA_DIR = dataDir;
+      config.CORE_SKILLS_PATH = path.join(dataDir, "core-skills");
+      listable = new ListableTestCliAgent(config, agentActions);
+      warn = otelMock.__moduleLoggers["cli-agent"].warn;
+      warn.mockClear();
+    });
+
+    it("lists the models once while the failure is cached", async () => {
+      MockedRunCli.mockImplementation(async (_command: string, args: string[]) => {
+        if (args.includes("--list-models")) {
+          throw new Error("listing boom");
+        }
+        return { stdout: "CLI reply\n", stderr: "" };
+      });
+
+      await expect(listable.listModels()).resolves.toBeNull();
+      await expect(listable.listModels()).resolves.toBeNull();
+
+      expect(listingCalls()).toBe(1);
+      expect(warn).toHaveBeenCalledTimes(1);
+    });
+
+    it("retries the listing after the failure TTL", async () => {
+      let now = 1000000;
+      const nowSpy = jest.spyOn(Date, "now").mockImplementation(() => now);
+      try {
+        MockedRunCli.mockImplementation(async (_command: string, args: string[]) => {
+          if (args.includes("--list-models")) {
+            throw new Error("listing boom");
+          }
+          return { stdout: "CLI reply\n", stderr: "" };
+        });
+
+        await listable.listModels();
+        await listable.listModels();
+        expect(listingCalls()).toBe(1);
+
+        now += MODEL_LIST_FAILURE_TTL_MS + 1;
+        await listable.listModels();
+        expect(listingCalls()).toBe(2);
+      } finally {
+        nowSpy.mockRestore();
+      }
+    });
+
+    it("dedupes concurrent callers on one listing", async () => {
+      MockedRunCli.mockImplementation(async (_command: string, args: string[]) => {
+        if (args.includes("--list-models")) {
+          await new Promise((resolve) => setTimeout(resolve, 10));
+          throw new Error("listing boom");
+        }
+        return { stdout: "CLI reply\n", stderr: "" };
+      });
+
+      await Promise.all([listable.listModels(), listable.listModels()]);
+
+      expect(listingCalls()).toBe(1);
+    });
+
+    it("caches a successful listing indefinitely", async () => {
+      MockedRunCli.mockImplementation(async (_command: string, args: string[]) => {
+        if (args.includes("--list-models")) {
+          return { stdout: "Auto\nFlash\n", stderr: "" };
+        }
+        return { stdout: "CLI reply\n", stderr: "" };
+      });
+
+      await expect(listable.listModels()).resolves.toEqual(["Auto", "Flash"]);
+      await expect(listable.listModels()).resolves.toEqual(["Auto", "Flash"]);
+
+      expect(listingCalls()).toBe(1);
+    });
+
+    it("treats an empty listing as a cached failure", async () => {
+      MockedRunCli.mockImplementation(async (_command: string, args: string[]) => {
+        if (args.includes("--list-models")) {
+          return { stdout: "\n", stderr: "" };
+        }
+        return { stdout: "CLI reply\n", stderr: "" };
+      });
+
+      await expect(listable.listModels()).resolves.toBeNull();
+      await expect(listable.listModels()).resolves.toBeNull();
+
+      expect(listingCalls()).toBe(1);
+    });
+
+    it("skips the validation for an adapter without a listing", async () => {
+      await expect(agent.listModels()).resolves.toBeNull();
+      expect(listingCalls()).toBe(0);
+      expect(MockedRunCli).not.toHaveBeenCalled();
     });
   });
 

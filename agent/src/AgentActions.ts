@@ -1,6 +1,6 @@
 import * as fse from "fs-extra";
 import { parse } from "yaml";
-import { CLI_AGENT_NAMES } from "./Config";
+import { CLI_AGENT_NAMES, MAX_DELAY_SECONDS } from "./Config";
 
 /**
  * One action of the agent: the tasks matching the project pattern and the
@@ -193,6 +193,7 @@ export function parseAgentActions(content: string): AgentActionsConfig {
         "timeout",
         "default.timeout",
         errors,
+        MAX_DELAY_SECONDS,
       );
       if (timeout !== null) {
         config.defaultTimeout = timeout;
@@ -360,6 +361,7 @@ export function parseAgentActions(content: string): AgentActionsConfig {
         "timeout",
         `actions[${index}].timeout`,
         errors,
+        MAX_DELAY_SECONDS,
       );
       const weight = readPositiveWeight(
         action,
@@ -697,20 +699,31 @@ function readPriority(
 }
 
 // Reads an optional positive integer field (a timeout in seconds); missing
-// fields report 'not set' (null). Non-integer, zero, negative or float
-// values always produce a validation error so typos fail fast at startup.
+// fields report 'not set' (null). Non-integer, zero, negative, float or
+// above-max values always produce a validation error so typos fail fast at
+// startup (a delay above the timer maximum would overflow into a hot loop).
 function readPositiveInteger(
   source: Record<string, unknown>,
   field: string,
   label: string,
   errors: string[],
+  max?: number,
 ): number | null {
   const value = source[field];
   if (value === undefined) {
     return null;
   }
-  if (typeof value !== "number" || !Number.isInteger(value) || value <= 0) {
-    errors.push(`'${label}' must be a positive integer (seconds)`);
+  if (
+    typeof value !== "number" ||
+    !Number.isInteger(value) ||
+    value <= 0 ||
+    (max !== undefined && value > max)
+  ) {
+    errors.push(
+      max !== undefined
+        ? `'${label}' must be a positive integer of at most ${max} seconds (current value: '${String(value)}')`
+        : `'${label}' must be a positive integer (seconds)`,
+    );
     return null;
   }
   return value;

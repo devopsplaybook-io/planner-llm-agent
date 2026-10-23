@@ -366,7 +366,7 @@ describe("Config", () => {
       expect(errors).toContain("PLANNER_URL is required");
       expect(errors).toContain("PLANNER_API_KEY is required");
       expect(errors).toContain(
-        "TASK_POLLING_INTERVAL must be a positive integer (current value: '0')",
+        "TASK_POLLING_INTERVAL must be a positive integer of at most 2147483 seconds (current value: '0')",
       );
     });
 
@@ -388,7 +388,7 @@ describe("Config", () => {
 
       const errors = config.validate();
       expect(errors).toEqual([
-        "TASK_POLLING_INTERVAL must be a positive integer (current value: 'NaN')",
+        "TASK_POLLING_INTERVAL must be a positive integer of at most 2147483 seconds (current value: 'NaN')",
       ]);
     });
 
@@ -429,7 +429,7 @@ describe("Config", () => {
 
       const errors = config.validate();
       expect(errors).toEqual([
-        "TASK_TIMEOUT must be a positive integer (current value: '0')",
+        "TASK_TIMEOUT must be a positive integer of at most 2147483 seconds (current value: '0')",
       ]);
     });
 
@@ -597,8 +597,95 @@ describe("Config", () => {
 
       const errors = config.validate();
       expect(errors).toEqual([
-        "AGENT_NOTE_INTERVAL must be a positive integer or 0 to disable (current value: 'NaN')",
+        "AGENT_NOTE_INTERVAL must be a positive integer of at most 2147483 seconds or 0 to disable (current value: 'NaN')",
       ]);
+    });
+
+    it("should accept the maximum seconds-based delay and reject one second more", () => {
+      const secondsKeys: [string, number][] = [
+        ["TASK_POLLING_INTERVAL", 2147483],
+        ["TASK_POLLING_MAX_INTERVAL", 2147483],
+        ["TASK_TIMEOUT", 2147483],
+        ["AGENT_EVALUATION_TIMEOUT", 2147483],
+        ["TASK_PROGRESS_COMMENT_INTERVAL", 2147483],
+        ["AGENT_NOTE_INTERVAL", 2147483],
+        ["AGENT_CONFIG_SYNC_INTERVAL", 2147483],
+      ];
+      for (const [key, value] of secondsKeys) {
+        const accepted = new Config();
+        accepted.PLANNER_API_KEY = "key";
+        accepted.AGENT_NOTE_PROJECT = "Agent";
+        accepted.AGENT_CONFIG_REPOSITORY =
+          "https://github.com/acme/agent-config.git";
+        (accepted as unknown as Record<string, number>)[key] = value;
+        expect(accepted.validate()).toEqual([]);
+
+        const rejected = new Config();
+        rejected.PLANNER_API_KEY = "key";
+        rejected.AGENT_NOTE_PROJECT = "Agent";
+        rejected.AGENT_CONFIG_REPOSITORY =
+          "https://github.com/acme/agent-config.git";
+        (rejected as unknown as Record<string, number>)[key] = value + 1;
+        const errors = rejected.validate();
+        expect(errors).toHaveLength(1);
+        expect(errors[0]).toContain(`${key} must be a`);
+        expect(errors[0]).toContain("integer of at most 2147483 seconds");
+      }
+    });
+
+    it("should keep accepting a disabled progress or note interval", () => {
+      const config = new Config();
+      config.PLANNER_API_KEY = "key";
+      config.AGENT_NOTE_PROJECT = "Agent";
+      config.TASK_PROGRESS_COMMENT_INTERVAL = 0;
+      config.AGENT_NOTE_INTERVAL = 0;
+      expect(config.validate()).toEqual([]);
+    });
+
+    it("should default the attachment size cap to 50 MiB", () => {
+      const config = new Config();
+      expect(config.TASK_ATTACHMENT_MAX_BYTES).toBe(50 * 1024 * 1024);
+    });
+
+    it("should accept a disabled attachment size cap", () => {
+      const config = new Config();
+      config.PLANNER_API_KEY = "key";
+      config.TASK_ATTACHMENT_MAX_BYTES = 0;
+      expect(config.validate()).toEqual([]);
+    });
+
+    it("should report an invalid attachment size cap", () => {
+      const config = new Config();
+      config.PLANNER_API_KEY = "key";
+      config.TASK_ATTACHMENT_MAX_BYTES = -1;
+      expect(config.validate()).toEqual([
+        "TASK_ATTACHMENT_MAX_BYTES must be a non-negative integer (0 disables the cap) (current value: '-1')",
+      ]);
+
+      config.TASK_ATTACHMENT_MAX_BYTES = 1.5;
+      expect(config.validate()).toEqual([
+        "TASK_ATTACHMENT_MAX_BYTES must be a non-negative integer (0 disables the cap) (current value: '1.5')",
+      ]);
+    });
+
+    it("should accept a relative agent config folder", () => {
+      for (const folder of ["", "skills", "skills/", "a/b"]) {
+        const config = new Config();
+        config.PLANNER_API_KEY = "key";
+        config.AGENT_CONFIG_FOLDER = folder;
+        expect(config.validate()).toEqual([]);
+      }
+    });
+
+    it("should report an unsafe agent config folder", () => {
+      for (const folder of ["../x", "/abs", "a/../b", "a//b", "C:\\x", "a\\b"]) {
+        const config = new Config();
+        config.PLANNER_API_KEY = "key";
+        config.AGENT_CONFIG_FOLDER = folder;
+        expect(config.validate()).toEqual([
+          `AGENT_CONFIG_FOLDER must be a relative path without '..' or empty segments (current value: '${folder}')`,
+        ]);
+      }
     });
 
     it("should accept every supported CLI agent", () => {

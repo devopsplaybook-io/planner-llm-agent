@@ -435,6 +435,24 @@ describe("Scheduler", () => {
       expect(selectTasksLegacy(candidates, 2, 2)).toEqual([]);
     });
 
+    it("admits at least one task for a positive fractional budget", () => {
+      const candidates = [
+        buildCandidate(buildTask({ id: "t1" })),
+        buildCandidate(buildTask({ id: "t2" })),
+        buildCandidate(buildTask({ id: "t3" })),
+      ];
+      expect(
+        selectTasksLegacy(candidates, 0.5, 0).map((candidate) => candidate.task.id),
+      ).toEqual(["t1"]);
+      expect(
+        selectTasksLegacy(candidates, 1.5, 0).map((candidate) => candidate.task.id),
+      ).toEqual(["t1"]);
+      expect(selectTasksLegacy(candidates, 0, 0)).toEqual([]);
+      expect(
+        selectTasksLegacy(candidates, 2.5, 1).map((candidate) => candidate.task.id),
+      ).toEqual(["t1"]);
+    });
+
     it("ignores the weights completely", () => {
       const candidates = [
         buildCandidate(

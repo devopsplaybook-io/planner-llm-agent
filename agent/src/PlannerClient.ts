@@ -19,6 +19,25 @@ export class PlannerRequestError extends Error {
   }
 }
 
+// An attachment larger than the configured cap: the download is aborted
+// without buffering the whole body, and the caller skips the attachment.
+export class AttachmentTooLargeError extends Error {
+  public readonly limit: number;
+  // Declared (content-length) or observed size in bytes when known.
+  public readonly size: number | null;
+
+  constructor(limit: number, size: number | null) {
+    super(
+      size !== null
+        ? `Attachment exceeds the maximum size of ${limit} bytes (${size} bytes)`
+        : `Attachment exceeds the maximum size of ${limit} bytes`,
+    );
+    this.name = "AttachmentTooLargeError";
+    this.limit = limit;
+    this.size = size;
+  }
+}
+
 export interface PlannerUser {
   id: string;
   name: string;
@@ -351,7 +370,56 @@ export class PlannerClient {
           `Planner request to '/api/tasks/${taskId}/attachments/${attachmentId}' failed with status ${response.status}`,
         );
       }
-      return Buffer.from(await response.arrayBuffer());
+      // Read the cap at call time so a hot-reloaded value applies; 0 (or an
+      // invalid value) disables it.
+      const configuredLimit = this.config.TASK_ATTACHMENT_MAX_BYTES;
+      const limit =
+        Number.isInteger(configuredLimit) && configuredLimit > 0
+          ? configuredLimit
+          : 0;
+      const declared = Number.parseInt(
+        response.headers.get("content-length") ?? "",
+        10,
+      );
+      if (limit > 0 && Number.isFinite(declared) && declared > limit) {
+        await response.body?.cancel().catch(() => undefined);
+        throw new AttachmentTooLargeError(limit, declared);
+      }
+      const body = response.body;
+      if (body === null) {
+        const buffer = Buffer.from(await response.arrayBuffer());
+        if (limit > 0 && buffer.length > limit) {
+          throw new AttachmentTooLargeError(limit, buffer.length);
+        }
+        return buffer;
+      }
+      const reader = body.getReader();
+      const chunks: Buffer[] = [];
+      let total = 0;
+      try {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) {
+            break;
+          }
+          total += value.byteLength;
+          if (limit > 0 && total > limit) {
+            // Stop pulling the stream: the memory stays bounded even for a
+            // chunked response without a content-length header.
+            await reader.cancel().catch(() => undefined);
+            throw new AttachmentTooLargeError(limit, total);
+          }
+          chunks.push(Buffer.from(value));
+        }
+      } finally {
+        try {
+          reader.releaseLock();
+        } catch {
+          // A reader with a pending read cannot release; the stream is
+          // already cancelled or finished in that case.
+        }
+      }
+      return Buffer.concat(chunks);
     } catch (error) {
       span.recordException(error as Error);
       throw error;

@@ -3,6 +3,7 @@ import * as fse from "fs-extra";
 import * as os from "os";
 import * as path from "path";
 import { QoderClient } from "./QoderClient";
+import { MODEL_LIST_FAILURE_TTL_MS } from "./BaseCliAgent";
 import { Config } from "../Config";
 
 // The shared logger is created inside the factory because the mocked
@@ -905,7 +906,14 @@ describe("QoderClient", () => {
     expect(summary).toBe(
       "Done\n\n---\nModel: claude-opus-4-1 · Duration: 0s",
     );
-    expect(mockLogger.warn).not.toHaveBeenCalled();
+    // The failure is logged once and the validation is skipped: the task
+    // still runs with the model the CLI resolves on its own.
+    expect(mockLogger.warn).toHaveBeenCalledTimes(1);
+    expect(mockLogger.warn).toHaveBeenCalledWith(
+      expect.stringContaining(
+        "model listing failed (Command failed): the model check is skipped for 5 minutes",
+      ),
+    );
   });
 
   it("should list the models only once across tasks", async () => {
@@ -932,6 +940,196 @@ describe("QoderClient", () => {
         (call[1] as string[]).includes("--list-models"),
       ),
     ).toHaveLength(1);
+  });
+
+  it("should not retry a failed model listing within the TTL", async () => {
+    mockExecFile.mockImplementation(
+      (
+        _command: string,
+        args: string[],
+        _options: unknown,
+        callback: (error: Error | null, stdout: string, stderr: string) => void,
+      ) => {
+        if (args.includes("--list-models")) {
+          callback(
+            Object.assign(new Error("Command failed"), {
+              code: 1,
+              killed: false,
+              stderr: "boom",
+              stdout: "",
+            }),
+            "",
+            "",
+          );
+          return;
+        }
+        callback(null, JSON.stringify({ result: "Done" }), "");
+      },
+    );
+
+    const client = new QoderClient(config);
+    const task = {
+      id: "task-1",
+      projectId: "project-1",
+      title: "Implement feature",
+      status: "To Do",
+      priority: "medium",
+      dateUpdated: "",
+      description: "Add a feature\nagent-model: claude-opus-4-1\n",
+      comments: [],
+      attachments: [],
+    };
+    await client.performTask(
+      task,
+      path.join(os.tmpdir(), "qoder-spec", "task-1-Agent.md"),
+    );
+    await client.performTask(
+      task,
+      path.join(os.tmpdir(), "qoder-spec", "task-2-Agent.md"),
+    );
+
+    expect(
+      mockExecFile.mock.calls.filter((call) =>
+        (call[1] as string[]).includes("--list-models"),
+      ),
+    ).toHaveLength(1);
+  });
+
+  it("should retry a failed model listing after the TTL", async () => {
+    let now = 1000000;
+    const nowSpy = jest.spyOn(Date, "now").mockImplementation(() => now);
+    try {
+      mockExecFile.mockImplementation(
+        (
+          _command: string,
+          args: string[],
+          _options: unknown,
+          callback: (error: Error | null, stdout: string, stderr: string) => void,
+        ) => {
+          if (args.includes("--list-models")) {
+            callback(
+              Object.assign(new Error("Command failed"), {
+                code: 1,
+                killed: false,
+                stderr: "boom",
+                stdout: "",
+              }),
+              "",
+              "",
+            );
+            return;
+          }
+          callback(null, JSON.stringify({ result: "Done" }), "");
+        },
+      );
+
+      const client = new QoderClient(config);
+      const task = {
+        id: "task-1",
+        projectId: "project-1",
+        title: "Implement feature",
+        status: "To Do",
+        priority: "medium",
+        dateUpdated: "",
+        description: "Add a feature\nagent-model: claude-opus-4-1\n",
+        comments: [],
+        attachments: [],
+      };
+      await client.performTask(
+        task,
+        path.join(os.tmpdir(), "qoder-spec", "task-1-Agent.md"),
+      );
+      await client.performTask(
+        task,
+        path.join(os.tmpdir(), "qoder-spec", "task-2-Agent.md"),
+      );
+      expect(
+        mockExecFile.mock.calls.filter((call) =>
+          (call[1] as string[]).includes("--list-models"),
+        ),
+      ).toHaveLength(1);
+
+      now += MODEL_LIST_FAILURE_TTL_MS + 1;
+      await client.performTask(
+        task,
+        path.join(os.tmpdir(), "qoder-spec", "task-3-Agent.md"),
+      );
+      expect(
+        mockExecFile.mock.calls.filter((call) =>
+          (call[1] as string[]).includes("--list-models"),
+        ),
+      ).toHaveLength(2);
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
+
+  it("should keep the credits file valid under concurrent writes and reads", async () => {
+    let credits = 0;
+    mockExecFile.mockImplementation(
+      (
+        _command: string,
+        args: string[],
+        _options: unknown,
+        callback: (error: Error | null, stdout: string, stderr: string) => void,
+      ) => {
+        if (args.includes("--list-models")) {
+          callback(null, "MODEL\nAuto\n", "");
+          return;
+        }
+        credits += 1;
+        callback(
+          null,
+          JSON.stringify({ result: "Done", total_credits: credits }),
+          "",
+        );
+      },
+    );
+
+    const client = new QoderClient(config);
+    const creditsFile = path.join(
+      os.tmpdir(),
+      "qoder-spec",
+      "data",
+      "qoder-credits.json",
+    );
+    const task = {
+      id: "task-1",
+      projectId: "project-1",
+      title: "Implement feature",
+      status: "To Do",
+      priority: "medium",
+      dateUpdated: "",
+      description: "Add a feature\nagent-model: Auto\n",
+      comments: [],
+      attachments: [],
+    };
+    const reads = Array.from({ length: 20 }, async () => {
+      for (let attempt = 0; attempt < 10; attempt += 1) {
+        await new Promise((resolve) => setImmediate(resolve));
+        if (await fse.pathExists(creditsFile)) {
+          const content = await fse.readJson(creditsFile);
+          expect(typeof content.credits).toBe("number");
+        }
+      }
+    });
+    await Promise.all([
+      ...Array.from({ length: 20 }, (_, index) =>
+        client.performTask(
+          task,
+          path.join(
+            os.tmpdir(),
+            "qoder-spec",
+            `concurrent-${index}-Agent.md`,
+          ),
+        ),
+      ),
+      ...reads,
+    ]);
+
+    const content = await fse.readJson(creditsFile);
+    expect(typeof content.credits).toBe("number");
+    await expect(client.readUsage()).resolves.toEqual(expect.any(Number));
   });
 
   it("should not check the models when the task runs with the CLI default", async () => {

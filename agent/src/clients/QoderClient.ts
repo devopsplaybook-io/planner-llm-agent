@@ -1,5 +1,6 @@
 import * as fse from "fs-extra";
 import * as path from "path";
+import { writeJsonAtomic } from "../AtomicFile";
 import { Config } from "../Config";
 import {
   extractEnvelopeNumber,
@@ -101,7 +102,8 @@ export class QoderClient extends BaseCliAgent {
 
   protected async writeUsage(credits: number): Promise<void> {
     try {
-      await fse.outputJson(getCreditsFile(this.config), { credits });
+      // Locked, atomic write: concurrent tasks never leave a corrupt file.
+      await writeJsonAtomic(getCreditsFile(this.config), { credits });
     } catch {
       // Non-fatal: the credits display is best-effort.
     }

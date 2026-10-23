@@ -2,7 +2,11 @@ import { execFile } from "child_process";
 import * as fse from "fs-extra";
 import * as os from "os";
 import * as path from "path";
-import { AgentConfigRepository, listAgentSkills } from "./AgentConfigRepository";
+import {
+  AgentConfigRepository,
+  getAgentConfigContentPath,
+  listAgentSkills,
+} from "./AgentConfigRepository";
 import { Config } from "./Config";
 
 jest.mock("./OTelContext", () => ({
@@ -106,6 +110,26 @@ describe("AgentConfigRepository", () => {
     const revParseCall = gitCalls().find((call) => call[1][0] === "rev-parse");
     expect(revParseCall?.[2].cwd).toBe(targetDir());
     expect(await fse.pathExists(path.join(targetDir(), ".git"))).toBe(false);
+  });
+
+  it("resolves a valid folder exactly as before", () => {
+    config.AGENT_CONFIG_FOLDER = "skills/";
+    expect(getAgentConfigContentPath(config)).toBe(
+      path.join(targetDir(), "skills"),
+    );
+    config.AGENT_CONFIG_FOLDER = "skills";
+    expect(getAgentConfigContentPath(config)).toBe(
+      path.join(targetDir(), "skills"),
+    );
+    config.AGENT_CONFIG_FOLDER = "";
+    expect(getAgentConfigContentPath(config)).toBe(targetDir());
+  });
+
+  it("fails safe to the repository root for an invalid folder", () => {
+    for (const folder of ["../x", "/abs", "a/../b", "a//b", "C:\\x", "a\\b"]) {
+      config.AGENT_CONFIG_FOLDER = folder;
+      expect(getAgentConfigContentPath(config)).toBe(targetDir());
+    }
   });
 
   it("clones with a sparse checkout when a folder is configured", async () => {
