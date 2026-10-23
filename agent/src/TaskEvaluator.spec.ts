@@ -305,6 +305,27 @@ describe("TaskEvaluator", () => {
       expect(maxConcurrent).toBe(2);
     });
 
+    it("never exceeds the concurrency limit when an acquire races a released slot", async () => {
+      const mockCli = buildMockCli();
+      const evaluator = buildEvaluator(mockCli, { concurrency: 2 });
+      const semaphore = evaluator as unknown as {
+        acquire(limit: number): Promise<void>;
+        release(): void;
+        readonly active: number;
+      };
+
+      await semaphore.acquire(1); // active = 1
+      const waiting = semaphore.acquire(1); // queued behind the limit
+      semaphore.release(); // active = 0, wakes the waiter
+      void semaphore.acquire(1); // takes the freed slot first: active = 1
+      await Promise.resolve(); // let the woken waiter resume
+      const peak = semaphore.active;
+      semaphore.release();
+      await waiting;
+      // The woken waiter must re-wait instead of incrementing to 2.
+      expect(peak).toBeLessThanOrEqual(1);
+    });
+
     it("lowers the batch concurrency to the process cap of the scheduler", async () => {
       const mockCli = buildMockCli();
       let concurrent = 0;

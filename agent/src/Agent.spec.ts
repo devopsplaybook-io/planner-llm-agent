@@ -891,6 +891,75 @@ describe("Agent", () => {
     agent.stop();
   });
 
+  it("should preserve the Agent Notes when a comment quotes the marker", async () => {
+    config.TASK_STATUS_CLEANUP = "Archived";
+    const notesFile = path.join(dataDir, "tasks", "task-1-Agent.md");
+    const quotedMarkerComment = `Please use this marker: ${AGENT_NOTES_MARKER}`;
+    await fse.ensureDir(path.dirname(notesFile));
+    await fse.writeFile(
+      notesFile,
+      [
+        "# Task: Implement feature",
+        "",
+        "## Description",
+        "",
+        "Old description",
+        "",
+        "## Comments",
+        "",
+        `- **Alice** (2026-09-02T00:00:00.000Z): ${quotedMarkerComment}`,
+        "",
+        "## Attachments",
+        "",
+        "*(none)*",
+        "",
+        AGENT_NOTES_MARKER,
+        "",
+        "## Agent Notes",
+        "",
+        "Previous findings from the last run",
+      ].join("\n"),
+    );
+    mockPlanner.listAssignedTasks.mockResolvedValue([
+      {
+        id: "task-1",
+        title: "Implement feature",
+        status: "To Do",
+        description: "New description",
+        comments: [
+          {
+            id: "comment-1",
+            userId: "user-2",
+            userName: "Alice",
+            text: quotedMarkerComment,
+            dateCreated: "2026-09-02T00:00:00.000Z",
+          },
+        ],
+        attachments: [],
+      },
+    ]);
+    mockQoder.performTask.mockResolvedValue("Feature implemented");
+
+    const agent = createAgent();
+    agent.start();
+    await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
+
+    const content = await fse.readFile(notesFile, "utf8");
+    // The quoted marker must not be used as the split point: the brief is
+    // regenerated once and the preserved notes are not duplicated.
+    expect(content.match(/## Attachments/g)).toHaveLength(1);
+    expect(content.match(/## Agent Notes/g)).toHaveLength(1);
+    expect(content.match(/Previous findings from the last run/g)).toHaveLength(
+      1,
+    );
+    expect(content.split(AGENT_NOTES_MARKER).length - 1).toBe(2);
+    // The preserved notes stay after the final marker section.
+    expect(content.indexOf("## Agent Notes")).toBeGreaterThan(
+      content.lastIndexOf(AGENT_NOTES_MARKER),
+    );
+    agent.stop();
+  });
+
   it("should move a failing task to the end status with an explanation", async () => {
     mockPlanner.listAssignedTasks.mockResolvedValue([
       {
@@ -3558,8 +3627,8 @@ describe("Agent", () => {
     agent.stop();
   });
 
-  it("should move the task to the error status when an adjustment run fails", async () => {
-    mockPlanner.listAssignedTasks.mockResolvedValue([
+  it("should finalize with the last successful summary when an adjustment run fails", async () => {
+    mockPlannerTasks([
       {
         id: "task-1",
         title: "Implement feature",
@@ -3597,12 +3666,171 @@ describe("Agent", () => {
     agent.start();
     await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
 
+    // The failed adjustment never discards the completed first run: its
+    // summary is posted with a note, and the task reaches its end status.
     expect(mockQoder.performTask).toHaveBeenCalledTimes(2);
+    const comments = mockPlanner.addTaskComment.mock.calls
+      .filter((call) => call[0] === "task-1")
+      .map((call) => String(call[1]));
+    expect(comments).toHaveLength(1);
+    expect(comments[0]).toContain("First run summary");
+    expect(comments[0]).toContain("an adjustment round failed");
+    expect(
+      comments.some((text) => text.includes("Task processing failed:")),
+    ).toBe(false);
+    expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith("task-1", "Done");
+    agent.stop();
+  });
+
+  it("should finalize with the last successful summary when an adjustment run times out", async () => {
+    mockPlannerTasks([
+      {
+        id: "task-1",
+        title: "Implement feature",
+        status: "To Do",
+        description: "Add a feature",
+        comments: [],
+        attachments: [],
+      },
+    ]);
+    mockPlanner.getTask.mockResolvedValue({
+      id: "task-1",
+      projectId: "",
+      title: "Implement feature",
+      status: "To Do",
+      priority: "medium",
+      description: "Add a feature",
+      dateUpdated: "2026-10-15T01:00:00.000Z",
+      comments: [
+        {
+          id: "comment-new",
+          userId: "user-2",
+          userName: "Alice",
+          text: "A late message",
+          dateCreated: "2026-10-15T00:30:00.000Z",
+        },
+      ],
+      attachments: [],
+      dependencies: [],
+    });
+    mockQoder.performTask
+      .mockResolvedValueOnce("First run summary")
+      .mockRejectedValueOnce(
+        new Error("Qoder task execution timed out after 60 seconds"),
+      );
+
+    const agent = createAgent();
+    agent.start();
+    await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
+
+    expect(mockQoder.performTask).toHaveBeenCalledTimes(2);
+    expect(mockPlanner.addTaskComment).toHaveBeenCalledWith(
+      "task-1",
+      expect.stringContaining("First run summary"),
+    );
+    expect(mockPlanner.addTaskComment).toHaveBeenCalledWith(
+      "task-1",
+      expect.stringContaining("an adjustment round failed"),
+    );
+    expect(
+      logSpy.mock.calls.some((call) =>
+        String(call[0]).includes("adjustment round 1/2 failed"),
+      ),
+    ).toBe(true);
+    expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith("task-1", "Done");
+    agent.stop();
+  });
+
+  it("should take the failure path when the initial run fails and never adjust", async () => {
+    config.TASK_ADJUSTMENT_MAX_ROUNDS = 2;
+    mockPlannerTasks([
+      {
+        id: "task-1",
+        title: "Implement feature",
+        status: "To Do",
+        description: "Add a feature",
+        comments: [],
+        attachments: [],
+      },
+    ]);
+    mockQoder.performTask.mockRejectedValue(new Error("CLI exploded"));
+
+    const agent = createAgent();
+    agent.start();
+    await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
+
+    // Only the initial run failed: the generic error path applies, and no
+    // adjustment check is ever attempted.
+    expect(mockQoder.performTask).toHaveBeenCalledTimes(1);
+    expect(mockPlanner.getTask).not.toHaveBeenCalled();
     expect(mockPlanner.addTaskComment).toHaveBeenCalledWith(
       "task-1",
       expect.stringContaining("Task processing failed:"),
     );
     expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith("task-1", "Done");
+    agent.stop();
+  });
+
+  it("should still abort when an adjustment run is aborted", async () => {
+    mockPlannerTasks([
+      {
+        id: "task-1",
+        title: "Implement feature",
+        status: "To Do",
+        description: "Add a feature",
+        comments: [],
+        attachments: [],
+      },
+    ]);
+    mockPlanner.getTask.mockResolvedValue({
+      id: "task-1",
+      projectId: "",
+      title: "Implement feature",
+      status: "To Do",
+      priority: "medium",
+      description: "Add a feature",
+      dateUpdated: "2026-10-15T01:00:00.000Z",
+      comments: [
+        {
+          id: "comment-new",
+          userId: "user-2",
+          userName: "Alice",
+          text: "A late message",
+          dateCreated: "2026-10-15T00:30:00.000Z",
+        },
+      ],
+      attachments: [],
+      dependencies: [],
+    });
+    mockQoder.performTask
+      .mockResolvedValueOnce("First run summary")
+      .mockRejectedValueOnce(
+        new CliAbortedError("Qoder task execution aborted"),
+      );
+    const actions: AgentActionsConfig = {
+      defaultStatusAbort: "Aborted",
+      defaultModel: "",
+      defaultTimeout: null,
+      actions: WILDCARD_ACTIONS.actions,
+    };
+    const store = new FinalizationStore({ retryBaseMs: 60000 });
+
+    const agent = createAgent(actions, store);
+    agent.start();
+    await waitFor(
+      () =>
+        mockPlanner.addTaskComment.mock.calls.some((call) =>
+          String(call[1]).includes("Task aborted at user request"),
+        ),
+      5000,
+    );
+
+    // The abort wins over the finalization: the abort comment is posted, the
+    // first run summary is not, and no status move or record happens.
+    expect(mockQoder.performTask).toHaveBeenCalledTimes(2);
+    expect(mockPlanner.addTaskComment).toHaveBeenCalledTimes(1);
+    expect(mockPlanner.updateTaskStatus).not.toHaveBeenCalled();
+    expect(store.has("task-1")).toBe(false);
     agent.stop();
   });
 
@@ -4004,6 +4232,165 @@ describe("Agent", () => {
     agent.stop();
   });
 
+  it("should post the summary but keep the user abort status when the task is aborted during finalization", async () => {
+    const task = {
+      id: "task-1",
+      title: "Implement feature",
+      status: "To Do",
+      description: "Add a feature",
+      comments: [] as unknown[],
+      attachments: [] as unknown[],
+    };
+    mockPlanner.listAssignedTasks.mockImplementation(async () => [
+      { ...task },
+    ]);
+    const store = new FinalizationStore({ retryBaseMs: 60000 });
+    mockQoder.performTask.mockImplementation(async () => {
+      // The CLI finished, and the user moved the task to the abort status
+      // before the finalization could apply the end status.
+      task.status = "Aborted";
+      return "Feature implemented";
+    });
+    const actions: AgentActionsConfig = {
+      defaultStatusAbort: "Aborted",
+      defaultModel: "",
+      defaultTimeout: null,
+      actions: WILDCARD_ACTIONS.actions,
+    };
+
+    const agent = createAgent(actions, store);
+    agent.start();
+    await waitFor(() => !store.has("task-1") && mockPlanner.addTaskComment.mock.calls.length > 0);
+
+    // The aborted work is still reported, but the user-set status is kept:
+    // no end status and no folder cleanup.
+    expect(mockPlanner.addTaskComment).toHaveBeenCalledWith(
+      "task-1",
+      "Feature implemented",
+    );
+    expect(mockPlanner.updateTaskStatus).not.toHaveBeenCalled();
+    await expect(
+      fse.pathExists(path.join(dataDir, "tasks", "task-1-Agent.md")),
+    ).resolves.toBe(true);
+    expect(store.has("task-1")).toBe(false);
+    expect(console.log).toHaveBeenCalledWith(
+      expect.stringContaining("is in its abort status 'Aborted'"),
+    );
+    agent.stop();
+  });
+
+  it("should keep the abort status on a finalization retry", async () => {
+    config.TASK_POLLING_INTERVAL = 0.05;
+    const task = {
+      id: "task-1",
+      title: "Implement feature",
+      status: "To Do",
+      description: "Add a feature",
+      comments: [] as unknown[],
+      attachments: [] as unknown[],
+    };
+    mockPlanner.listAssignedTasks.mockImplementation(async () => [
+      { ...task },
+    ]);
+    mockQoder.performTask.mockResolvedValue("All done");
+    // The summary comment POST fails on the first attempt only; the user
+    // moves the task to the abort status meanwhile.
+    let summaryCommentAttempts = 0;
+    mockPlanner.addTaskComment.mockImplementation(
+      async (_id: string, text: string) => {
+        if (text === "All done") {
+          summaryCommentAttempts++;
+          if (summaryCommentAttempts === 1) {
+            task.status = "Aborted";
+            throw new Error("Planner is down");
+          }
+        }
+      },
+    );
+    const actions: AgentActionsConfig = {
+      defaultStatusAbort: "Aborted",
+      defaultModel: "",
+      defaultTimeout: null,
+      actions: WILDCARD_ACTIONS.actions,
+    };
+
+    const store = new FinalizationStore({ retryBaseMs: 10 });
+    const agent = createAgent(actions, store);
+    agent.start();
+    await waitFor(
+      () => summaryCommentAttempts === 2 && !store.has("task-1"),
+      5000,
+    );
+
+    // The retry posts the summary but never applies the end status.
+    expect(mockQoder.performTask).toHaveBeenCalledTimes(1);
+    expect(mockPlanner.updateTaskStatus).not.toHaveBeenCalled();
+    await expect(
+      fse.pathExists(path.join(dataDir, "tasks", "task-1-Agent.md")),
+    ).resolves.toBe(true);
+    expect(console.log).toHaveBeenCalledWith(
+      expect.stringContaining(
+        "finalized on retry; its status 'Aborted' was kept (user abort)",
+      ),
+    );
+    agent.stop();
+  });
+
+  it("should schedule a retry when the abort-status re-fetch fails", async () => {
+    const task = {
+      id: "task-1",
+      title: "Implement feature",
+      status: "To Do",
+      description: "Add a feature",
+      comments: [] as unknown[],
+      attachments: [] as unknown[],
+    };
+    mockPlanner.listAssignedTasks.mockImplementation(async () => [
+      { ...task },
+    ]);
+    mockQoder.performTask.mockResolvedValue("All done");
+    let getTaskCalls = 0;
+    mockPlanner.getTask.mockImplementation(async () => {
+      getTaskCalls++;
+      if (getTaskCalls === 1) {
+        // The adjustment check succeeds and sees no new comment.
+        return {
+          ...task,
+          projectId: "",
+          priority: "medium",
+          dateUpdated: "2026-10-15T01:00:00.000Z",
+          comments: [],
+          dependencies: [],
+        };
+      }
+      // The finalization abort-status re-fetch fails.
+      throw new Error("Planner is down");
+    });
+    const actions: AgentActionsConfig = {
+      defaultStatusAbort: "Aborted",
+      defaultModel: "",
+      defaultTimeout: null,
+      actions: WILDCARD_ACTIONS.actions,
+    };
+    const store = new FinalizationStore({ retryBaseMs: 60000 });
+
+    const agent = createAgent(actions, store);
+    agent.start();
+    await waitFor(
+      () => store.has("task-1") && store.get("task-1")!.attempts >= 1,
+      5000,
+    );
+
+    // The failed re-fetch defers the decision to a retry: no status update
+    // is attempted and the summary is not re-posted.
+    expect(mockPlanner.updateTaskStatus).not.toHaveBeenCalled();
+    expect(store.get("task-1")?.commentPosted).toBe(true);
+    await expect(
+      fse.pathExists(path.join(dataDir, "tasks", "task-1-Agent.md")),
+    ).resolves.toBe(true);
+    agent.stop();
+  });
+
   it("should mark the task running and record the model, then clear the running label", async () => {
     const task = {
       id: "task-1",
@@ -4075,6 +4462,64 @@ describe("Agent", () => {
 
     expect(writes[0]).toEqual(["agent:running", "agent:qoder"]);
     expect(writes[1]).toEqual(["agent:qoder"]);
+    agent.stop();
+  });
+
+  it("should remove the originally added running label after TASK_RUNNING_LABEL is hot-reloaded during a run", async () => {
+    const task = {
+      id: "task-1",
+      title: "Implement feature",
+      status: "To Do",
+      description: "Add a feature",
+      comments: [],
+      attachments: [],
+    };
+    const writes = mockTaskLabels(task);
+    mockQoder.performTask.mockImplementation(async () => {
+      config.TASK_RUNNING_LABEL = "agent:busy";
+      return "Feature implemented";
+    });
+
+    const agent = createAgent();
+    agent.start();
+    await waitFor(() => writes.length === 2);
+
+    // Only the label added at start is removed: the hot-reloaded value is
+    // never removed from the task.
+    expect(writes).toEqual([["agent:running"], []]);
+    expect(mockPlanner.mutateTaskLabels).toHaveBeenCalledWith("task-1", {
+      add: [],
+      remove: ["agent:running"],
+      quiet: true,
+    });
+    expect(mockPlanner.mutateTaskLabels).not.toHaveBeenCalledWith("task-1", {
+      add: [],
+      remove: ["agent:busy"],
+      quiet: true,
+    });
+    agent.stop();
+  });
+
+  it("should still remove the running label when TASK_LABELS is disabled during the run", async () => {
+    const task = {
+      id: "task-1",
+      title: "Implement feature",
+      status: "To Do",
+      description: "Add a feature",
+      comments: [],
+      attachments: [],
+    };
+    const writes = mockTaskLabels(task);
+    mockQoder.performTask.mockImplementation(async () => {
+      config.TASK_LABELS = false;
+      return "Feature implemented";
+    });
+
+    const agent = createAgent();
+    agent.start();
+    await waitFor(() => writes.length === 2);
+
+    expect(writes).toEqual([["agent:running"], []]);
     agent.stop();
   });
 
@@ -4264,24 +4709,26 @@ describe("Agent", () => {
 
   it("should not write labels when TASK_LABELS is false", async () => {
     config.TASK_LABELS = false;
-    mockPlanner.listAssignedTasks.mockResolvedValue([
-      {
-        id: "task-1",
-        title: "Implement feature",
-        status: "To Do",
-        description: "Add a feature",
-        comments: [],
-        attachments: [],
-        labels: ["urgent"],
-      },
-    ]);
+    const task = {
+      id: "task-1",
+      title: "Implement feature",
+      status: "To Do",
+      description: "Add a feature",
+      comments: [],
+      attachments: [],
+      labels: ["urgent"],
+    };
+    const writes = mockTaskLabels(task);
     mockQoder.performTask.mockResolvedValue("Feature implemented");
 
     const agent = createAgent();
     agent.start();
     await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
 
+    // Disabled before the run: no add and no remove at all.
+    expect(mockPlanner.mutateTaskLabels).not.toHaveBeenCalled();
     expect(mockPlanner.updateTaskLabels).not.toHaveBeenCalled();
+    expect(writes).toEqual([]);
     agent.stop();
   });
 
@@ -4985,6 +5432,96 @@ describe("Agent", () => {
       );
 
       expect(mockQoder.performTask).toHaveBeenCalledTimes(3);
+      expect(mockPlanner.updateTaskStatus).not.toHaveBeenCalled();
+      agent.stop();
+    });
+
+    it("should finalize with the last successful summary when an adjustment run fails", async () => {
+      mockPlannerTasks([
+        {
+          id: "task-1",
+          title: "Discuss the plan",
+          status: "Plan",
+          description: "Design the conversational flow",
+          comments: [],
+          attachments: [],
+        },
+      ]);
+      mockPlanner.getTask.mockResolvedValue({
+        id: "task-1",
+        projectId: "",
+        title: "Discuss the plan",
+        status: "Plan",
+        priority: "medium",
+        description: "Design the conversational flow",
+        dateUpdated: "2026-10-19T01:00:00.000Z",
+        comments: [
+          {
+            id: "comment-new",
+            userId: "user-2",
+            userName: "Alice",
+            text: "One more thing",
+            dateCreated: "2026-10-19T00:30:00.000Z",
+          },
+        ],
+        attachments: [],
+        dependencies: [],
+      });
+      mockQoder.performTask
+        .mockResolvedValueOnce("Agent analysis")
+        .mockRejectedValueOnce(new Error("Adjustment run failed"));
+
+      const agent = createAgent(commentsActions());
+      agent.start();
+      await waitFor(
+        () =>
+          mockPlanner.addTaskComment.mock.calls.some((call) =>
+            String(call[1]).includes("an adjustment round failed"),
+          ),
+        5000,
+      );
+
+      // Comments mode: the first summary is posted with the note and the
+      // task keeps its status (no status move anyway).
+      expect(mockPlanner.addTaskComment).toHaveBeenCalledWith(
+        "task-1",
+        expect.stringContaining("Agent analysis"),
+      );
+      expect(
+        mockPlanner.addTaskComment.mock.calls.some((call) =>
+          String(call[1]).includes("Task processing failed:"),
+        ),
+      ).toBe(false);
+      expect(mockPlanner.updateTaskStatus).not.toHaveBeenCalled();
+      agent.stop();
+    });
+
+    it("should never re-fetch the task for a comment-only finalization", async () => {
+      mockPlannerTasks([
+        {
+          id: "task-1",
+          title: "Discuss the plan",
+          status: "Plan",
+          description: "Design the conversational flow",
+          comments: [],
+          attachments: [],
+        },
+      ]);
+      mockQoder.performTask.mockResolvedValue("Agent analysis");
+      const actions = commentsActions();
+      actions.defaultStatusAbort = "Aborted";
+
+      const agent = createAgent(actions);
+      agent.start();
+      await waitFor(() =>
+        mockPlanner.addTaskComment.mock.calls.some(
+          (call) => call[1] === "Agent analysis",
+        ),
+      );
+
+      // Only the adjustment check re-reads the task: the comment-only
+      // finalization never moves the status, so it needs no abort check.
+      expect(mockPlanner.getTask).toHaveBeenCalledTimes(1);
       expect(mockPlanner.updateTaskStatus).not.toHaveBeenCalled();
       agent.stop();
     });

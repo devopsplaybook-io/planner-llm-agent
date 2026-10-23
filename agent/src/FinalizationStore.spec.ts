@@ -5,6 +5,7 @@ const recordFields = (title = "Task 1") => ({
   contentVersion: "2026-09-10T00:00:00.000Z",
   summary: "All done",
   statusEnd: "Done",
+  statusAbort: "Aborted",
 });
 
 describe("FinalizationStore", () => {
@@ -21,6 +22,7 @@ describe("FinalizationStore", () => {
       contentVersion: "2026-09-10T00:00:00.000Z",
       summary: "All done",
       statusEnd: "Done",
+      statusAbort: "Aborted",
       commentPosted: false,
       attempts: 0,
       nextRetryAt: 1000,
@@ -30,6 +32,20 @@ describe("FinalizationStore", () => {
     store.delete("task-1");
     expect(store.has("task-1")).toBe(false);
     expect(store.size).toBe(0);
+  });
+
+  it("stores the resolved abort status and defaults it to null", () => {
+    const store = new FinalizationStore();
+    store.record("task-1", recordFields(), 1000);
+    expect(store.get("task-1")?.statusAbort).toBe("Aborted");
+
+    // An action without an abort status records null (no abort check).
+    store.record(
+      "task-2",
+      { ...recordFields("Task 2"), statusAbort: undefined },
+      1000,
+    );
+    expect(store.get("task-2")?.statusAbort).toBeNull();
   });
 
   it("tracks the comment-posted state of a record", () => {

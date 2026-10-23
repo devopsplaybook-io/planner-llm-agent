@@ -18,6 +18,10 @@ export interface FinalizationRecord {
   // the comments mode, where the finalization is comment-only (no status
   // move, no folder cleanup) and the retry then only re-posts the comment.
   statusEnd: string | null;
+  // Resolved abort status of the action (snapshotted at pick time); null
+  // when the action has none. A task found in this status during
+  // finalization keeps the user-set status (the end status is not applied).
+  statusAbort: string | null;
   // True once the summary comment POST succeeded: the retry then only
   // updates the status, so the comment is never posted twice.
   commentPosted: boolean;
@@ -67,6 +71,7 @@ export class FinalizationStore {
       contentVersion: string;
       summary: string;
       statusEnd: string | null;
+      statusAbort?: string;
     },
     now: number = Date.now(),
   ): FinalizationRecord {
@@ -76,6 +81,7 @@ export class FinalizationStore {
       contentVersion: fields.contentVersion,
       summary: fields.summary,
       statusEnd: fields.statusEnd,
+      statusAbort: fields.statusAbort ?? null,
       commentPosted: false,
       attempts: 0,
       nextRetryAt: now,
