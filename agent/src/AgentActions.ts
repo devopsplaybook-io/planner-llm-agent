@@ -26,7 +26,10 @@ import { CLI_AGENT_NAMES, MAX_DELAY_SECONDS } from "./Config";
  * the action: 'status' (the default pipeline: the task is moved to the end
  * status once processed) or 'comments' (conversational: the agent never
  * changes the task status and re-processes it every time a new user
- * comment lands; statusEnd is then null).
+ * comment lands; statusEnd is then null). The optional fallbackAgent and
+ * fallbackModel define the fallback run used when the primary run of the
+ * task fails (a CLI error or a timeout): the task is then re-run once with
+ * the fallback agent and model before the failure is reported.
  */
 export interface AgentAction {
   project: string;
@@ -36,6 +39,8 @@ export interface AgentAction {
   statusEnd: string | null;
   trigger: "status" | "comments";
   agent?: string;
+  fallbackAgent?: string;
+  fallbackModel?: string;
   statusError?: string;
   statusInProgress?: string;
   statusAbort?: string;
@@ -51,12 +56,15 @@ export interface AgentAction {
  * actions without their own model, the default task timeout (seconds)
  * applied to the actions without their own timeout, the default statuses
  * applied to the actions without their own status error / in-progress /
- * abort status, the named instruction templates the actions can reference,
- * and the actions themselves.
+ * abort status, the default fallback agent and model applied to the
+ * actions without their own fallback, the named instruction templates the
+ * actions can reference, and the actions themselves.
  */
 export interface AgentActionsConfig {
   defaultAgent?: string;
   defaultModel: string;
+  defaultFallbackAgent?: string;
+  defaultFallbackModel?: string;
   defaultStatusError?: string;
   defaultStatusInProgress?: string;
   defaultStatusAbort?: string;
@@ -74,6 +82,8 @@ export interface AgentActionsConfig {
  * default:
  *   agent: <CLI agent name>
  *   model: <model name>
+ *   fallback_agent: <CLI agent name>
+ *   fallback_model: <model name>
  *   timeout: <seconds>
  *   status_error: <status name>
  *   status_in_progress: <status name>
@@ -87,6 +97,8 @@ export interface AgentActionsConfig {
  *     status_in_progress: <status name>
  *     status_abort: <status name>
  *     agent: <CLI agent name>
+ *     fallback_agent: <CLI agent name>
+ *     fallback_model: <model name>
  *     model: <model name>
  *     instruction: <instruction or template name>
  *     timeout: <seconds>
@@ -94,10 +106,15 @@ export interface AgentActionsConfig {
  *     priority: <high|medium|low>
  *
  * 'default' and per-action 'agent'/'model'/'instruction'/'timeout'/'weight'/
- * 'status_error'/'status_in_progress'/'status_abort'/'priority'/'trigger'
- * are optional; 'project' is optional too: a missing, null or
- * empty project matches any project, and a non-empty project is a glob
- * pattern where '*' matches any sequence of characters. The optional
+ * 'status_error'/'status_in_progress'/'status_abort'/'priority'/'trigger'/
+ * 'fallback_agent'/'fallback_model' are optional; 'project' is optional too: a
+ * missing, null or empty project matches any project, and a non-empty project
+ * is a glob pattern where '*' matches any sequence of characters. The
+ * optional 'fallback_agent'/'fallback_model' (per action, with
+ * 'default.fallback_agent'/'default.fallback_model' as the global fallback)
+ * define the fallback run used when the primary run of a task fails: the
+ * task is re-run once with the fallback agent and model before the failure
+ * is reported (see the Agent fallback resolution). The optional
  * 'instructions' root mapping defines named instruction templates: an
  * action 'instruction' value that exactly matches a template name resolves
  * to the template content, any other value is used verbatim as an inline
@@ -163,6 +180,8 @@ export function parseAgentActions(content: string): AgentActionsConfig {
         if (
           key !== "agent" &&
           key !== "model" &&
+          key !== "fallback_agent" &&
+          key !== "fallback_model" &&
           key !== "timeout" &&
           key !== "status_error" &&
           key !== "status_in_progress" &&
@@ -179,6 +198,25 @@ export function parseAgentActions(content: string): AgentActionsConfig {
       );
       if (agent !== null) {
         config.defaultAgent = agent;
+      }
+      const fallbackAgent = readAgent(
+        defaults,
+        "fallback_agent",
+        "default.fallback_agent",
+        errors,
+      );
+      if (fallbackAgent !== null) {
+        config.defaultFallbackAgent = fallbackAgent;
+      }
+      const fallbackModel = readString(
+        defaults,
+        "fallback_model",
+        "default.fallback_model",
+        errors,
+        true,
+      );
+      if (fallbackModel !== null) {
+        config.defaultFallbackModel = fallbackModel;
       }
       const model = defaults.model;
       if (model !== undefined) {
@@ -258,6 +296,8 @@ export function parseAgentActions(content: string): AgentActionsConfig {
             "status_in_progress",
             "status_abort",
             "agent",
+            "fallback_agent",
+            "fallback_model",
             "model",
             "instruction",
             "timeout",
@@ -342,6 +382,19 @@ export function parseAgentActions(content: string): AgentActionsConfig {
         `actions[${index}].agent`,
         errors,
       );
+      const fallbackAgent = readAgent(
+        action,
+        "fallback_agent",
+        `actions[${index}].fallback_agent`,
+        errors,
+      );
+      const fallbackModel = readString(
+        action,
+        "fallback_model",
+        `actions[${index}].fallback_model`,
+        errors,
+        true,
+      );
       const model = readString(
         action,
         "model",
@@ -398,6 +451,8 @@ export function parseAgentActions(content: string): AgentActionsConfig {
           ...(statusInProgress === null ? {} : { statusInProgress }),
           ...(statusAbort === null ? {} : { statusAbort }),
           ...(agent === null ? {} : { agent }),
+          ...(fallbackAgent === null ? {} : { fallbackAgent }),
+          ...(fallbackModel === null ? {} : { fallbackModel }),
           ...(priority === null ? {} : { priority }),
           model: model ?? "",
           instruction: resolveInstruction(instruction, instructions) ?? "",

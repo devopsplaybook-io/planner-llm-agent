@@ -146,16 +146,25 @@ Promise.resolve().then(async () => {
     logger.info("Agent config repository not configured");
   }
 
-  // Create and validate every CLI agent selected by the default or an action.
-  const configuredAgents = new Set([
-    agentActionsManager.config.defaultAgent || config.AGENT_CLI,
-    ...agentActionsManager.config.actions.map(
-      (action) =>
-        action.agent ||
-        agentActionsManager.config.defaultAgent ||
-        config.AGENT_CLI,
-    ),
-  ]);
+  // Create and validate every CLI agent selected by the default or an
+  // action, the fallback agents included: a fallback introduced by a task
+  // failure would otherwise be prepared and authenticated for the first
+  // time in the middle of that failure.
+  const configuredAgents = new Set(
+    [
+      agentActionsManager.config.defaultAgent || config.AGENT_CLI,
+      agentActionsManager.config.defaultFallbackAgent,
+      ...agentActionsManager.config.actions.map(
+        (action) =>
+          action.agent ||
+          agentActionsManager.config.defaultAgent ||
+          config.AGENT_CLI,
+      ),
+      ...agentActionsManager.config.actions.map(
+        (action) => action.fallbackAgent,
+      ),
+    ].filter((agentName): agentName is string => Boolean(agentName)),
+  );
   const cliAgents = new Map<string, CliAgentClient>();
   try {
     for (const agentName of configuredAgents) {

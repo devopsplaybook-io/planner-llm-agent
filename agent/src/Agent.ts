@@ -849,6 +849,35 @@ export class Agent {
     return resolveModel(task, defaultModel)?.model ?? "";
   }
 
+  // Resolves the fallback agent and model of a failed task run: the action
+  // fields win, then the actions defaults, then the primary pair (no
+  // change). The fallback model is resolved like any task model: an
+  // agent-model line in the task description still overrides it. Returns
+  // null when the resolved pair cannot differ from the primary one (nothing
+  // configured, or configured identical to the primary pair): the fallback
+  // run would be a plain retry of the pair that just failed, not a fallback.
+  private resolveTaskFallback(
+    task: PlannerTask,
+    action: AgentAction,
+    primaryAgent: string,
+    primaryModel: string,
+  ): { agent: string; model: string } | null {
+    const agent =
+      action.fallbackAgent ??
+      this.agentActions?.defaultFallbackAgent ??
+      primaryAgent;
+    const configuredModel =
+      action.fallbackModel ?? this.agentActions?.defaultFallbackModel;
+    const model =
+      configuredModel !== undefined
+        ? (resolveModel(task, configuredModel)?.model ?? "")
+        : primaryModel;
+    if (agent === primaryAgent && model === primaryModel) {
+      return null;
+    }
+    return { agent, model };
+  }
+
   // The running tasks are reported on every poll while tasks are running
   // (title, project, weight, elapsed time, model): the only intentional
   // deviation from strict polling silence, so the parallel activity stays
@@ -1064,23 +1093,85 @@ export class Agent {
         task,
         startedAt,
       );
+      // The primary agent+model runs the task; when it fails (a CLI error or
+      // a timeout — a user abort never triggers it) and a fallback
+      // agent/model is configured, the task is re-run once with the fallback
+      // pair before the failure is reported.
+      let effectiveAgent = cliAgent;
+      let effectiveOptions = taskOptions;
       let summary: string;
       try {
-        summary = await cliAgent.performTask(task, notesFile, taskOptions);
+        try {
+          summary = await cliAgent.performTask(task, notesFile, taskOptions);
+        } catch (error) {
+          if (isCliAbortError(error)) {
+            throw error;
+          }
+          const fallback = this.resolveTaskFallback(
+            task,
+            action,
+            selectedAgent,
+            resolvedModel,
+          );
+          if (fallback === null) {
+            throw error;
+          }
+          const primaryModel = resolvedModel.length > 0 ? resolvedModel : "auto";
+          const fallbackModel =
+            fallback.model.length > 0 ? fallback.model : "auto";
+          logger.warn(
+            `Primary agent '${selectedAgent}' (model '${primaryModel}') failed for task '${task.title}' (${task.id}): ${(error as Error).message}; re-running with the fallback agent '${fallback.agent}' (model '${fallbackModel}')`,
+          );
+          const fallbackCliAgent = await this.getCliAgent(fallback.agent);
+          const fallbackOptions: TaskOptions = {
+            ...taskOptions,
+            model: fallback.model,
+          };
+          // The fallback run records its own provenance: the model/CLI
+          // labels accumulate across runs, like the primary ones. The
+          // running-task metadata follows the model actually in flight.
+          await this.recordProvenanceLabels(
+            task,
+            fallback.model,
+            fallback.agent,
+          );
+          const runningTask = this.processingTasks.get(task.id);
+          if (runningTask) {
+            runningTask.model = fallback.model;
+          }
+          effectiveAgent = fallbackCliAgent;
+          effectiveOptions = fallbackOptions;
+          try {
+            summary = await fallbackCliAgent.performTask(
+              task,
+              notesFile,
+              fallbackOptions,
+            );
+          } catch (fallbackError) {
+            if (isCliAbortError(fallbackError)) {
+              throw fallbackError;
+            }
+            throw new Error(
+              `The task failed on the primary agent '${selectedAgent}' (model '${primaryModel}') and again on the fallback agent '${fallback.agent}' (model '${fallbackModel}'). Fallback error: ${(fallbackError as Error).message} Primary error: ${(error as Error).message}`,
+              { cause: fallbackError },
+            );
+          }
+        }
       } finally {
         stopProgressHeartbeat();
       }
       // The CLI run of the step is done: before finalizing, check whether
       // new comments were posted on the task while it ran and give the CLI
       // agent a bounded number of adjustment passes to take them into
-      // account.
+      // account. The adjustment rounds run on the agent that produced the
+      // summary (the fallback one when the primary run failed).
       const { summary: finalSummary, contentVersion } =
         await this.adjustForNewComments(
           task,
           project,
-          cliAgent,
+          effectiveAgent,
           notesFile,
-          taskOptions,
+          effectiveOptions,
           summary,
         );
       // The CLI work is done for good: from here on only the Planner
@@ -1455,6 +1546,29 @@ export class Agent {
       `add the agent labels (${add.join(", ")})`,
     );
     return runningLabel.length > 0 ? runningLabel : null;
+  }
+
+  // Records the provenance labels of an additional run (the fallback) on
+  // the task: the model/CLI labels accumulate across runs, like the primary
+  // ones. Best-effort like every label write.
+  private async recordProvenanceLabels(
+    task: PlannerTask,
+    model: string,
+    cliAgent: string,
+  ): Promise<void> {
+    if (!this.taskLabelsEnabled()) {
+      return;
+    }
+    const labels = this.provenanceLabels(model, cliAgent);
+    if (labels.length === 0) {
+      return;
+    }
+    const add = mergeLabels([], labels);
+    await this.applyLabelMutation(
+      task,
+      { add },
+      `add the fallback provenance labels (${add.join(", ")})`,
+    );
   }
 
   // Removes the exact running label added at task start; the provenance

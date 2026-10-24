@@ -75,6 +75,92 @@ describe("AgentActions", () => {
       expect(config.actions[0].agent).toBe("copilot-cli");
     });
 
+    it("should parse the default and per-action fallback agent and model", () => {
+      const config = parseAgentActions(
+        [
+          "default:",
+          "  agent: qoder",
+          "  model: DeepSeek-Flash",
+          "  fallback_agent: claude-code",
+          "  fallback_model: GLM-5.3-Flash",
+          "actions:",
+          "  - project: Project*",
+          "    status_start: To Do",
+          "    status_end: Done",
+          "    fallback_agent: copilot-cli",
+          "    fallback_model: gpt-6-luna",
+          "  - project: Backend",
+          "    status_start: To Do",
+          "    status_end: Done",
+        ].join("\n"),
+      );
+
+      expect(config.defaultFallbackAgent).toBe("claude-code");
+      expect(config.defaultFallbackModel).toBe("GLM-5.3-Flash");
+      expect(config.actions[0].fallbackAgent).toBe("copilot-cli");
+      expect(config.actions[0].fallbackModel).toBe("gpt-6-luna");
+      expect(config.actions[1].fallbackAgent).toBeUndefined();
+      expect(config.actions[1].fallbackModel).toBeUndefined();
+    });
+
+    it("should trim the fallback model and normalize the fallback agent case", () => {
+      const config = parseAgentActions(
+        [
+          "default:",
+          '  fallback_agent: " Qoder "',
+          '  fallback_model: " GLM-5.3-Flash "',
+          "actions: []",
+        ].join("\n"),
+      );
+
+      expect(config.defaultFallbackAgent).toBe("qoder");
+      expect(config.defaultFallbackModel).toBe("GLM-5.3-Flash");
+    });
+
+    it("should reject an unsupported fallback agent", () => {
+      expect(() =>
+        parseAgentActions(
+          [
+            "default:",
+            "  fallback_agent: unknown-cli",
+            "actions: []",
+          ].join("\n"),
+        ),
+      ).toThrow(/'default\.fallback_agent' must be one of qoder/);
+      expect(() =>
+        parseAgentActions(
+          [
+            "actions:",
+            "  - status_start: To Do",
+            "    status_end: Done",
+            "    fallback_agent: unknown-cli",
+          ].join("\n"),
+        ),
+      ).toThrow(/'actions\[0\]\.fallback_agent' must be one of qoder/);
+    });
+
+    it("should reject an empty or non-string fallback model", () => {
+      expect(() =>
+        parseAgentActions(
+          [
+            "default:",
+            '  fallback_model: " "',
+            "actions: []",
+          ].join("\n"),
+        ),
+      ).toThrow(/'default\.fallback_model' must be a non-empty string/);
+      expect(() =>
+        parseAgentActions(
+          [
+            "actions:",
+            "  - status_start: To Do",
+            "    status_end: Done",
+            "    fallback_model: 42",
+          ].join("\n"),
+        ),
+      ).toThrow(/'actions\[0\]\.fallback_model' must be a non-empty string/);
+    });
+
     it("should parse the default and per-action error statuses", () => {
       const config = parseAgentActions(
         [
