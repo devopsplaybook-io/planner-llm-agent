@@ -182,6 +182,11 @@ export class AgentActionsManager {
       .toLowerCase();
     this.config.defaultAgent = defaultAgent;
     this.config.defaultModel = parsed.defaultModel;
+    // The fallback fields stay unset when not configured: the Agent resolves
+    // them per field (action, then default, then the primary pair) and a
+    // resolved pair identical to the primary one means no fallback run.
+    this.config.defaultFallbackAgent = parsed.defaultFallbackAgent;
+    this.config.defaultFallbackModel = parsed.defaultFallbackModel;
     this.config.defaultStatusError = parsed.defaultStatusError;
     this.config.defaultStatusInProgress = parsed.defaultStatusInProgress;
     this.config.defaultStatusAbort = parsed.defaultStatusAbort;
