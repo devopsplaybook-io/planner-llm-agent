@@ -1122,6 +1122,290 @@ describe("Agent", () => {
     agent.stop();
   });
 
+  it("should re-run a failing task with the action fallback model", async () => {
+    mockPlannerTasks([
+      {
+        id: TASK_1,
+        title: "Implement feature",
+        status: "To Do",
+        description: "Add a feature",
+        comments: [],
+        attachments: [],
+      },
+    ]);
+    mockQoder.performTask
+      .mockRejectedValueOnce(
+        new Error("Qoder task execution failed:\nlimit reached"),
+      )
+      .mockResolvedValueOnce("Recovered with the fallback model");
+
+    const actions: AgentActionsConfig = {
+      defaultModel: "",
+      defaultTimeout: null,
+      actions: [
+        {
+          project: "",
+          statusStart: "To Do",
+          statusEnd: "Done",
+          trigger: "status",
+          model: "DeepSeek-Flash",
+          fallbackModel: "GLM-5.3-Flash",
+          instruction: "",
+          timeout: null,
+          weight: null,
+        },
+      ],
+    };
+    const agent = createAgent(actions);
+    agent.start();
+    await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
+
+    expect(mockQoder.performTask).toHaveBeenCalledTimes(2);
+    expect(mockQoder.performTask).toHaveBeenNthCalledWith(
+      1,
+      expect.objectContaining({ id: TASK_1 }),
+      expect.any(String),
+      expect.objectContaining({ model: "DeepSeek-Flash" }),
+    );
+    expect(mockQoder.performTask).toHaveBeenNthCalledWith(
+      2,
+      expect.objectContaining({ id: TASK_1 }),
+      expect.any(String),
+      expect.objectContaining({ model: "GLM-5.3-Flash" }),
+    );
+    expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith(TASK_1, "Done");
+    expect(mockPlanner.addTaskComment).toHaveBeenCalledWith(
+      TASK_1,
+      expect.stringContaining("Recovered with the fallback model"),
+    );
+    agent.stop();
+  });
+
+  it("should re-run a failing task with the default fallback agent and model", async () => {
+    mockPlannerTasks([
+      {
+        id: TASK_1,
+        title: "Implement feature",
+        status: "To Do",
+        description: "Add a feature",
+        comments: [],
+        attachments: [],
+      },
+    ]);
+    mockQoder.performTask.mockRejectedValueOnce(new Error("primary boom"));
+    mockCopilot.performTask.mockResolvedValue("Recovered with Copilot");
+
+    const actions: AgentActionsConfig = {
+      defaultAgent: "qoder",
+      defaultModel: "DeepSeek-Flash",
+      defaultFallbackAgent: "copilot-cli",
+      defaultFallbackModel: "gpt-6-luna",
+      defaultTimeout: null,
+      actions: [
+        {
+          project: "",
+          statusStart: "To Do",
+          statusEnd: "Done",
+          trigger: "status",
+          model: "",
+          instruction: "",
+          timeout: null,
+          weight: null,
+        },
+      ],
+    };
+    const agent = createAgent(actions);
+    agent.start();
+    await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
+
+    expect(mockQoder.performTask).toHaveBeenCalledTimes(1);
+    expect(mockCopilot.performTask).toHaveBeenCalledTimes(1);
+    expect(mockCopilot.performTask).toHaveBeenCalledWith(
+      expect.objectContaining({ id: TASK_1 }),
+      expect.any(String),
+      expect.objectContaining({ model: "gpt-6-luna" }),
+    );
+    expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith(TASK_1, "Done");
+    expect(mockPlanner.addTaskComment).toHaveBeenCalledWith(
+      TASK_1,
+      expect.stringContaining("Recovered with Copilot"),
+    );
+    agent.stop();
+  });
+
+  it("should record the fallback provenance labels", async () => {
+    const task = {
+      id: TASK_1,
+      title: "Implement feature",
+      status: "To Do",
+      description: "Add a feature",
+      comments: [],
+      attachments: [],
+    };
+    const writes = mockTaskLabels(task);
+    mockQoder.performTask
+      .mockRejectedValueOnce(new Error("primary boom"))
+      .mockResolvedValueOnce("Recovered with the fallback model");
+
+    const actions: AgentActionsConfig = {
+      defaultModel: "",
+      defaultTimeout: null,
+      actions: [
+        {
+          project: "",
+          statusStart: "To Do",
+          statusEnd: "Done",
+          trigger: "status",
+          model: "DeepSeek-Flash",
+          fallbackModel: "GLM-5.3-Flash",
+          instruction: "",
+          timeout: null,
+          weight: null,
+        },
+      ],
+    };
+    const agent = createAgent(actions);
+    agent.start();
+    await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
+
+    const added = writes.flatMap((labels) => labels);
+    expect(added).toContain("model:deepseek-flash");
+    expect(added).toContain("model:glm-5.3-flash");
+    agent.stop();
+  });
+
+  it("should report both errors when the fallback run also fails", async () => {
+    mockPlannerTasks([
+      {
+        id: TASK_1,
+        title: "Implement feature",
+        status: "To Do",
+        description: "Add a feature",
+        comments: [],
+        attachments: [],
+      },
+    ]);
+    mockQoder.performTask.mockRejectedValue(new Error("Qoder CLI exploded"));
+
+    const actions: AgentActionsConfig = {
+      defaultModel: "",
+      defaultTimeout: null,
+      actions: [
+        {
+          project: "",
+          statusStart: "To Do",
+          statusEnd: "Done",
+          trigger: "status",
+          model: "DeepSeek-Flash",
+          fallbackModel: "GLM-5.3-Flash",
+          instruction: "",
+          timeout: null,
+          weight: null,
+        },
+      ],
+    };
+    const agent = createAgent(actions);
+    agent.start();
+    await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
+
+    expect(mockQoder.performTask).toHaveBeenCalledTimes(2);
+    expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith(TASK_1, "Done");
+    const failureComment = mockPlanner.addTaskComment.mock.calls
+      .map((call) => call[1] as string)
+      .find((text) => text.includes("Task processing failed:"));
+    expect(failureComment).toContain(
+      "failed on the primary agent 'qoder' (model 'DeepSeek-Flash')",
+    );
+    expect(failureComment).toContain(
+      "the fallback agent 'qoder' (model 'GLM-5.3-Flash')",
+    );
+    expect(failureComment).toContain("Fallback error:");
+    expect(failureComment).toContain("Primary error:");
+    agent.stop();
+  });
+
+  it("should not run the fallback when the primary run is aborted by the user", async () => {
+    mockPlannerTasks([
+      {
+        id: TASK_1,
+        title: "Implement feature",
+        status: "To Do",
+        description: "Add a feature",
+        comments: [],
+        attachments: [],
+      },
+    ]);
+    mockQoder.performTask.mockRejectedValue(new CliAbortedError());
+
+    const actions: AgentActionsConfig = {
+      defaultModel: "",
+      defaultTimeout: null,
+      actions: [
+        {
+          project: "",
+          statusStart: "To Do",
+          statusEnd: "Done",
+          trigger: "status",
+          model: "DeepSeek-Flash",
+          fallbackModel: "GLM-5.3-Flash",
+          instruction: "",
+          timeout: null,
+          weight: null,
+        },
+      ],
+    };
+    const agent = createAgent(actions);
+    agent.start();
+    await waitFor(() =>
+      mockPlanner.addTaskComment.mock.calls.some((call) =>
+        String(call[1]).includes("Task aborted at user request"),
+      ),
+    );
+
+    expect(mockQoder.performTask).toHaveBeenCalledTimes(1);
+    expect(mockPlanner.updateTaskStatus).not.toHaveBeenCalled();
+    agent.stop();
+  });
+
+  it("should not run a fallback identical to the primary pair", async () => {
+    mockPlannerTasks([
+      {
+        id: TASK_1,
+        title: "Implement feature",
+        status: "To Do",
+        description: "Add a feature",
+        comments: [],
+        attachments: [],
+      },
+    ]);
+    mockQoder.performTask.mockRejectedValue(new Error("Qoder CLI exploded"));
+
+    const actions: AgentActionsConfig = {
+      defaultModel: "",
+      defaultTimeout: null,
+      actions: [
+        {
+          project: "",
+          statusStart: "To Do",
+          statusEnd: "Done",
+          trigger: "status",
+          model: "DeepSeek-Flash",
+          fallbackAgent: "qoder",
+          fallbackModel: "DeepSeek-Flash",
+          instruction: "",
+          timeout: null,
+          weight: null,
+        },
+      ],
+    };
+    const agent = createAgent(actions);
+    agent.start();
+    await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
+
+    expect(mockQoder.performTask).toHaveBeenCalledTimes(1);
+    agent.stop();
+  });
+
   it("should move a failing task to the default error status when the action has none", async () => {
     mockPlanner.listAssignedTasks.mockResolvedValue([
       {

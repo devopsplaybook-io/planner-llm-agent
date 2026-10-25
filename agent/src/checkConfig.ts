@@ -29,6 +29,8 @@ function describeAction(action: {
   statusInProgress?: string;
   statusAbort?: string;
   agent?: string;
+  fallbackAgent?: string;
+  fallbackModel?: string;
   model: string;
   instruction: string;
   timeout: number | null;
@@ -47,6 +49,8 @@ function describeAction(action: {
     ...(action.trigger === "comments" ? ["trigger: comments"] : []),
     `agent: ${action.agent ?? "(default)"}`,
     `model: ${action.model.length > 0 ? action.model : "(default)"}`,
+    `fallback_agent: ${action.fallbackAgent ?? "(primary)"}`,
+    `fallback_model: ${action.fallbackModel ?? "(primary)"}`,
     `timeout: ${action.timeout !== null ? `${action.timeout}s` : "(default)"}`,
     `weight: ${action.weight !== null ? String(action.weight) : "auto"}`,
     `priority: ${action.priority ?? "(task)"}`,
@@ -90,6 +94,8 @@ async function main(): Promise<number> {
     [
       `  agent: ${config.defaultAgent ?? "(AGENT_CLI)"}`,
       `  model: ${config.defaultModel.length > 0 ? config.defaultModel : "(CLI default)"}`,
+      `  fallback_agent: ${config.defaultFallbackAgent ?? "(primary)"}`,
+      `  fallback_model: ${config.defaultFallbackModel ?? "(primary)"}`,
       `  timeout: ${config.defaultTimeout !== null ? `${config.defaultTimeout}s` : "(TASK_TIMEOUT)"}`,
       `  status_error: ${config.defaultStatusError ?? "(end status)"}`,
       `  status_in_progress: ${config.defaultStatusInProgress ?? "(none)"}`,
