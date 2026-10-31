@@ -9,8 +9,10 @@ const otelLogger = new StandardLogger();
 let otelTracer: StandardTracer;
 let otelMeter: StandardMeter;
 
-export function OTelInit(config: Config): void {
-  otelLogger.initOTel(config);
+export async function OTelInit(config: Config): Promise<void> {
+  // otel-utils 1.9 made initOTel asynchronous: awaiting it is what makes the
+  // log provider ready before the first record is emitted.
+  await otelLogger.initOTel(config);
   otelTracer = new StandardTracer(config);
   otelMeter = new StandardMeter(config);
 }
