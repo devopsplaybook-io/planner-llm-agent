@@ -210,6 +210,16 @@ describe("Agent", () => {
   let config: Config;
   let dataDir: string;
   let logSpy: jest.SpyInstance;
+  let warnSpy: jest.SpyInstance;
+  let errorSpy: jest.SpyInstance;
+  // otel-utils 1.9 mirrors a log record on the console stream of its level:
+  // info on stdout, warn and error on their own. Tests that only care about
+  // the message look it up across the three streams.
+  const consoleLines = (): string[] =>
+    [logSpy, warnSpy, errorSpy].flatMap((spy) =>
+      spy.mock.calls.map((call: unknown[]) => String(call[0])),
+    );
+
   // All agents created by a test are stopped in afterEach, so a failing
   // assertion never leaks a polling interval into the next test.
   let agents: Agent[] = [];
@@ -303,6 +313,8 @@ describe("Agent", () => {
 
   beforeEach(() => {
     logSpy = jest.spyOn(console, "log").mockImplementation(jest.fn());
+    warnSpy = jest.spyOn(console, "warn").mockImplementation(jest.fn());
+    errorSpy = jest.spyOn(console, "error").mockImplementation(jest.fn());
     delete process.env.AGENT_NAME;
     delete process.env.TASK_POLLING_INTERVAL;
     config = new Config();
@@ -1059,7 +1071,7 @@ describe("Agent", () => {
     agent.start();
     await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
 
-    expect(console.log).toHaveBeenCalledWith(
+    expect(console.error).toHaveBeenCalledWith(
       expect.stringContaining(
         `Failed to process task 'Implement feature' (${TASK_1})`,
       ),
@@ -1494,8 +1506,8 @@ describe("Agent", () => {
     const agent = createAgent();
     agent.start();
     await waitFor(() =>
-      logSpy.mock.calls.some((call) =>
-        String(call[0]).includes(
+      consoleLines().some((line) =>
+        line.includes(
           `Failed to move task 'Implement feature' (${TASK_1}) to status 'Done'`,
         ),
       ),
@@ -1728,7 +1740,7 @@ describe("Agent", () => {
     const agent = createAgent();
     agent.start();
     await jest.advanceTimersByTimeAsync(0);
-    expect(console.log).toHaveBeenCalledWith(
+    expect(console.error).toHaveBeenCalledWith(
       expect.stringContaining("Failed to poll tasks from Planner"),
     );
 
@@ -1888,7 +1900,7 @@ describe("Agent", () => {
     expect(mockPlanner.updateTaskStatus).toHaveBeenCalledTimes(1);
     expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith(TASK_1, "Done");
     expect(mockQoder.performTask).toHaveBeenCalledTimes(1);
-    expect(console.log).toHaveBeenCalledWith(
+    expect(console.warn).toHaveBeenCalledWith(
       expect.stringContaining(
         "Skipping task 'Escape attempt' with an invalid id '../../escape'",
       ),
@@ -2119,7 +2131,7 @@ describe("Agent", () => {
       null,
     );
 
-    expect(console.log).toHaveBeenCalledWith(
+    expect(console.warn).toHaveBeenCalledWith(
       expect.stringContaining("Ignoring the unreadable attachment manifest"),
     );
     const manifest = await fse.readJson(
@@ -2701,7 +2713,7 @@ describe("Agent", () => {
       "Feature implemented",
     );
     expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith(TASK_1, "Done");
-    expect(console.log).toHaveBeenCalledWith(
+    expect(console.error).toHaveBeenCalledWith(
       expect.stringContaining(
         `Failed to post the start notification for task 'Implement feature' (${TASK_1})`,
       ),
@@ -4155,8 +4167,8 @@ describe("Agent", () => {
     );
     expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith(TASK_1, "Done");
     expect(
-      logSpy.mock.calls.some((call) =>
-        String(call[0]).includes(
+      consoleLines().some((line) =>
+        line.includes(
           `Failed to check task 'Implement feature' (${TASK_1}) for new comments`,
         ),
       ),
@@ -4221,8 +4233,8 @@ describe("Agent", () => {
       "Summary after call 3",
     );
     expect(
-      logSpy.mock.calls.some((call) =>
-        String(call[0]).includes("adjustment budget of 2 round(s)"),
+      consoleLines().some((line) =>
+        line.includes("adjustment budget of 2 round(s)"),
       ),
     ).toBe(true);
     agent.stop();
@@ -4277,8 +4289,8 @@ describe("Agent", () => {
       "Feature implemented",
     );
     expect(
-      logSpy.mock.calls.some((call) =>
-        String(call[0]).includes("adjustment budget of 0 round(s)"),
+      consoleLines().some((line) =>
+        line.includes("adjustment budget of 0 round(s)"),
       ),
     ).toBe(true);
     agent.stop();
@@ -4390,8 +4402,8 @@ describe("Agent", () => {
       expect.stringContaining("an adjustment round failed"),
     );
     expect(
-      logSpy.mock.calls.some((call) =>
-        String(call[0]).includes("adjustment round 1/2 failed"),
+      consoleLines().some((line) =>
+        line.includes("adjustment round 1/2 failed"),
       ),
     ).toBe(true);
     expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith(TASK_1, "Done");
@@ -4676,7 +4688,7 @@ describe("Agent", () => {
     agent.start();
     await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
 
-    expect(console.log).toHaveBeenCalledWith(
+    expect(console.warn).toHaveBeenCalledWith(
       expect.stringContaining(
         "the status does not exist in project 'Web'",
       ),
@@ -4723,7 +4735,7 @@ describe("Agent", () => {
     agent.start();
     await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length >= 2);
 
-    expect(console.log).toHaveBeenCalledWith(
+    expect(console.warn).toHaveBeenCalledWith(
       expect.stringContaining(
         `Failed to move task 'Implement feature' (${TASK_1}) to the in-progress status 'In Progress' (continuing)`,
       ),
@@ -5356,7 +5368,7 @@ describe("Agent", () => {
     expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith(TASK_1, "Done");
     // An operational failure is not an unsupported endpoint: no fallback.
     expect(mockPlanner.updateTaskLabels).not.toHaveBeenCalled();
-    expect(console.log).toHaveBeenCalledWith(
+    expect(console.warn).toHaveBeenCalledWith(
       expect.stringContaining(
         `Failed to add the agent labels (agent:running) for task 'Implement feature' (${TASK_1})`,
       ),

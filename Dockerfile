@@ -57,7 +57,7 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg -o 
     rm -rf /var/lib/apt/lists/*
 
 # Kubernetes CLI (version pinned for reproducible builds)
-ARG KUBECTL_VERSION=v1.37.1
+ARG KUBECTL_VERSION=v1.37.2
 RUN ARCH=$(dpkg --print-architecture) && \
     curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${ARCH}/kubectl" -o /usr/local/bin/kubectl && \
     chmod +x /usr/local/bin/kubectl
@@ -79,7 +79,7 @@ RUN ARCH=$(dpkg --print-architecture) && \
     chmod +x /usr/local/bin/yq
 
 # Go
-ARG GO_VERSION=1.27.2
+ARG GO_VERSION=1.27.3
 RUN ARCH=$(dpkg --print-architecture) && \
     curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-${ARCH}.tar.gz" -o /tmp/go.tar.gz && \
     tar -C /usr/local -xzf /tmp/go.tar.gz && \
@@ -88,8 +88,8 @@ ENV PATH="/usr/local/go/bin:${PATH}"
 
 # Rust (rustup-init from the pinned release archive, toolchain pinned for
 # reproducible builds)
-ARG RUSTUP_VERSION=1.29.1
-ARG RUST_TOOLCHAIN=1.99.0
+ARG RUSTUP_VERSION=1.29.2
+ARG RUST_TOOLCHAIN=1.99.1
 ENV RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo \
     PATH="/usr/local/cargo/bin:${PATH}"
@@ -107,11 +107,11 @@ RUN RUSTUP_ARCH=$(case "$(dpkg --print-architecture)" in \
 # default, the others are selected with AGENT_CLI: claude-code, copilot-cli,
 # codex, gemini-cli)
 RUN npm install -g \
-      @qoder-ai/qodercli@1.1.71 \
-      @anthropic-ai/claude-code@2.1.300 \
-      @github/copilot@1.0.98 \
-      @openai/codex@0.162.1 \
-      @google/gemini-cli@0.64.0
+      @qoder-ai/qodercli@1.1.81 \
+      @anthropic-ai/claude-code@2.1.316 \
+      @github/copilot@1.0.105 \
+      @openai/codex@0.166.0 \
+      @google/gemini-cli@0.66.0
 
 # Verify all tools are available
 RUN node --version && npm --version && git --version && gh --version && \

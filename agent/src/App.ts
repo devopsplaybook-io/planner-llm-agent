@@ -102,7 +102,7 @@ Promise.resolve().then(async () => {
 
   // OpenTelemetry
   try {
-    OTelInit(config);
+    await OTelInit(config);
   } catch (error) {
     logger.error("Failed to initialize OpenTelemetry", error as Error);
     process.exit(1);
