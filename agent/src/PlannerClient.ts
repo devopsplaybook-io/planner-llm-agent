@@ -4,18 +4,42 @@ import { OTelTracer } from "./OTelContext";
 
 const REQUEST_TIMEOUT_MS = 30000;
 
+// Conservative, centralised retry policy for idempotent (GET) requests. A
+// transient network error, timeout, 429 or 5xx is retried with a full-jitter
+// exponential backoff; plain 4xx and every write (POST/PUT/PATCH) are never
+// retried here (the finalization retry loop handles the writes idempotently).
+const REQUEST_RETRY_ATTEMPTS = 3;
+const REQUEST_RETRY_BASE_DELAY_MS = 250;
+const REQUEST_RETRY_MAX_DELAY_MS = 2000;
+const REQUEST_RETRY_TOTAL_BUDGET_MS = 90_000;
+// The response body of a failed request is included (truncated) in the
+// error: it usually explains the failure in the logs.
+const REQUEST_ERROR_BODY_MAX_CHARS = 500;
+
 type PlannerSpan = ReturnType<StandardTracer["startSpan"]>;
+
+// Retry policy overrides (tests inject zero delays).
+export interface PlannerRetryOptions {
+  // Total attempts of an idempotent request (writes stay single-attempt).
+  attempts?: number;
+  baseDelayMs?: number;
+  maxDelayMs?: number;
+  totalBudgetMs?: number;
+}
 
 // Failed Planner HTTP request: the status lets callers distinguish a
 // missing/unsupported endpoint (404/405, e.g. an older Planner without the
-// atomic label mutation) from an operational failure.
+// atomic label mutation) from an operational failure. The truncated response
+// body, when any, is carried for diagnostics.
 export class PlannerRequestError extends Error {
   public readonly status: number;
+  public readonly body?: string;
 
-  constructor(message: string, status: number) {
+  constructor(message: string, status: number, body?: string) {
     super(message);
     this.name = "PlannerRequestError";
     this.status = status;
+    this.body = body;
   }
 }
 
@@ -115,9 +139,20 @@ const AGENT_TASK_FIELDS =
 
 export class PlannerClient {
   private config: Config;
+  private retryAttempts: number;
+  private retryBaseDelayMs: number;
+  private retryMaxDelayMs: number;
+  private retryTotalBudgetMs: number;
 
-  constructor(config: Config) {
+  constructor(config: Config, retryOptions?: PlannerRetryOptions) {
     this.config = config;
+    this.retryAttempts = retryOptions?.attempts ?? REQUEST_RETRY_ATTEMPTS;
+    this.retryBaseDelayMs =
+      retryOptions?.baseDelayMs ?? REQUEST_RETRY_BASE_DELAY_MS;
+    this.retryMaxDelayMs =
+      retryOptions?.maxDelayMs ?? REQUEST_RETRY_MAX_DELAY_MS;
+    this.retryTotalBudgetMs =
+      retryOptions?.totalBudgetMs ?? REQUEST_RETRY_TOTAL_BUDGET_MS;
   }
 
   public async getCurrentUser(): Promise<PlannerUser> {
@@ -347,29 +382,10 @@ export class PlannerClient {
       "planner-client.download-task-attachment",
     );
     try {
-      const url = `${this.config.PLANNER_URL}/api/tasks/${taskId}/attachments/${attachmentId}`;
-      const headers: Record<string, string> = {
-        "x-api-key": this.config.PLANNER_API_KEY,
-      };
-      StandardTracer.updateHttpHeader(span, headers);
-      let response: Response;
-      try {
-        response = await fetch(url, {
-          method: "GET",
-          headers: headers,
-          signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-        });
-      } catch (error) {
-        throw new Error(
-          `Failed to reach Planner at '${url}': ${(error as Error).message}`,
-          { cause: error },
-        );
-      }
-      if (!response.ok) {
-        throw new Error(
-          `Planner request to '/api/tasks/${taskId}/attachments/${attachmentId}' failed with status ${response.status}`,
-        );
-      }
+      const path = `/api/tasks/${taskId}/attachments/${attachmentId}`;
+      // The initial fetch is idempotent: a transient failure is retried
+      // before the (much larger) body is read.
+      const response = await this.fetchResponse(path, "GET", span);
       // Read the cap at call time so a hot-reloaded value applies; 0 (or an
       // invalid value) disables it.
       const configuredLimit = this.config.TASK_ATTACHMENT_MAX_BYTES;
@@ -546,6 +562,28 @@ export class PlannerClient {
     span: PlannerSpan,
     body?: unknown,
   ): Promise<PlannerTaskJson> {
+    const response = await this.fetchResponse(path, method, span, body);
+    try {
+      return await response.json();
+    } catch (error) {
+      throw new Error(
+        `Planner request to '${path}' returned an invalid JSON response`,
+        { cause: error },
+      );
+    }
+  }
+
+  // Performs the HTTP fetch with the retry policy of the client. Only
+  // idempotent requests (GET) are retried, and only on a network error or
+  // timeout and on a 429/5xx response; the retryable response body is
+  // cancelled before the next attempt. A final non-OK response is reported
+  // as a PlannerRequestError carrying the (truncated) response body.
+  private async fetchResponse(
+    path: string,
+    method: string,
+    span: PlannerSpan,
+    body?: unknown,
+  ): Promise<Response> {
     const url = `${this.config.PLANNER_URL}${path}`;
     const headers: Record<string, string> = {
       "x-api-key": this.config.PLANNER_API_KEY,
@@ -554,33 +592,87 @@ export class PlannerClient {
       headers["Content-Type"] = "application/json";
     }
     StandardTracer.updateHttpHeader(span, headers);
-    let response: Response;
-    try {
-      response = await fetch(url, {
-        method: method,
-        headers: headers,
-        body: body === undefined ? undefined : JSON.stringify(body),
-        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-      });
-    } catch (error) {
-      throw new Error(
-        `Failed to reach Planner at '${url}': ${(error as Error).message}`,
-        { cause: error },
-      );
-    }
-    if (!response.ok) {
+    const attempts = method === "GET" ? Math.max(1, this.retryAttempts) : 1;
+    const deadline = Date.now() + this.retryTotalBudgetMs;
+    let lastError: Error | null = null;
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) {
+        break;
+      }
+      let response: Response;
+      try {
+        response = await fetch(url, {
+          method: method,
+          headers: headers,
+          body: body === undefined ? undefined : JSON.stringify(body),
+          signal: AbortSignal.timeout(Math.min(REQUEST_TIMEOUT_MS, remaining)),
+        });
+      } catch (error) {
+        lastError = new Error(
+          `Failed to reach Planner at '${url}': ${(error as Error).message}`,
+          { cause: error },
+        );
+        if (
+          attempt < attempts &&
+          (await this.waitBeforeRetry(attempt, deadline))
+        ) {
+          continue;
+        }
+        throw lastError;
+      }
+      if (response.ok) {
+        return response;
+      }
+      const retryable = response.status === 429 || response.status >= 500;
+      if (retryable && attempt < attempts) {
+        await response.body?.cancel().catch(() => undefined);
+        if (await this.waitBeforeRetry(attempt, deadline)) {
+          continue;
+        }
+      }
+      const errorBody = await this.readErrorBody(response);
       throw new PlannerRequestError(
-        `Planner request to '${path}' failed with status ${response.status}`,
+        `Planner request to '${path}' failed with status ${response.status}${errorBody ? `: ${errorBody}` : ""}`,
         response.status,
+        errorBody || undefined,
       );
     }
-    try {
-      return await response.json();
-    } catch (error) {
-      throw new Error(
-        `Planner request to '${path}' returned an invalid JSON response`,
-        { cause: error },
+    throw (
+      lastError ??
+      new Error(
+        `Planner request to '${path}' failed: the retry budget of ${this.retryTotalBudgetMs} ms was exhausted`,
+      )
+    );
+  }
+
+  // Full-jitter exponential backoff between two attempts. Returns false when
+  // the delay would exceed the overall request budget.
+  private async waitBeforeRetry(
+    attempt: number,
+    deadline: number,
+  ): Promise<boolean> {
+    const delay =
+      Math.random() *
+      Math.min(
+        this.retryBaseDelayMs * 2 ** (attempt - 1),
+        this.retryMaxDelayMs,
       );
+    if (Date.now() + delay >= deadline) {
+      return false;
+    }
+    if (delay > 0) {
+      await new Promise((resolve) => setTimeout(resolve, delay));
+    }
+    return true;
+  }
+
+  private async readErrorBody(response: Response): Promise<string> {
+    try {
+      const text = await response.text();
+      return text.slice(0, REQUEST_ERROR_BODY_MAX_CHARS).trim();
+    } catch {
+      return "";
     }
   }
 }

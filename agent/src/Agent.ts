@@ -82,6 +82,10 @@ const MAX_WARNED_INVALID_TASK_IDS = 100;
 const MAX_SALVAGED_SUMMARY_LENGTH = 2000;
 const MAX_SALVAGED_OUTPUT_LENGTH = 1000;
 
+// Tolerance when matching an already posted summary comment against the run
+// start: the agent and Planner clocks are NTP-synced, a small skew is enough.
+const COMMENT_MATCH_CLOCK_SKEW_MS = 60_000;
+
 // Directive of an adjustment pass: appended to the action instruction when
 // new comments arrived on the task while the CLI agent was running a step.
 const MAX_ADJUSTMENT_DIRECTIVE =
@@ -481,7 +485,14 @@ export class Agent {
       await this.cleanupCompletedTasks(tasks);
       // Records of the tasks that are no longer assigned can never be
       // finalized: drop them.
-      this.finalizationStore.prune(new Set(tasks.map((task) => task.id)));
+      const pruned = await this.finalizationStore.prune(
+        new Set(tasks.map((task) => task.id)),
+      );
+      if (pruned > 0) {
+        logger.info(
+          `Dropped ${pruned} pending finalization record(s) of tasks that are no longer assigned or past the retry TTL`,
+        );
+      }
       this.logRunningTasks();
       this.abortRequestedTasks(tasks);
       if (actions.length === 0 || tasks.length === 0) {
@@ -1214,7 +1225,7 @@ export class Agent {
       // finalization remains, and a failure of it must never re-run the
       // CLI — the record keeps the task out of the candidates and drives
       // the idempotent retries (see retryDueFinalizations).
-      this.finalizationStore.record(task.id, {
+      await this.finalizationStore.record(task.id, {
         title: task.title,
         contentVersion,
         summary: finalSummary,
@@ -1222,9 +1233,17 @@ export class Agent {
         // Pick-time snapshot, so the check matches abortRequestedTasks even
         // if the actions config is hot-reloaded mid-run.
         statusAbort: this.processingTasks.get(task.id)?.statusAbort,
+        // The run start bounds the duplicate-summary check: an identical
+        // comment older than it belongs to a previous run.
+        runStartedAt: startedAt,
       });
       const outcome = await this.finalizeCompletedTask(task.id);
-      this.finalizationStore.delete(task.id);
+      await this.finalizationStore.delete(task.id);
+      if (outcome === "missing") {
+        // The task disappeared between the polls: finalizeCompletedTask
+        // already dropped its record and logged it.
+        return;
+      }
       logger.info(
         outcome === "aborted"
           ? `Task '${task.title}' (${task.id}) completed; its status '${this.processingTasks.get(task.id)?.statusAbort ?? "unknown"}' was kept (user abort)`
@@ -1245,7 +1264,7 @@ export class Agent {
       if (this.finalizationStore.has(task.id)) {
         // The CLI execution succeeded; only the Planner finalization failed.
         // The retry is scheduled with an exponential backoff.
-        this.finalizationStore.scheduleRetry(task.id);
+        await this.finalizationStore.scheduleRetry(task.id);
         const record = this.finalizationStore.get(task.id);
         logger.error(
           `Failed to finalize completed task '${task.title}' (${task.id}) (attempt ${record?.attempts ?? 1}, retry scheduled): ${message}`,
@@ -1467,31 +1486,92 @@ export class Agent {
   // Completes a finished task on Planner: posts the summary comment (unless
   // a previous attempt already did) and moves the task to its end status
   // unless the record is comment-only (comments mode: the task never
-  // changes status, so no folder cleanup applies either). Before the
-  // end-status update the task is re-fetched: when the user moved it to the
-  // abort status after the CLI finished, the summary is still posted but the
-  // end status is not applied and the folder is not cleaned (an aborted
-  // work is still reported; the user-set status wins). A failed re-fetch
-  // propagates so the caller schedules a retry: the same Planner API is
-  // needed for the status update anyway. Idempotent, driven by the
-  // FinalizationStore record of the task.
+  // changes status, so no folder cleanup applies either). On a retry (or
+  // after a restart) the task is fetched first and an identical summary
+  // comment already posted by the agent is detected, so a lost POST response
+  // never duplicates the summary. Before the end-status update the task is
+  // also checked against the abort status: when the user moved it there after
+  // the CLI finished, the summary is still posted but the end status is not
+  // applied and the folder is not cleaned (an aborted work is still
+  // reported; the user-set status wins). A failed re-fetch propagates so the
+  // caller schedules a retry: the same Planner API is needed for the status
+  // update anyway. A task no longer visible (404) is dropped instead of
+  // retried for a day. Idempotent, driven by the FinalizationStore record.
   private async finalizeCompletedTask(
     taskId: string,
-  ): Promise<"finalized" | "aborted"> {
+  ): Promise<"finalized" | "aborted" | "missing"> {
     const record = this.finalizationStore.get(taskId);
     if (!record) {
       return "finalized";
     }
+    // One fetch serves both the duplicate-summary check and the abort check.
+    let current: PlannerTask | null | undefined;
+    const fetchCurrent = async (): Promise<PlannerTask | null> => {
+      if (current !== undefined) {
+        return current;
+      }
+      try {
+        current = await this.planner.getTask(taskId);
+        return current;
+      } catch (error) {
+        if (error instanceof PlannerRequestError && error.status === 404) {
+          current = null;
+          return null;
+        }
+        throw error;
+      }
+    };
+    const dropMissing = async (reason: string): Promise<"missing"> => {
+      await this.finalizationStore.delete(taskId);
+      logger.warn(
+        `Task '${record.title}' (${taskId}) is no longer visible on Planner (deleted or unassigned): dropped its pending finalization (${reason})`,
+      );
+      return "missing";
+    };
     if (!record.commentPosted) {
-      await this.planner.addTaskComment(taskId, record.summary);
-      this.finalizationStore.markCommentPosted(taskId);
+      // The duplicate check only runs on a retry or after a restart: the
+      // first in-process attempt posts unconditionally (the request count of
+      // the happy path is unchanged).
+      const checkingDuplicate = record.attempts > 0 || record.resumed;
+      const existing = checkingDuplicate ? await fetchCurrent() : null;
+      if (checkingDuplicate && existing === null) {
+        return await dropMissing("the summary was not posted");
+      }
+      let alreadyPosted = false;
+      if (existing !== null) {
+        const agentUserId = await this.resolveAgentUserId();
+        if (agentUserId === null) {
+          // Never post blind on a retry: the summary may already be there.
+          throw new Error(
+            "cannot resolve the agent user to check for an already posted summary",
+          );
+        }
+        alreadyPosted = hasMatchingSummaryComment(
+          existing.comments,
+          record.summary,
+          agentUserId,
+          record.runStartedAt - COMMENT_MATCH_CLOCK_SKEW_MS,
+        );
+      }
+      if (alreadyPosted) {
+        await this.finalizationStore.markCommentPosted(taskId);
+        logger.info(
+          `Task '${record.title}' (${taskId}): the summary comment is already present, it is not posted again`,
+        );
+      } else {
+        await this.planner.addTaskComment(taskId, record.summary);
+        await this.finalizationStore.markCommentPosted(taskId);
+      }
     }
     if (record.statusEnd === null) {
       return "finalized";
     }
     if (record.statusAbort !== null) {
-      const current = await this.planner.getTask(taskId);
-      if (current.status === record.statusAbort) {
+      const task = await fetchCurrent();
+      if (task === null) {
+        return await dropMissing("the end status was not applied");
+      }
+      if (task.status === record.statusAbort) {
         logger.info(
           `Task '${record.title}' (${taskId}) is in its abort status '${record.statusAbort}': keeping the user-set status (the summary comment was posted)`,
         );
@@ -1516,7 +1596,12 @@ export class Agent {
       }
       try {
         const outcome = await this.finalizeCompletedTask(taskId);
-        this.finalizationStore.delete(taskId);
+        await this.finalizationStore.delete(taskId);
+        if (outcome === "missing") {
+          // The record was already dropped and the warning logged by
+          // finalizeCompletedTask.
+          continue;
+        }
         logger.info(
           outcome === "aborted"
             ? `Task '${record.title}' (${taskId}) finalized on retry; its status '${record.statusAbort}' was kept (user abort)`
@@ -1525,7 +1610,7 @@ export class Agent {
               : `Task '${record.title}' (${taskId}) finalized on retry and moved to status '${record.statusEnd}'`,
         );
       } catch (error) {
-        this.finalizationStore.scheduleRetry(taskId);
+        await this.finalizationStore.scheduleRetry(taskId);
         logger.error(
           `Failed to finalize completed task '${record.title}' (${taskId}) (attempt ${record.attempts}, retry scheduled): ${(error as Error).message}`,
         );
@@ -2400,6 +2485,26 @@ export function appendProcessedCommentsMarker(
 export function parseProcessedCommentsMarker(text: string): string | null {
   const match = PROCESSED_COMMENTS_MARKER_PATTERN.exec(text.trimEnd());
   return match ? match[1] : null;
+}
+
+// Whether the agent already posted this exact summary since the given time.
+// Used on a finalization retry: the previous POST may have been applied even
+// though its response was lost, so an identical agent-authored comment
+// created after the run started proves the summary is already there. An
+// unparseable dateCreated counts as a match (text and author already match).
+export function hasMatchingSummaryComment(
+  comments: PlannerTaskComment[],
+  summary: string,
+  agentUserId: string,
+  sinceMs: number,
+): boolean {
+  return comments.some((comment) => {
+    if (comment.text !== summary || comment.userId !== agentUserId) {
+      return false;
+    }
+    const created = Date.parse(comment.dateCreated);
+    return Number.isNaN(created) || created >= sinceMs;
+  });
 }
 
 // Whether a comment-triggered action must pick the task up now: zero
