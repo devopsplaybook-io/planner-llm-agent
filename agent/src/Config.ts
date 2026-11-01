@@ -13,6 +13,15 @@ export const DEFAULT_TASK_TIMEOUT_SECONDS = 3600;
 // Attachments larger than this are skipped (0 disables the cap).
 export const DEFAULT_TASK_ATTACHMENT_MAX_BYTES = 50 * 1024 * 1024;
 
+// Defaults of the two reloadable timers, also the fallback for an invalid
+// hot-reloaded interval.
+export const DEFAULT_AGENT_NOTE_INTERVAL = 86400;
+export const DEFAULT_AGENT_CONFIG_SYNC_INTERVAL = 300;
+
+// Status that satisfies a task dependency: status names are project-defined,
+// so it is configurable and validated against the project catalogs.
+export const DEFAULT_DEPENDENCY_SATISFIED_STATUS = "Done";
+
 // Startup warning emitted when PLANNER_URL uses plain HTTP: the API key and
 // every Planner request then travel in cleartext.
 export const PLAIN_HTTP_WARNING =
@@ -45,6 +54,9 @@ export class Config {
   public TASK_POLLING_INTERVAL: number;
   public TASK_POLLING_MAX_INTERVAL: number;
   public TASK_STATUS_CLEANUP: string;
+  // Status name that satisfies a task dependency (a dependency whose status
+  // is not this one still blocks the dependent task).
+  public TASK_DEPENDENCY_SATISFIED_STATUS: string;
   public TASK_MAX_PARALLEL: number;
   public TASK_TIMEOUT: number;
   public TASK_SMART_SCHEDULING: boolean;
@@ -135,6 +147,7 @@ export class Config {
     // consecutive idle poll, up to this many seconds.
     this.TASK_POLLING_MAX_INTERVAL = 300;
     this.TASK_STATUS_CLEANUP = "Done";
+    this.TASK_DEPENDENCY_SATISFIED_STATUS = DEFAULT_DEPENDENCY_SATISFIED_STATUS;
     this.TASK_MAX_PARALLEL = 1;
     this.TASK_TIMEOUT = DEFAULT_TASK_TIMEOUT_SECONDS;
     this.TASK_SMART_SCHEDULING = true;
@@ -156,7 +169,7 @@ export class Config {
     // Bound of one scheduling round's utility-model evaluations (seconds).
     this.AGENT_EVALUATION_TIMEOUT = 30;
     this.AGENT_NOTE_PROJECT = "";
-    this.AGENT_NOTE_INTERVAL = 86400;
+    this.AGENT_NOTE_INTERVAL = DEFAULT_AGENT_NOTE_INTERVAL;
 
     this.AGENT_CLI = "qoder";
     this.AGENT_AUTH_CHECK = "true";
@@ -179,7 +192,7 @@ export class Config {
     this.AGENT_CONFIG_REPOSITORY = "";
     this.AGENT_CONFIG_BRANCH = "main";
     this.AGENT_CONFIG_FOLDER = "";
-    this.AGENT_CONFIG_SYNC_INTERVAL = 300;
+    this.AGENT_CONFIG_SYNC_INTERVAL = DEFAULT_AGENT_CONFIG_SYNC_INTERVAL;
     this.CORE_SKILLS_PATH = "";
 
     this.OPENTELEMETRY_COLLECTOR_HTTP_TRACES = "";
@@ -221,6 +234,11 @@ export class Config {
     }
     if (config.TASK_STATUS_CLEANUP) {
       this.TASK_STATUS_CLEANUP = config.TASK_STATUS_CLEANUP as string;
+    }
+    if (config.TASK_DEPENDENCY_SATISFIED_STATUS) {
+      this.TASK_DEPENDENCY_SATISFIED_STATUS = (
+        config.TASK_DEPENDENCY_SATISFIED_STATUS as string
+      ).trim();
     }
     if (config.TASK_MAX_PARALLEL) {
       this.TASK_MAX_PARALLEL = config.TASK_MAX_PARALLEL as number;
@@ -278,7 +296,8 @@ export class Config {
     if (config.AGENT_NOTE_PROJECT) {
       this.AGENT_NOTE_PROJECT = config.AGENT_NOTE_PROJECT as string;
     }
-    if (config.AGENT_NOTE_INTERVAL) {
+    // Explicit 0 disables the scheduled note update: it is a valid value.
+    if (config.AGENT_NOTE_INTERVAL !== undefined) {
       this.AGENT_NOTE_INTERVAL = config.AGENT_NOTE_INTERVAL as number;
     }
     if (config.AGENT_CLI) {
@@ -339,7 +358,8 @@ export class Config {
     if (config.AGENT_CONFIG_FOLDER) {
       this.AGENT_CONFIG_FOLDER = config.AGENT_CONFIG_FOLDER as string;
     }
-    if (config.AGENT_CONFIG_SYNC_INTERVAL) {
+    // Explicit 0 disables the periodic config-repository refresh.
+    if (config.AGENT_CONFIG_SYNC_INTERVAL !== undefined) {
       this.AGENT_CONFIG_SYNC_INTERVAL =
         config.AGENT_CONFIG_SYNC_INTERVAL as number;
     }
@@ -395,6 +415,10 @@ export class Config {
     }
     if (process.env.TASK_STATUS_CLEANUP) {
       this.TASK_STATUS_CLEANUP = process.env.TASK_STATUS_CLEANUP;
+    }
+    if (process.env.TASK_DEPENDENCY_SATISFIED_STATUS) {
+      this.TASK_DEPENDENCY_SATISFIED_STATUS =
+        process.env.TASK_DEPENDENCY_SATISFIED_STATUS.trim();
     }
     if (process.env.TASK_MAX_PARALLEL) {
       this.TASK_MAX_PARALLEL = parseFloat(process.env.TASK_MAX_PARALLEL);
@@ -627,6 +651,10 @@ export class Config {
       );
     }
 
+    if (this.TASK_DEPENDENCY_SATISFIED_STATUS.trim().length === 0) {
+      errors.push("TASK_DEPENDENCY_SATISFIED_STATUS must not be empty");
+    }
+
     if (
       !Number.isInteger(this.TASK_ADJUSTMENT_MAX_ROUNDS) ||
       this.TASK_ADJUSTMENT_MAX_ROUNDS < 0
@@ -755,11 +783,11 @@ export class Config {
       }
       if (
         !Number.isInteger(this.AGENT_CONFIG_SYNC_INTERVAL) ||
-        this.AGENT_CONFIG_SYNC_INTERVAL <= 0 ||
+        this.AGENT_CONFIG_SYNC_INTERVAL < 0 ||
         this.AGENT_CONFIG_SYNC_INTERVAL > MAX_DELAY_SECONDS
       ) {
         errors.push(
-          `AGENT_CONFIG_SYNC_INTERVAL must be a positive integer of at most ${MAX_DELAY_SECONDS} seconds (current value: '${this.AGENT_CONFIG_SYNC_INTERVAL}')`,
+          `AGENT_CONFIG_SYNC_INTERVAL must be a non-negative integer of at most ${MAX_DELAY_SECONDS} seconds (0 disables the periodic refresh) (current value: '${this.AGENT_CONFIG_SYNC_INTERVAL}')`,
         );
       }
     }

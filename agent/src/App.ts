@@ -8,6 +8,7 @@ import { AgentNote } from "./AgentNote";
 import { Config, parseBooleanFlag } from "./Config";
 import { FinalizationStore } from "./FinalizationStore";
 import { GitEnvironment } from "./GitEnvironment";
+import { HotReloadTimers } from "./HotReloadTimers";
 import { terminateLiveProcessGroups } from "./CliUtils";
 import { OTelInit, OTelLogger, OTelTracer } from "./OTelContext";
 import { PlannerClient } from "./PlannerClient";
@@ -59,14 +60,21 @@ Promise.resolve().then(async () => {
     logger.error("Failed to write the heartbeat file", error as Error);
   }
 
+  // The reloadable timers (agent note, config repository refresh) are
+  // created later, once their dependencies exist; the config watcher
+  // re-applies them after every successful reload.
+  let hotReloadTimers: HotReloadTimers | null = null;
   watchFile(config.CONFIG_FILE, () => {
     logger.info(`Config updated: ${config.CONFIG_FILE}`);
-    config.reload().catch((error: Error) => {
-      logger.error(
-        `Failed to reload configuration file '${config.CONFIG_FILE}'`,
-        error,
-      );
-    });
+    config
+      .reload()
+      .then(() => hotReloadTimers?.apply())
+      .catch((error: Error) => {
+        logger.error(
+          `Failed to reload configuration file '${config.CONFIG_FILE}'`,
+          error,
+        );
+      });
   });
 
   // Agent actions: the YAML file binds projects and start statuses to a
@@ -125,24 +133,15 @@ Promise.resolve().then(async () => {
   const agentConfigRepository = new AgentConfigRepository(config);
   if (agentConfigRepository.isEnabled()) {
     // Fail fast when the configured repository cannot be cloned: the agent
-    // would otherwise run with missing skills or configuration.
+    // would otherwise run with missing skills or configuration. Enabling
+    // the repository from empty stays a startup-only change (it needs the
+    // initial clone); the periodic refresh interval is hot-applied below.
     try {
       await agentConfigRepository.sync();
     } catch (error) {
       logger.error("Agent config repository sync failed", error as Error);
       process.exit(1);
     }
-    // Refresh the local copy periodically; a failed refresh keeps the last
-    // synced copy and is logged, but never stops the agent.
-    const configSyncTimer = setInterval(() => {
-      void agentConfigRepository.sync().catch((error: Error) => {
-        logger.error(
-          "Agent config repository refresh failed (keeping the last synced copy)",
-          error,
-        );
-      });
-    }, config.AGENT_CONFIG_SYNC_INTERVAL * 1000);
-    configSyncTimer.unref();
   } else {
     logger.info("Agent config repository not configured");
   }
@@ -244,9 +243,9 @@ Promise.resolve().then(async () => {
   agent.start();
 
   // Agent note: a single Planner note named after the agent, regularly
-  // refreshed with LLM-generated content. The note is updated when the
-  // agent starts so its content reflects the current agent configuration,
-  // then on the configured interval.
+  // refreshed with LLM-generated content. The job is created disabled when
+  // the note is not configured and the schedule is re-applied on every
+  // config reload (see HotReloadTimers).
   const agentNote = new AgentNote(
     config,
     new PlannerClient(config),
@@ -257,28 +256,24 @@ Promise.resolve().then(async () => {
     () => agent.getSchedulingState(),
   );
   if (agentNote.isEnabled()) {
-    const updateAgentNote = () => {
-      void agentNote.update().catch((error: Error) => {
-        logger.error(
-          "Agent note update failed (will retry on schedule)",
-          error,
-        );
-      });
-    };
-    // The note is refreshed once at startup, before the first scheduled
-    // interval, so a configuration change is picked up on every restart.
-    updateAgentNote();
-    const agentNoteTimer = setInterval(
-      updateAgentNote,
-      config.AGENT_NOTE_INTERVAL * 1000,
-    );
-    agentNoteTimer.unref();
+    logger.info("Agent note updates enabled");
   } else {
     logger.info("Agent note not configured");
   }
+  hotReloadTimers = new HotReloadTimers({
+    config,
+    noteRun: () => agentNote.update(),
+    configSyncRun: () => agentConfigRepository.sync(),
+    configSyncEnabled: agentConfigRepository.isEnabled(),
+    onError: (message, error) =>
+      logger.error(`${message} (will retry on the next interval)`, error),
+    onWarning: (message) => logger.warn(message),
+  });
+  hotReloadTimers.apply();
 
   const shutdown = () => {
     logger.info("Shutting down");
+    hotReloadTimers?.stop();
     agent.stop();
     // Terminate the CLI process groups spawned by the running tasks so a
     // container stop does not leave coding-agent processes behind; then

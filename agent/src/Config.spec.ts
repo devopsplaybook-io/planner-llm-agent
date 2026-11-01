@@ -32,6 +32,7 @@ describe("Config", () => {
       expect(config.PLANNER_API_KEY).toBe("");
       expect(config.TASK_POLLING_INTERVAL).toBe(60);
       expect(config.TASK_STATUS_CLEANUP).toBe("Done");
+      expect(config.TASK_DEPENDENCY_SATISFIED_STATUS).toBe("Done");
       expect(config.TASK_TIMEOUT).toBe(3600);
       expect(config.TASK_MAX_PARALLEL).toBe(1);
       expect(config.TASK_SMART_SCHEDULING).toBe(true);
@@ -233,6 +234,47 @@ describe("Config", () => {
       await config.reload();
       expect(config.AGENT_NOTE_PROJECT).toBe("File Project");
       expect(config.AGENT_NOTE_INTERVAL).toBe(1800);
+
+      await fs.remove(tmpDir);
+    });
+
+    it("should apply explicitly disabled interval timers and the dependency status from the config file", async () => {
+      const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-config-"));
+      const configFile = path.join(tmpDir, "config.json");
+      await fs.writeJson(configFile, {
+        AGENT_NOTE_INTERVAL: 0,
+        AGENT_CONFIG_SYNC_INTERVAL: 0,
+        TASK_DEPENDENCY_SATISFIED_STATUS: " Completed ",
+      });
+      process.env.CONFIG_FILE = configFile;
+
+      const config = new Config();
+      await config.reload();
+      expect(config.AGENT_NOTE_INTERVAL).toBe(0);
+      expect(config.AGENT_CONFIG_SYNC_INTERVAL).toBe(0);
+      expect(config.TASK_DEPENDENCY_SATISFIED_STATUS).toBe("Completed");
+
+      await fs.remove(tmpDir);
+    });
+
+    it("should give priority to the environment for the intervals and the dependency status", async () => {
+      const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "agent-config-"));
+      const configFile = path.join(tmpDir, "config.json");
+      await fs.writeJson(configFile, {
+        AGENT_NOTE_INTERVAL: 60,
+        AGENT_CONFIG_SYNC_INTERVAL: 60,
+        TASK_DEPENDENCY_SATISFIED_STATUS: "File Done",
+      });
+      process.env.CONFIG_FILE = configFile;
+      process.env.AGENT_NOTE_INTERVAL = "90";
+      process.env.AGENT_CONFIG_SYNC_INTERVAL = "120";
+      process.env.TASK_DEPENDENCY_SATISFIED_STATUS = "Env Done";
+
+      const config = new Config();
+      await config.reload();
+      expect(config.AGENT_NOTE_INTERVAL).toBe(90);
+      expect(config.AGENT_CONFIG_SYNC_INTERVAL).toBe(120);
+      expect(config.TASK_DEPENDENCY_SATISFIED_STATUS).toBe("Env Done");
 
       await fs.remove(tmpDir);
     });
@@ -673,6 +715,42 @@ describe("Config", () => {
       config.AGENT_NOTE_PROJECT = "Agent";
       config.TASK_PROGRESS_COMMENT_INTERVAL = 0;
       config.AGENT_NOTE_INTERVAL = 0;
+      expect(config.validate()).toEqual([]);
+    });
+
+    it("should accept a disabled agent config sync interval", () => {
+      const config = new Config();
+      config.PLANNER_API_KEY = "key";
+      config.AGENT_CONFIG_REPOSITORY =
+        "https://github.com/acme/agent-config.git";
+      config.AGENT_CONFIG_SYNC_INTERVAL = 0;
+      expect(config.validate()).toEqual([]);
+    });
+
+    it("should report a negative agent config sync interval", () => {
+      const config = new Config();
+      config.PLANNER_API_KEY = "key";
+      config.AGENT_CONFIG_REPOSITORY =
+        "https://github.com/acme/agent-config.git";
+      config.AGENT_CONFIG_SYNC_INTERVAL = -1;
+      expect(config.validate()).toEqual([
+        "AGENT_CONFIG_SYNC_INTERVAL must be a non-negative integer of at most 2147483 seconds (0 disables the periodic refresh) (current value: '-1')",
+      ]);
+    });
+
+    it("should report an empty dependency satisfied status", () => {
+      const config = new Config();
+      config.PLANNER_API_KEY = "key";
+      config.TASK_DEPENDENCY_SATISFIED_STATUS = "  ";
+      expect(config.validate()).toEqual([
+        "TASK_DEPENDENCY_SATISFIED_STATUS must not be empty",
+      ]);
+    });
+
+    it("should accept a custom dependency satisfied status", () => {
+      const config = new Config();
+      config.PLANNER_API_KEY = "key";
+      config.TASK_DEPENDENCY_SATISFIED_STATUS = "Completed";
       expect(config.validate()).toEqual([]);
     });
 

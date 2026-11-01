@@ -4,6 +4,7 @@ import * as fse from "fs-extra";
 import {
   Agent,
   appendProcessedCommentsMarker,
+  blockingDependencies,
   buildTaskLabel,
   commentsPickupPending,
   hasAgentComment,
@@ -718,8 +719,9 @@ describe("Agent", () => {
       expect.stringContaining("Tasks assigned"),
     );
     expect(mockQoder.performTask).not.toHaveBeenCalled();
-    // The projects are only loaded when a task is ready to be processed.
-    expect(mockPlanner.listProjects).not.toHaveBeenCalled();
+    // The project catalog is read once for the startup status validation;
+    // it is not read for scheduling since no task is ready.
+    expect(mockPlanner.listProjects).toHaveBeenCalledTimes(1);
     agent.stop();
   });
 
@@ -735,7 +737,8 @@ describe("Agent", () => {
     expect(console.log).not.toHaveBeenCalledWith(
       expect.stringContaining("Tasks assigned"),
     );
-    expect(mockPlanner.listProjects).not.toHaveBeenCalled();
+    // The one catalog read comes from the startup status validation.
+    expect(mockPlanner.listProjects).toHaveBeenCalledTimes(1);
     agent.stop();
   });
 
@@ -871,6 +874,182 @@ describe("Agent", () => {
     );
     expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith(TASK_1, "Done");
     agent.stop();
+  });
+
+  it("should process a task whose dependency is in the configured satisfied status", async () => {
+    config.TASK_DEPENDENCY_SATISFIED_STATUS = "Completed";
+    mockPlanner.listAssignedTasks.mockResolvedValue([
+      {
+        id: TASK_1,
+        title: "Unblocked work",
+        status: "To Do",
+        description: "Add a feature",
+        comments: [],
+        attachments: [],
+        dependencies: [
+          { taskId: TASK_2, title: "First step", status: "Completed" },
+        ],
+      },
+    ]);
+    mockQoder.performTask.mockResolvedValue("Feature implemented");
+
+    const agent = createAgent();
+    agent.start();
+    await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
+
+    expect(mockQoder.performTask).toHaveBeenCalledTimes(1);
+    expect(mockPlanner.updateTaskStatus).toHaveBeenCalledWith(TASK_1, "Done");
+    agent.stop();
+  });
+
+  it("should warn about configured statuses missing from the project catalog", async () => {
+    mockPlanner.listProjects.mockResolvedValue([
+      {
+        id: "p1",
+        name: "Web",
+        description: "",
+        statuses: ["To Do", "In Progress"],
+      },
+    ]);
+    mockPlanner.listAssignedTasks.mockResolvedValue([]);
+
+    const agent = createAgent();
+    agent.start();
+    await waitFor(() => warnSpy.mock.calls.length > 0);
+
+    expect(consoleLines()).toEqual(
+      expect.arrayContaining([
+        expect.stringContaining(
+          "Configured status 'Done' (actions[0].status_end) does not exist in the status catalog of project 'Web'",
+        ),
+      ]),
+    );
+    expect(consoleLines()).toEqual(
+      expect.arrayContaining([
+        expect.stringContaining(
+          "Dependency satisfied status 'Done' (TASK_DEPENDENCY_SATISFIED_STATUS) does not exist in the status catalog of project(s) 'Web'",
+        ),
+      ]),
+    );
+    agent.stop();
+  });
+
+  it("should not warn when the project catalog contains every configured status", async () => {
+    mockPlanner.listProjects.mockResolvedValue([
+      {
+        id: "p1",
+        name: "Web",
+        description: "",
+        statuses: ["To Do", "In Progress", "Done"],
+      },
+    ]);
+    mockPlanner.listAssignedTasks.mockResolvedValue([]);
+
+    const agent = createAgent();
+    agent.start();
+    await waitFor(() => mockPlanner.listProjects.mock.calls.length === 1);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    expect(consoleLines()).not.toEqual(
+      expect.arrayContaining([expect.stringContaining("status catalog")]),
+    );
+    agent.stop();
+  });
+
+  it("should keep polling when the project catalog cannot be read for validation", async () => {
+    // The first catalog read is the startup validation and fails; polling
+    // continues and the scheduling read succeeds.
+    mockPlanner.listProjects
+      .mockRejectedValueOnce(new Error("catalog down"))
+      .mockResolvedValue([]);
+    mockPlanner.listAssignedTasks.mockResolvedValue([
+      {
+        id: TASK_1,
+        title: "Implement feature",
+        status: "To Do",
+        description: "Add a feature",
+        comments: [],
+        attachments: [],
+      },
+    ]);
+    mockQoder.performTask.mockResolvedValue("Done");
+
+    const agent = createAgent();
+    agent.start();
+    await waitFor(() => mockPlanner.updateTaskStatus.mock.calls.length > 0);
+
+    expect(mockQoder.performTask).toHaveBeenCalledTimes(1);
+    expect(consoleLines()).toEqual(
+      expect.arrayContaining([
+        expect.stringContaining(
+          "Could not validate the configured statuses against the Planner project status catalogs (continuing)",
+        ),
+      ]),
+    );
+    agent.stop();
+  });
+
+  it("should gate dependencies on the default Done status", () => {
+    expect(
+      blockingDependencies({
+        id: TASK_1,
+        projectId: "p1",
+        title: "Task",
+        status: "To Do",
+        priority: "medium",
+        description: "",
+        dateUpdated: "",
+        comments: [],
+        attachments: [],
+        dependencies: [
+          { taskId: TASK_2, status: "Done" },
+          { taskId: TASK_3, status: "Completed" },
+          { taskId: TASK_OLDEST },
+        ],
+      }),
+    ).toEqual([
+      { taskId: TASK_3, status: "Completed" },
+      { taskId: TASK_OLDEST },
+    ]);
+  });
+
+  it("should gate dependencies on a custom satisfied status", () => {
+    expect(
+      blockingDependencies(
+        {
+          id: TASK_1,
+          projectId: "p1",
+          title: "Task",
+          status: "To Do",
+          priority: "medium",
+          description: "",
+          dateUpdated: "",
+          comments: [],
+          attachments: [],
+          dependencies: [
+            { taskId: TASK_2, status: "Done" },
+            { taskId: TASK_3, status: "Completed" },
+          ],
+        },
+        "Completed",
+      ),
+    ).toEqual([{ taskId: TASK_2, status: "Done" }]);
+  });
+
+  it("should gate nothing when the task has no dependency data", () => {
+    expect(
+      blockingDependencies({
+        id: TASK_1,
+        projectId: "p1",
+        title: "Task",
+        status: "To Do",
+        priority: "medium",
+        description: "",
+        dateUpdated: "",
+        comments: [],
+        attachments: [],
+      }),
+    ).toEqual([]);
   });
 
   it("should render the dependencies in the task notes file", async () => {

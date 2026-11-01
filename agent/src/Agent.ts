@@ -5,7 +5,7 @@ import {
   AgentActionsConfig,
   matchProjectPattern,
 } from "./AgentActions";
-import { Config, MAX_DELAY_SECONDS } from "./Config";
+import { Config, DEFAULT_DEPENDENCY_SATISFIED_STATUS, MAX_DELAY_SECONDS } from "./Config";
 import { writeJsonAtomic } from "./AtomicFile";
 import type { AgentSchedulingSnapshot } from "./AgentNote";
 import { FinalizationStore } from "./FinalizationStore";
@@ -47,6 +47,7 @@ import {
   selectTasksLegacy,
 } from "./Scheduler";
 import { TaskEvaluator } from "./TaskEvaluator";
+import { buildStatusWarnings, projectHasStatus } from "./StatusValidation";
 
 const logger = OTelLogger().createModuleLogger("agent");
 
@@ -269,6 +270,9 @@ export class Agent {
   // Invalid task ids skipped at the Planner boundary, bounded so a hostile
   // Planner cannot grow the set without limit.
   private warnedInvalidTaskIds = new Set<string>();
+  // The configured statuses are validated once against the project status
+  // catalogs, on the first poll that has actions (never fails polling).
+  private statusesValidated = false;
   // Planner user id of the agent itself, cached at every poll: the
   // new-comment check excludes the comments authored by this user (they are
   // the agent's own start/summary comments). One agent process per agent
@@ -470,6 +474,9 @@ export class Agent {
           }
           return projects;
         };
+      // The configured statuses are checked against the project catalogs
+      // once, as early as the catalog can be read.
+      await this.validateConfiguredStatusesOnce(loadProjects);
       // Cut the poll payload: when every action is bound to a project
       // pattern, the task list is fetched per project instead of across
       // all projects.
@@ -514,9 +521,10 @@ export class Agent {
       // for the user, a blocked dependency) is never picked up by a later
       // overlapping action. The claim set is rebuilt from the configuration
       // and the comments on every poll, so the rule is stateless and
-      // restart-safe. A task with a dependency that is not Done yet is only
-      // reported as deferred (no status change, no error comment) and is
-      // picked up naturally once its dependencies complete. Every claimed
+      // restart-safe. A task with a dependency that is not in the configured
+      // satisfied status (default Done) yet is only reported as deferred (no
+      // status change, no error comment) and is picked up naturally once its
+      // dependencies complete. Every claimed
       // (task, action) pair that passes the gates is a candidate; the
       // scheduler then fills the capacity budget from the candidates sorted
       // by queue priority. The budget is shared by every action.
@@ -555,7 +563,10 @@ export class Agent {
           ) {
             continue;
           }
-          const blocking = blockingDependencies(task);
+          const blocking = blockingDependencies(
+            task,
+            this.dependencySatisfiedStatus(),
+          );
           if (blocking.length > 0) {
             dependencyDeferrals.push({
               task,
@@ -1015,6 +1026,56 @@ export class Agent {
   // is processed.
   private getActions(): AgentAction[] {
     return this.agentActions?.actions ?? [];
+  }
+
+  // The configured dependency satisfied status. A hot-reloaded empty value
+  // falls back to the default instead of gating every dependency (the
+  // startup validation rejects an empty value).
+  private dependencySatisfiedStatus(): string {
+    const value = this.config.TASK_DEPENDENCY_SATISFIED_STATUS?.trim();
+    return value && value.length > 0
+      ? value
+      : DEFAULT_DEPENDENCY_SATISFIED_STATUS;
+  }
+
+  // Validates the configured action statuses (start/end/error/in-progress/
+  // abort) and the dependency satisfied status against the project status
+  // catalogs, once per process, on the first poll that has actions. Status
+  // names are project-defined: a mismatch is reported as an actionable
+  // warning but never stops the agent. A catalog fetch failure logs one
+  // warning and never fails the poll; the validation is not retried.
+  private async validateConfiguredStatusesOnce(
+    loadProjects: () => Promise<Map<string, PlannerProject>>,
+  ): Promise<void> {
+    if (this.statusesValidated) {
+      return;
+    }
+    const actions = this.getActions();
+    if (actions.length === 0) {
+      return;
+    }
+    try {
+      const projects = await loadProjects();
+      const warnings = buildStatusWarnings(
+        actions,
+        this.agentActions ?? {
+          defaultModel: "",
+          defaultTimeout: null,
+          actions: [],
+        },
+        this.dependencySatisfiedStatus(),
+        Array.from(projects.values()),
+      );
+      for (const warning of warnings) {
+        logger.warn(warning);
+      }
+    } catch (error) {
+      logger.warn(
+        `Could not validate the configured statuses against the Planner project status catalogs (continuing): ${(error as Error).message}`,
+      );
+    } finally {
+      this.statusesValidated = true;
+    }
   }
 
   // A task matches an action when its status is the action start status and
@@ -1892,7 +1953,7 @@ export class Agent {
     if (
       project?.statuses &&
       project.statuses.length > 0 &&
-      !project.statuses.includes(statusInProgress)
+      !projectHasStatus(project, statusInProgress)
     ) {
       logger.warn(
         `Task '${task.title}' (${task.id}) not moved to the in-progress status '${statusInProgress}': the status does not exist in project '${project.name}'`,
@@ -2425,17 +2486,19 @@ function dateUpdatedValue(dateUpdated: string): number {
   return Number.isNaN(time) ? Number.NEGATIVE_INFINITY : time;
 }
 
-// The dependencies that still block a task: only an explicit 'Done' status
-// satisfies a dependency (the only done-like status in the catalog, matching
-// the 'doneSince' and TASK_STATUS_CLEANUP semantics). A dependency without a
-// hydrated status blocks too: fail-closed, since the planner reports the
-// status of every existing dependency. An older server that omits the
-// dependencies field entirely gates nothing (it has no dependency data).
+// The dependencies that still block a task: only a dependency whose status
+// equals the configured satisfied status (default 'Done') is satisfied. The
+// dependency gate is global because a Planner dependency carries only a
+// status string (no project or action). A dependency without a hydrated
+// status blocks too: fail-closed, since the planner reports the status of
+// every existing dependency. An older server that omits the dependencies
+// field entirely gates nothing (it has no dependency data).
 export function blockingDependencies(
   task: PlannerTask,
+  satisfiedStatus: string = DEFAULT_DEPENDENCY_SATISFIED_STATUS,
 ): PlannerTaskDependency[] {
   return (task.dependencies ?? []).filter(
-    (dependency) => dependency.status !== "Done",
+    (dependency) => dependency.status !== satisfiedStatus,
   );
 }
 
