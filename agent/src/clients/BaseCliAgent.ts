@@ -76,16 +76,16 @@ export abstract class BaseCliAgent implements CliAgentClient {
     model: string | null,
   ): string[];
 
-  // Reply extraction from the CLI output; null when no reply can be parsed
-  // (the caller falls back to the raw stdout). The exact arguments of the
-  // invocation are provided so adapters that receive the reply through a
-  // file (Codex '--output-last-message') can locate it — the file name is
+  // Asynchronous reply extraction from the CLI output; null when no reply can
+  // be parsed (the caller falls back to the raw stdout). The exact arguments
+  // of the invocation are provided so adapters that receive the reply through
+  // a file (Codex '--output-last-message') can locate it — the file name is
   // unique per invocation, so it must not be shared through instance state
   // across concurrent runs.
   protected abstract parseReply(
     result: { stdout: string; stderr: string },
     args?: string[],
-  ): string | null;
+  ): Promise<string | null>;
 
   // Called once per CLI invocation when it settles (success or failure):
   // adapters can clean up per-invocation resources (e.g. the reply file of
@@ -163,7 +163,7 @@ export abstract class BaseCliAgent implements CliAgentClient {
       }, "authentication check");
       // A zero exit code is not enough: verify that the probe actually
       // produced a reply so an empty-output CLI fails visibly at startup.
-      const reply = this.parseReply(result, args) ?? result.stdout;
+      const reply = (await this.parseReply(result, args)) ?? result.stdout;
       if (!reply.includes("OK")) {
         throw new Error(
           `${this.displayName} authentication probe did not return the expected reply. CLI output:\n${formatCliOutput(result)}`,
@@ -278,7 +278,7 @@ export abstract class BaseCliAgent implements CliAgentClient {
         // Fall back to the CLI output when the file cannot be read.
       }
       if (summary.length === 0) {
-        const reply = this.parseReply(result, args ?? undefined);
+        const reply = await this.parseReply(result, args ?? undefined);
         if (reply !== null && reply.length > 0) {
           summary = reply;
           source = "cli reply";
@@ -368,7 +368,7 @@ export abstract class BaseCliAgent implements CliAgentClient {
       logger.info(
         `${this.usageLabel()} after prompt${purposeSuffix}: ${formatUsageValue(usageAfter)}`,
       );
-      const reply = this.parseReply(result, args);
+      const reply = await this.parseReply(result, args);
       if (reply !== null && reply.length > 0) {
         return reply;
       }

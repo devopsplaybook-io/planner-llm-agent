@@ -75,19 +75,19 @@ export class CodexClient extends BaseCliAgent {
     return index !== -1 && index + 1 < args.length ? args[index + 1] : null;
   }
 
-  protected parseReply(
+  protected async parseReply(
     result: { stdout: string; stderr: string },
     args?: string[],
-  ): string | null {
+  ): Promise<string | null> {
     const replyFile = this.replyFileOf(args);
     if (replyFile !== null) {
       try {
-        const reply = fse.readFileSync(replyFile, "utf8").trim();
+        const reply = (await fse.readFile(replyFile, "utf8")).trim();
         if (reply.length > 0) {
           return reply;
         }
       } catch {
-        // Fall back to the raw output when the file is missing.
+        // Fall back to the raw output when the file is missing or unreadable.
       }
     }
     const trimmed = result.stdout.trim();

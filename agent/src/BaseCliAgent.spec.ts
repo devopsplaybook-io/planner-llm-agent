@@ -6,8 +6,24 @@ import { Config } from "./Config";
 import { BaseCliAgent, MODEL_LIST_FAILURE_TTL_MS, extractTaskModel, resolveModel } from "./clients/BaseCliAgent";
 import { CliAbortedError, runCli } from "./CliUtils";
 import type { RunCliOptions } from "./CliUtils";
+import { invalidateSkillsCache } from "./CoreSkills";
 import type { PlannerTask } from "./PlannerClient";
 import type { PromptOptions, TaskOptions } from "./clients/CliAgent";
+
+// Real fs-extra with counted directory/file reads: the skills-listing cache
+// tests assert that a second task prompt performs no disk scan.
+jest.mock("fs-extra", () => {
+  const actual = jest.requireActual("fs-extra");
+  return {
+    ...actual,
+    readdir: jest.fn((...args: unknown[]) =>
+      (actual.readdir as (...inputs: unknown[]) => unknown)(...args),
+    ),
+    readFile: jest.fn((...args: unknown[]) =>
+      (actual.readFile as (...inputs: unknown[]) => unknown)(...args),
+    ),
+  };
+});
 
 jest.mock("./OTelContext", () => {
   // One logger instance per module name: tests can assert the lines logged
@@ -94,7 +110,9 @@ class TestCliAgent extends BaseCliAgent {
     return ["--model", model ?? "auto", "--prompt", prompt];
   }
 
-  protected parseReply(result: { stdout: string; stderr: string }): string | null {
+  protected async parseReply(
+    result: { stdout: string; stderr: string },
+  ): Promise<string | null> {
     return result.stdout.trim() || null;
   }
 
@@ -159,6 +177,10 @@ describe("BaseCliAgent", () => {
   beforeEach(() => {
     MockedRunCli.mockReset();
     MockedRunCli.mockResolvedValue({ stdout: "CLI reply\n", stderr: "" });
+    // The skills listing cache is module-global: start every test cold.
+    invalidateSkillsCache();
+    (fse.readdir as unknown as jest.Mock).mockClear();
+    (fse.readFile as unknown as jest.Mock).mockClear();
     dataDir = path.join(os.tmpdir(), `base-cli-agent-spec-${Date.now()}`);
     const config = new Config();
     config.DATA_DIR = dataDir;
@@ -359,6 +381,66 @@ describe("BaseCliAgent", () => {
       const { args } = lastCall();
       expect(args[3]).toContain("'shared — Synced description.'");
       expect(args[3]).not.toContain("Core description.");
+    });
+
+    it("scans the skills directories once across task prompts", async () => {
+      const config = new Config();
+      config.DATA_DIR = dataDir;
+      config.CORE_SKILLS_PATH = path.join(dataDir, "core-skills");
+      config.AGENT_CONFIG_REPOSITORY =
+        "https://github.com/acme/agent-config.git";
+      agent = new TestCliAgent(config, agentActions);
+      fse.outputFileSync(
+        path.join(config.CORE_SKILLS_PATH, "core-skill", "SKILL.md"),
+        ["---", "name: core-skill", 'description: "Core skill."', "---"].join(
+          "\n",
+        ),
+      );
+      fse.outputFileSync(
+        path.join(dataDir, "agent-config", "skills", "synced-skill", "SKILL.md"),
+        [
+          "---",
+          "name: synced-skill",
+          'description: "Synced skill."',
+          "---",
+        ].join("\n"),
+      );
+      const skillDirReads = (): number =>
+        (fse.readdir as unknown as jest.Mock).mock.calls.filter(
+          ([dir]) =>
+            String(dir).includes("core-skills") ||
+            String(dir).includes("agent-config"),
+        ).length;
+      const skillFileReads = (): number =>
+        (fse.readFile as unknown as jest.Mock).mock.calls.filter(([file]) =>
+          String(file).endsWith("SKILL.md"),
+        ).length;
+
+      const notesFile = path.join(dataDir, "tasks", "task-1-Agent.md");
+      await agent.performTask(buildTask(), notesFile);
+      // One directory listing and one SKILL.md read per source (core and
+      // synced), despite the prompt listing the core skills twice.
+      expect(skillDirReads()).toBe(2);
+      expect(skillFileReads()).toBe(2);
+
+      await agent.performTask(buildTask(), notesFile);
+      expect(skillDirReads()).toBe(2);
+      expect(skillFileReads()).toBe(2);
+
+      const prompts = MockedRunCli.mock.calls
+        .map((call) => call[1] as string[])
+        .filter((cliArgs) => cliArgs.includes("--prompt"))
+        .map((cliArgs) => cliArgs[cliArgs.indexOf("--prompt") + 1] as string);
+      expect(prompts).toHaveLength(2);
+      const skillsLine = (prompt: string): string =>
+        prompt
+          .split("\n")
+          .find((line) => line.startsWith("Available skills")) ?? "";
+      expect(skillsLine(prompts[0])).toContain("'core-skill — Core skill.'");
+      expect(skillsLine(prompts[0])).toContain(
+        "'synced-skill — Synced skill.'",
+      );
+      expect(skillsLine(prompts[1])).toBe(skillsLine(prompts[0]));
     });
 
     it("rethrows a CLI abort as CliAbortedError with the display name", async () => {

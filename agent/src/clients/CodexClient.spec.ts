@@ -34,6 +34,21 @@ jest.mock("child_process", () => ({
 
 const mockExecFile = execFile as unknown as jest.Mock;
 
+// Real fs-extra with counted reads: the reply-file read must go through the
+// asynchronous readFile, never the blocking readFileSync.
+jest.mock("fs-extra", () => {
+  const actual = jest.requireActual("fs-extra");
+  return {
+    ...actual,
+    readFile: jest.fn((...args: unknown[]) =>
+      (actual.readFile as (...inputs: unknown[]) => unknown)(...args),
+    ),
+    readFileSync: jest.fn((...args: unknown[]) =>
+      (actual.readFileSync as (...inputs: unknown[]) => unknown)(...args),
+    ),
+  };
+});
+
 // Waits for a condition on the real filesystem (the reply-file cleanup is
 // fire-and-forget and may complete shortly after the run settles).
 async function waitFor(condition: () => boolean, timeoutMs = 2000): Promise<void> {
@@ -70,6 +85,8 @@ describe("CodexClient", () => {
     config.DATA_DIR = path.join(os.tmpdir(), "codex-spec", "data");
     client = new CodexClient(config);
     mockExecFile.mockReset();
+    (fse.readFile as unknown as jest.Mock).mockClear();
+    (fse.readFileSync as unknown as jest.Mock).mockClear();
     mockLogger.info.mockClear();
     mockLogger.warn.mockClear();
     mockLogger.error.mockClear();
@@ -154,6 +171,21 @@ describe("CodexClient", () => {
       "--skip-git-repo-check",
     ]);
     expect(args[args.length - 1]).toContain("Task documentation file:");
+
+    // The reply file is read asynchronously (never with the blocking
+    // readFileSync).
+    const replyFilesRead = (
+      mock: jest.Mock,
+    ): string[] =>
+      mock.mock.calls
+        .map(([file]) => String(file))
+        .filter((file) => file.includes("codex-last-message-"));
+    expect(replyFilesRead(fse.readFile as unknown as jest.Mock)).toHaveLength(
+      1,
+    );
+    expect(
+      replyFilesRead(fse.readFileSync as unknown as jest.Mock),
+    ).toHaveLength(0);
   });
 
   it("should run without a model flag when none is configured", async () => {
@@ -188,6 +220,55 @@ describe("CodexClient", () => {
         _options: unknown,
         callback: (error: Error | null, stdout: string, stderr: string) => void,
       ) => callback(null, "Implemented the feature\n", ""),
+    );
+
+    const summary = await client.performTask(
+      task(),
+      path.join(os.tmpdir(), "codex-spec", "task-1-Agent.md"),
+    );
+
+    expect(summary).toBe(
+      "Implemented the feature\n\n---\nModel: auto · Duration: 0s",
+    );
+  });
+
+  it("should fall back to stdout when the reply file is unreadable", async () => {
+    mockExecFile.mockImplementation(
+      (
+        _command: string,
+        args: string[],
+        _options: unknown,
+        callback: (error: Error | null, stdout: string, stderr: string) => void,
+      ) => {
+        // A directory at the reply path makes readFile fail (EISDIR).
+        const lastIndex = args.indexOf("--output-last-message");
+        fse.mkdirSync(args[lastIndex + 1] as string);
+        callback(null, "Implemented the feature\n", "");
+      },
+    );
+
+    const summary = await client.performTask(
+      task(),
+      path.join(os.tmpdir(), "codex-spec", "task-1-Agent.md"),
+    );
+
+    expect(summary).toBe(
+      "Implemented the feature\n\n---\nModel: auto · Duration: 0s",
+    );
+  });
+
+  it("should fall back to stdout when the reply file is empty", async () => {
+    mockExecFile.mockImplementation(
+      (
+        _command: string,
+        args: string[],
+        _options: unknown,
+        callback: (error: Error | null, stdout: string, stderr: string) => void,
+      ) => {
+        const lastIndex = args.indexOf("--output-last-message");
+        fse.writeFileSync(args[lastIndex + 1] as string, " \n\t \n");
+        callback(null, "Implemented the feature\n", "");
+      },
     );
 
     const summary = await client.performTask(

@@ -4,6 +4,13 @@ import { OTelTracer } from "./OTelContext";
 
 const REQUEST_TIMEOUT_MS = 30000;
 
+// Reference data (the agent's own user and the visible project catalog) is
+// cached for this long: a project added or renamed becomes visible within at
+// most 60 s, i.e. at the next poll after the cache expires. Failed fetches
+// are never cached and are retried on the next call; concurrent callers share
+// a single in-flight request.
+export const PLANNER_REFERENCE_TTL_MS = 60_000;
+
 // Conservative, centralised retry policy for idempotent (GET) requests. A
 // transient network error, timeout, 429 or 5xx is retried with a full-jitter
 // exponential backoff; plain 4xx and every write (POST/PUT/PATCH) are never
@@ -143,6 +150,14 @@ export class PlannerClient {
   private retryBaseDelayMs: number;
   private retryMaxDelayMs: number;
   private retryTotalBudgetMs: number;
+  private currentUserCache: { user: PlannerUser; expiresAt: number } | null =
+    null;
+  private currentUserInFlight: Promise<PlannerUser> | null = null;
+  private projectsCache: {
+    projects: PlannerProject[];
+    expiresAt: number;
+  } | null = null;
+  private projectsInFlight: Promise<PlannerProject[]> | null = null;
 
   constructor(config: Config, retryOptions?: PlannerRetryOptions) {
     this.config = config;
@@ -156,6 +171,31 @@ export class PlannerClient {
   }
 
   public async getCurrentUser(): Promise<PlannerUser> {
+    const cached = this.currentUserCache;
+    if (cached !== null && Date.now() < cached.expiresAt) {
+      return cached.user;
+    }
+    let inFlight = this.currentUserInFlight;
+    if (inFlight === null) {
+      inFlight = this.fetchCurrentUser().then((user) => {
+        this.currentUserCache = {
+          user,
+          expiresAt: Date.now() + PLANNER_REFERENCE_TTL_MS,
+        };
+        return user;
+      });
+      this.currentUserInFlight = inFlight;
+      const settle = () => {
+        if (this.currentUserInFlight === inFlight) {
+          this.currentUserInFlight = null;
+        }
+      };
+      inFlight.then(settle, settle);
+    }
+    return inFlight;
+  }
+
+  private async fetchCurrentUser(): Promise<PlannerUser> {
     const span = OTelTracer().startSpan("planner-client.get-current-user");
     try {
       const body = await this.request("/api/users/session", "POST", span);
@@ -445,6 +485,31 @@ export class PlannerClient {
   }
 
   public async listProjects(): Promise<PlannerProject[]> {
+    const cached = this.projectsCache;
+    if (cached !== null && Date.now() < cached.expiresAt) {
+      return cached.projects;
+    }
+    let inFlight = this.projectsInFlight;
+    if (inFlight === null) {
+      inFlight = this.fetchProjects().then((projects) => {
+        this.projectsCache = {
+          projects,
+          expiresAt: Date.now() + PLANNER_REFERENCE_TTL_MS,
+        };
+        return projects;
+      });
+      this.projectsInFlight = inFlight;
+      const settle = () => {
+        if (this.projectsInFlight === inFlight) {
+          this.projectsInFlight = null;
+        }
+      };
+      inFlight.then(settle, settle);
+    }
+    return inFlight;
+  }
+
+  private async fetchProjects(): Promise<PlannerProject[]> {
     const span = OTelTracer().startSpan("planner-client.list-projects");
     try {
       const body = await this.request("/api/projects", "GET", span);

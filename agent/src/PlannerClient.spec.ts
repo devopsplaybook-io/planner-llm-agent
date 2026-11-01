@@ -2,6 +2,7 @@ import {
   AttachmentTooLargeError,
   PlannerClient,
   PlannerRequestError,
+  PLANNER_REFERENCE_TTL_MS,
 } from "./PlannerClient";
 import { Config } from "./Config";
 
@@ -890,6 +891,190 @@ describe("PlannerClient", () => {
         }),
       }),
     );
+  });
+
+  describe("reference data cache", () => {
+    const noRetry = { attempts: 1, baseDelayMs: 0, maxDelayMs: 0 };
+
+    const userResponse = (id: string, name: string): Response =>
+      new Response(JSON.stringify({ success: true, user: { id, name } }), {
+        status: 201,
+      });
+
+    const projectsResponse = (name: string): Response =>
+      new Response(JSON.stringify([{ id: "p1", name }]), { status: 200 });
+
+    it("fetches the current user once within the TTL", async () => {
+      fetchMock.mockResolvedValue(userResponse("user-1", "Didier"));
+
+      const client = new PlannerClient(config);
+      const first = await client.getCurrentUser();
+      const second = await client.getCurrentUser();
+
+      expect(second).toEqual(first);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
+    it("refreshes the current user after the TTL", async () => {
+      const nowSpy = jest.spyOn(Date, "now").mockReturnValue(1_000_000);
+      try {
+        fetchMock
+          .mockResolvedValueOnce(userResponse("user-1", "Didier"))
+          .mockResolvedValueOnce(userResponse("user-2", "New Name"));
+
+        const client = new PlannerClient(config);
+        await expect(client.getCurrentUser()).resolves.toEqual({
+          id: "user-1",
+          name: "Didier",
+        });
+
+        nowSpy.mockReturnValue(1_000_000 + PLANNER_REFERENCE_TTL_MS);
+        await expect(client.getCurrentUser()).resolves.toEqual({
+          id: "user-2",
+          name: "New Name",
+        });
+        expect(fetchMock).toHaveBeenCalledTimes(2);
+      } finally {
+        nowSpy.mockRestore();
+      }
+    });
+
+    it("caches the project catalog for the TTL and refreshes it after", async () => {
+      const nowSpy = jest.spyOn(Date, "now").mockReturnValue(1_000_000);
+      try {
+        fetchMock
+          .mockResolvedValueOnce(projectsResponse("Project A"))
+          .mockResolvedValueOnce(projectsResponse("Project A renamed"));
+
+        const client = new PlannerClient(config);
+        const expected = [
+          { id: "p1", name: "Project A", description: "" },
+        ];
+        await expect(client.listProjects()).resolves.toEqual(expected);
+        await expect(client.listProjects()).resolves.toEqual(expected);
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+
+        nowSpy.mockReturnValue(1_000_000 + PLANNER_REFERENCE_TTL_MS);
+        await expect(client.listProjects()).resolves.toEqual([
+          { id: "p1", name: "Project A renamed", description: "" },
+        ]);
+        expect(fetchMock).toHaveBeenCalledTimes(2);
+      } finally {
+        nowSpy.mockRestore();
+      }
+    });
+
+    it("does not cache a failed user fetch", async () => {
+      fetchMock
+        .mockResolvedValueOnce(
+          new Response(JSON.stringify({ error: "Access Denied" }), {
+            status: 403,
+          }),
+        )
+        .mockResolvedValueOnce(userResponse("user-1", "Didier"));
+
+      const client = new PlannerClient(config, noRetry);
+      await expect(client.getCurrentUser()).rejects.toThrow("status 403");
+      await expect(client.getCurrentUser()).resolves.toEqual({
+        id: "user-1",
+        name: "Didier",
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+
+    it("does not cache a failed project fetch", async () => {
+      fetchMock
+        .mockResolvedValueOnce(
+          new Response(JSON.stringify({ error: "boom" }), { status: 500 }),
+        )
+        .mockResolvedValueOnce(projectsResponse("Project A"));
+
+      const client = new PlannerClient(config, noRetry);
+      await expect(client.listProjects()).rejects.toThrow("status 500");
+      await expect(client.listProjects()).resolves.toEqual([
+        { id: "p1", name: "Project A", description: "" },
+      ]);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+
+    it("single-flights concurrent user fetches", async () => {
+      let resolveFetch!: (response: Response) => void;
+      fetchMock.mockReturnValue(
+        new Promise<Response>((resolve) => {
+          resolveFetch = resolve;
+        }),
+      );
+
+      const client = new PlannerClient(config);
+      const first = client.getCurrentUser();
+      const second = client.getCurrentUser();
+      resolveFetch(userResponse("user-1", "Didier"));
+
+      await expect(Promise.all([first, second])).resolves.toEqual([
+        { id: "user-1", name: "Didier" },
+        { id: "user-1", name: "Didier" },
+      ]);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
+    it("single-flights concurrent project fetches", async () => {
+      let resolveFetch!: (response: Response) => void;
+      fetchMock.mockReturnValue(
+        new Promise<Response>((resolve) => {
+          resolveFetch = resolve;
+        }),
+      );
+
+      const client = new PlannerClient(config);
+      const first = client.listProjects();
+      const second = client.listProjects();
+      resolveFetch(projectsResponse("Project A"));
+
+      await expect(Promise.all([first, second])).resolves.toEqual([
+        [{ id: "p1", name: "Project A", description: "" }],
+        [{ id: "p1", name: "Project A", description: "" }],
+      ]);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
+    it("retries instead of reusing a rejected in-flight fetch", async () => {
+      fetchMock
+        .mockResolvedValueOnce(
+          new Response(JSON.stringify({ error: "Access Denied" }), {
+            status: 403,
+          }),
+        )
+        .mockResolvedValueOnce(userResponse("user-1", "Didier"));
+
+      const client = new PlannerClient(config, noRetry);
+      const first = client.getCurrentUser();
+      const second = client.getCurrentUser();
+
+      await expect(Promise.allSettled([first, second])).resolves.toEqual([
+        { status: "rejected", reason: expect.any(Error) },
+        { status: "rejected", reason: expect.any(Error) },
+      ]);
+      await expect(client.getCurrentUser()).resolves.toEqual({
+        id: "user-1",
+        name: "Didier",
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+
+    it("shares the per-poll reference fetches within the TTL", async () => {
+      fetchMock.mockImplementation(async (url: string) =>
+        String(url).endsWith("/api/users/session")
+          ? userResponse("user-1", "Didier")
+          : projectsResponse("Project A"),
+      );
+
+      const client = new PlannerClient(config);
+      for (let poll = 0; poll < 2; poll++) {
+        await client.getCurrentUser();
+        await client.listProjects();
+      }
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
   });
 
   // Retry policy tests: no delay is injected, the policy itself is what is
