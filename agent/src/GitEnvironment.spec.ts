@@ -134,8 +134,8 @@ describe("GitEnvironment", () => {
 
     const gitconfig = await readFile(".gitconfig");
     expect(gitconfig).toContain("[user]");
-    expect(gitconfig).toContain("\tname = agent-test");
-    expect(gitconfig).toContain("\temail = agent@test.example");
+    expect(gitconfig).toContain("\tname = \"agent-test\"");
+    expect(gitconfig).toContain("\temail = \"agent@test.example\"");
     expect(gitconfig).toContain('[credential "https://github.com"]');
     expect(gitconfig).toContain("\thelper = !gh auth git-credential");
     expect(gitconfig).toContain('[url "https://github.com/"]');
@@ -147,6 +147,8 @@ describe("GitEnvironment", () => {
     expect(process.env.GH_TOKEN).toBe(GITHUB_TOKEN);
     expect(process.env.GIT_TERMINAL_PROMPT).toBe("0");
     expect(mockExecFile.mock.calls.some((call) => call[0] === "gh")).toBe(true);
+    // The default token is only referenced through the gh credential helper.
+    expect(gitconfig).not.toContain(GITHUB_TOKEN);
   });
 
   it("keeps an existing GH_TOKEN", async () => {
@@ -172,13 +174,77 @@ describe("GitEnvironment", () => {
     expect(gitconfig).toContain('[credential "https://github.com/org-a"]');
     expect(gitconfig).toContain('[credential "https://github.com/org-b"]');
     expect(gitconfig).toContain(
-      `\thelper = "!f() { echo username=x-access-token; echo password=github_pat_aaaaaaaaaaaaaaaaaaaa; }; f"`,
+      `\thelper = "!f() { echo username=x-access-token; echo password=\${GH_TOKEN_ORG_A}; }; f"`,
     );
+    expect(gitconfig).toContain(
+      `\thelper = "!f() { echo username=x-access-token; echo password=\${GH_TOKEN_ORG_B}; }; f"`,
+    );
+    // The tokens themselves never reach the file.
+    expect(gitconfig).not.toContain("github_pat_aaaaaaaaaaaaaaaaaaaa");
+    expect(gitconfig).not.toContain("github_pat_bbbbbbbbbbbbbbbbbbbb");
     // No default token: no host-wide helper and no GH_TOKEN, but SSH clone
     // URLs are still rewritten so the organization tokens apply.
     expect(gitconfig).not.toContain('[credential "https://github.com"]');
     expect(gitconfig).toContain('[url "https://github.com/"]');
     expect(process.env.GH_TOKEN).toBeUndefined();
+  });
+
+  it("never writes token values into the gitconfig", async () => {
+    config.GITHUB_TOKEN = GITHUB_TOKEN;
+    config.GITHUB_TOKENS = "org-a=github_pat_aaaaaaaaaaaaaaaaaaaa";
+    mockCli(() => "");
+
+    await expect(run()).resolves.toBeUndefined();
+
+    // git config --list prints the file values, so a file without the tokens
+    // is equivalent to the listing revealing nothing.
+    const gitconfig = await readFile(".gitconfig");
+    expect(gitconfig).not.toContain(GITHUB_TOKEN);
+    expect(gitconfig).not.toContain("github_pat_aaaaaaaaaaaaaaaaaaaa");
+    expect(gitconfig).toContain("password=${GH_TOKEN_ORG_A}");
+    expect(gitconfig).toContain("\thelper = !gh auth git-credential");
+  });
+
+  it("rejects an invalid organization name and writes no gitconfig", async () => {
+    config.GITHUB_TOKENS = 'bad"org=github_pat_aaaaaaaaaaaaaaaaaaaa';
+    mockCli(() => "");
+
+    await expect(run()).rejects.toThrow(
+      /GITHUB_TOKENS organization name is invalid \(letters, digits and hyphens only\)/,
+    );
+    expect(await fse.pathExists(path.join(homeDir, ".gitconfig"))).toBe(false);
+  });
+
+  it("rejects a git identity containing a newline before writing anything", async () => {
+    config.GITHUB_TOKEN = GITHUB_TOKEN;
+    config.GIT_USER_NAME = "Agent\n[core]\n\teditor = evil";
+
+    await expect(run()).rejects.toThrow(
+      /GIT_USER_NAME must not contain control characters or newlines/,
+    );
+    expect(await fse.pathExists(path.join(homeDir, ".gitconfig"))).toBe(false);
+    expect(await fse.pathExists(path.join(homeDir, ".ssh"))).toBe(false);
+  });
+
+  it("rejects a git email containing a newline before writing the SSH files", async () => {
+    config.GIT_SSH_PRIVATE_KEY = SSH_KEY;
+    config.GIT_USER_EMAIL = "agent@test.example\nInjected";
+
+    await expect(run()).rejects.toThrow(
+      /GIT_USER_EMAIL must not contain control characters or newlines/,
+    );
+    expect(await fse.pathExists(path.join(homeDir, ".ssh"))).toBe(false);
+  });
+
+  it("escapes quotes and backslashes in the git identity", async () => {
+    config.GITHUB_TOKEN = GITHUB_TOKEN;
+    config.GIT_USER_NAME = 'Agent "Test" \\ X';
+    mockCli(() => "");
+
+    await expect(run()).resolves.toBeUndefined();
+
+    const gitconfig = await readFile(".gitconfig");
+    expect(gitconfig).toContain('\tname = "Agent \\"Test\\" \\\\ X"');
   });
 
   it("writes the organization helpers before the host-wide helper", async () => {
@@ -305,7 +371,7 @@ describe("GitEnvironment", () => {
 
     const gitconfig = await readFile(".gitconfig");
     expect(gitconfig).toContain(
-      `\tsigningkey = ${path.join(homeDir, ".ssh", "id_github.pub")}`,
+      `\tsigningkey = "${path.join(homeDir, ".ssh", "id_github.pub")}"`,
     );
     expect(gitconfig).toContain("\tgpgsign = true");
     expect(gitconfig).toContain("[gpg]");
@@ -360,7 +426,7 @@ describe("GitEnvironment", () => {
 
     const gitconfig = await readFile(".gitconfig");
     expect(gitconfig).toContain(
-      "\tsigningkey = ABCDEF1234567890ABCDEF1234567890ABCDEF12",
+      "\tsigningkey = \"ABCDEF1234567890ABCDEF1234567890ABCDEF12\"",
     );
     expect(gitconfig).toContain("\tgpgsign = true");
     expect(gitconfig).toContain("\tformat = openpgp");
@@ -395,7 +461,7 @@ describe("GitEnvironment", () => {
     await expect(run()).resolves.toBeUndefined();
 
     const gitconfig = await readFile(".gitconfig");
-    expect(gitconfig).toContain("\tsigningkey = CUSTOMKEYID");
+    expect(gitconfig).toContain("\tsigningkey = \"CUSTOMKEYID\"");
     expect(mockExecFile.mock.calls.some((call) => call[1].includes("--list-secret-keys"))).toBe(
       false,
     );

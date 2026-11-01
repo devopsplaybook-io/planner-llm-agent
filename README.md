@@ -259,7 +259,7 @@ The agent process environment is inherited by every CLI, `git` and `gh` child pr
 
 ### GitHub organization tokens
 
-Every configured organization token is exported as `GH_TOKEN_<ORG>` **to every task**, regardless of which repositories the task touches, and is written as a plaintext credential-helper command into `~/.gitconfig` (file mode `0600`, but readable by any code the agent runs). Git scopes each token by URL prefix `https://github.com/<organization>`, but this is git configuration, not process isolation: all configured tokens are present in the file. The default token is used host-wide through `gh auth git-credential`. An already-set `GH_TOKEN` in the environment is not overwritten.
+Every configured organization token is exported as `GH_TOKEN_<ORG>` **to every task**, regardless of which repositories the task touches, and is referenced by name in a credential-helper command in `~/.gitconfig` (`password=${GH_TOKEN_<ORG>}`): the file and `git config --list` contain only the variable name, never the token. Git scopes each token by URL prefix `https://github.com/<organization>`, but this is git configuration, not process isolation: all configured tokens remain readable in the process environment by any code the agent runs. The default token is used host-wide through `gh auth git-credential`. An already-set `GH_TOKEN` in the environment is not overwritten.
 
 ### Untrusted task input
 
@@ -291,7 +291,7 @@ The warning is emitted once at startup (a hot reload of `PLANNER_URL` does not e
 
 ### Dependency security
 
-At this revision both `npm audit` and `npm audit --omit=dev` report **0 vulnerabilities**. Dev-toolchain advisories, when they appear, are tracked with the periodic dependency-update tasks. The production image is built from the compiled output and copies the build stage's `node_modules` into the runtime image, so dev-only packages are present on disk but are not loaded by the agent process.
+At this revision both `npm audit` and `npm audit --omit=dev` report **0 vulnerabilities**. Dev-toolchain advisories, when they appear, are tracked with the periodic dependency-update tasks. The production image is built from the compiled output and copies the build stage's `node_modules` after `npm prune --omit=dev`, so it ships production dependencies only.
 
 ### Current limitation and possible hardening
 

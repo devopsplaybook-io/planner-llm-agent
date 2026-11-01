@@ -1,7 +1,13 @@
 import * as fse from "fs-extra";
 import * as os from "os";
 import * as path from "path";
-import { Config, githubTokenEnvName } from "./Config";
+import {
+  Config,
+  githubTokenEnvName,
+  hasControlCharacters,
+  isValidGithubOrganization,
+} from "./Config";
+import type { GithubTokenEntry } from "./Config";
 import { ExecFileError, extractErrorDetail, runCli } from "./CliUtils";
 import { OTelLogger, OTelTracer } from "./OTelContext";
 
@@ -79,11 +85,34 @@ export class GitEnvironment {
         throw new Error("GITHUB_TOKEN is too short to be a valid GitHub token");
       }
       for (const entry of githubTokenEntries) {
+        if (!isValidGithubOrganization(entry.organization)) {
+          throw new Error(
+            "GITHUB_TOKENS organization name is invalid (letters, digits and hyphens only)",
+          );
+        }
         if (entry.token.length < 20) {
           throw new Error(
             `GITHUB_TOKENS token for organization '${entry.organization}' is too short to be a valid GitHub token`,
           );
         }
+      }
+      // The identity and the signing key id are written into ~/.gitconfig
+      // (and the email into ~/.ssh/allowed_signers): reject line breaks and
+      // other control characters before anything is written.
+      for (const name of ["GIT_USER_NAME", "GIT_USER_EMAIL"] as const) {
+        if (hasControlCharacters(this.config[name])) {
+          throw new Error(
+            `${name} must not contain control characters or newlines`,
+          );
+        }
+      }
+      if (
+        this.config.GIT_GPG_KEY_ID.length > 0 &&
+        hasControlCharacters(this.config.GIT_GPG_KEY_ID)
+      ) {
+        throw new Error(
+          "GIT_GPG_KEY_ID must not contain control characters or newlines",
+        );
       }
       if (sshKey.length > 0 && !sshKey.includes("PRIVATE KEY-----")) {
         throw new Error(
@@ -161,7 +190,13 @@ export class GitEnvironment {
         configured.push(`GPG commit signing key (${gpgKeyId})`);
       }
 
-      await this.writeGitConfig(githubToken, sshPublicKey, gpgKeyId, sshSigning);
+      await this.writeGitConfig(
+        githubToken,
+        githubTokenEntries,
+        sshPublicKey,
+        gpgKeyId,
+        sshSigning,
+      );
 
       logger.info(`Git environment prepared: ${configured.join(", ")}`);
     } catch (error) {
@@ -377,6 +412,7 @@ export class GitEnvironment {
    */
   private async writeGitConfig(
     githubToken: string,
+    githubTokenEntries: GithubTokenEntry[],
     sshPublicKey: string,
     gpgKeyId: string,
     sshSigning: boolean,
@@ -384,16 +420,21 @@ export class GitEnvironment {
     // GPG signing takes precedence over SSH signing when both are configured.
     const gpgSigning = gpgKeyId.length > 0;
     const sshSigningKeyFile = path.join(this.homeDir, ".ssh", `${SSH_KEY_FILE_NAME}.pub`);
-    const githubTokenEntries = this.config.githubTokenEntries();
 
     const lines: string[] = [];
     lines.push("[user]");
-    lines.push(`\tname = ${this.config.GIT_USER_NAME}`);
-    lines.push(`\temail = ${this.config.GIT_USER_EMAIL}`);
+    lines.push(
+      `\tname = ${gitConfigValue("GIT_USER_NAME", this.config.GIT_USER_NAME)}`,
+    );
+    lines.push(
+      `\temail = ${gitConfigValue("GIT_USER_EMAIL", this.config.GIT_USER_EMAIL)}`,
+    );
     if (gpgSigning) {
-      lines.push(`\tsigningkey = ${gpgKeyId}`);
+      lines.push(`\tsigningkey = ${gitConfigValue("GIT_GPG_KEY_ID", gpgKeyId)}`);
     } else if (sshSigning && sshPublicKey.length > 0) {
-      lines.push(`\tsigningkey = ${sshSigningKeyFile}`);
+      lines.push(
+        `\tsigningkey = ${gitConfigValue("SSH signing key path", sshSigningKeyFile)}`,
+      );
     }
     lines.push("[init]");
     lines.push("\tdefaultBranch = main");
@@ -408,8 +449,11 @@ export class GitEnvironment {
       lines.push("\tuseHttpPath = true");
       for (const entry of githubTokenEntries) {
         lines.push(`[credential "https://github.com/${entry.organization}"]`);
+        // Only the environment-variable reference is written: git expands it
+        // from the inherited environment when the helper runs, so the token
+        // never lands in the file nor in `git config --list` output.
         lines.push(
-          `\thelper = "!f() { echo username=x-access-token; echo password=${entry.token}; }; f"`,
+          `\thelper = "!f() { echo username=x-access-token; echo password=\${${githubTokenEnvName(entry.organization)}}; }; f"`,
         );
       }
     }
@@ -438,6 +482,18 @@ export class GitEnvironment {
       { mode: 0o600 },
     );
   }
+}
+
+/**
+ * Renders a gitconfig value as a double-quoted, escaped string so that quotes
+ * and backslashes cannot break out of it. Control characters are rejected as
+ * defense in depth (callers validate them first).
+ */
+function gitConfigValue(label: string, value: string): string {
+  if (hasControlCharacters(value)) {
+    throw new Error(`${label} contains control characters or newlines`);
+  }
+  return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
 }
 
 /**

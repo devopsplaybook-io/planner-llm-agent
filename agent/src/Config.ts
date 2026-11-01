@@ -682,6 +682,23 @@ export class Config {
       }
     }
 
+    // The git identity and the signing key id are written into ~/.gitconfig;
+    // control characters (newlines in particular) could inject lines there
+    // and into ~/.ssh/allowed_signers. The messages never echo the value.
+    for (const name of ["GIT_USER_NAME", "GIT_USER_EMAIL"] as const) {
+      if (hasControlCharacters(this[name])) {
+        errors.push(`${name} must not contain control characters or newlines`);
+      }
+    }
+    if (
+      this.GIT_GPG_KEY_ID.length > 0 &&
+      hasControlCharacters(this.GIT_GPG_KEY_ID)
+    ) {
+      errors.push(
+        "GIT_GPG_KEY_ID must not contain control characters or newlines",
+      );
+    }
+
     // The organization tokens are optional; when set, every entry must be a
     // well-formed 'organization=token' pair so that a misconfiguration fails
     // fast at startup instead of surfacing inside a task.
@@ -701,7 +718,7 @@ export class Config {
         }
         const organization = trimmed.slice(0, separator).trim();
         const token = trimmed.slice(separator + 1).trim();
-        if (!/^[A-Za-z0-9-]+$/.test(organization)) {
+        if (!isValidGithubOrganization(organization)) {
           errors.push(
             `GITHUB_TOKENS organization '${organization}' is not a valid GitHub organization name (alphanumeric characters and hyphens only)`,
           );
@@ -870,4 +887,24 @@ export function parseGithubTokens(value: string): GithubTokenEntry[] {
  */
 export function githubTokenEnvName(organization: string): string {
   return `GH_TOKEN_${organization.toUpperCase().replace(/[^A-Z0-9]/g, "_")}`;
+}
+
+/**
+ * GitHub organization names accepted in GITHUB_TOKENS. GitHub organization
+ * names are alphanumeric with hyphens; the strict charset also keeps the
+ * GH_TOKEN_<ORG> mapping unambiguous (no underscores or dots).
+ */
+export const GITHUB_ORGANIZATION_PATTERN = /^[A-Za-z0-9-]+$/;
+
+export function isValidGithubOrganization(value: string): boolean {
+  return GITHUB_ORGANIZATION_PATTERN.test(value);
+}
+
+/**
+ * Detects control characters (including CR/LF), which would break out of the
+ * single-line values written into ~/.gitconfig and ~/.ssh/allowed_signers.
+ */
+export function hasControlCharacters(value: string): boolean {
+  // eslint-disable-next-line no-control-regex -- detecting them is the point
+  return /[\u0000-\u001F\u007F]/.test(value);
 }
