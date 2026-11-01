@@ -7,6 +7,7 @@ import {
   buildTaskLabel,
   commentsPickupPending,
   hasAgentComment,
+  hasMatchingSummaryComment,
   isCanonicalTaskId,
   lastCommentOf,
   mergeLabels,
@@ -2292,6 +2293,180 @@ describe("Agent", () => {
       (call) => call[1] === "All done",
     );
     expect(summaryComments).toHaveLength(1);
+  });
+
+  it("should resume a pending finalization after a restart without re-running the CLI", async () => {
+    config.TASK_POLLING_INTERVAL = 0.05;
+    const finalizationDir = path.join(dataDir, "finalization");
+    const task = {
+      id: TASK_1,
+      title: "Implement feature",
+      status: "To Do",
+      description: "Add a feature",
+      comments: [] as unknown[],
+      attachments: [] as unknown[],
+    };
+    mockPlannerTasks([task]);
+    mockQoder.performTask.mockResolvedValue("Should not run");
+
+    // The previous process crashed between the CLI completion and the
+    // Planner updates: the record was persisted but never delivered.
+    const crashed = new FinalizationStore({ dir: finalizationDir });
+    await crashed.record(TASK_1, {
+      title: "Implement feature",
+      contentVersion: "2026-10-15T01:00:00.000Z",
+      summary: "All done",
+      statusEnd: "Done",
+      runStartedAt: Date.now() - 120_000,
+    });
+
+    const store = new FinalizationStore({ dir: finalizationDir });
+    expect(await store.load()).toEqual({ loaded: 1, skipped: [] });
+
+    const agent = createAgent(WILDCARD_ACTIONS, store);
+    agent.start();
+    await waitFor(
+      () =>
+        !store.has(TASK_1) &&
+        mockPlanner.updateTaskStatus.mock.calls.some(
+          (call) => call[0] === TASK_1 && call[1] === "Done",
+        ),
+      5000,
+    );
+
+    // The CLI was never re-executed: only the pending finalization ran.
+    expect(mockQoder.performTask).not.toHaveBeenCalled();
+    expect(mockPlanner.addTaskComment).toHaveBeenCalledWith(TASK_1, "All done");
+    expect(
+      await fse.pathExists(path.join(finalizationDir, `${TASK_1}.json`)),
+    ).toBe(false);
+    agent.stop();
+  });
+
+  it("should not post the summary twice when the comment POST was applied but its response was lost", async () => {
+    config.TASK_POLLING_INTERVAL = 0.05;
+    const task = {
+      id: TASK_1,
+      title: "Implement feature",
+      status: "To Do",
+      description: "Add a feature",
+      comments: [] as unknown[],
+      attachments: [] as unknown[],
+    };
+    mockPlannerTasks([task]);
+    mockQoder.performTask.mockResolvedValue("All done");
+    let summaryAttempts = 0;
+    mockPlanner.addTaskComment.mockImplementation(
+      async (_id: string, text: string) => {
+        if (text !== "All done") {
+          return;
+        }
+        summaryAttempts++;
+        // The server applied the comment and the response was lost.
+        task.comments = [
+          ...task.comments,
+          {
+            id: "comment-summary",
+            userId: "user-1",
+            userName: "Test User",
+            text,
+            dateCreated: new Date().toISOString(),
+          },
+        ];
+        throw new Error("Response lost");
+      },
+    );
+
+    const agent = createAgent(
+      WILDCARD_ACTIONS,
+      new FinalizationStore({ retryBaseMs: 10 }),
+    );
+    agent.start();
+    await waitFor(
+      () =>
+        mockPlanner.updateTaskStatus.mock.calls.some(
+          (call) => call[0] === TASK_1 && call[1] === "Done",
+        ),
+      5000,
+    );
+
+    // The retry found the identical agent comment and did not post again.
+    expect(summaryAttempts).toBe(1);
+    expect(mockQoder.performTask).toHaveBeenCalledTimes(1);
+    expect(console.log).toHaveBeenCalledWith(
+      expect.stringContaining("the summary comment is already present"),
+    );
+    agent.stop();
+  });
+
+  it("should drop the finalization record when the task is no longer visible on retry", async () => {
+    config.TASK_POLLING_INTERVAL = 0.05;
+    const task = {
+      id: TASK_1,
+      title: "Implement feature",
+      status: "To Do",
+      description: "Add a feature",
+      comments: [] as unknown[],
+      attachments: [] as unknown[],
+    };
+    mockPlannerTasks([task]);
+    mockQoder.performTask.mockResolvedValue("All done");
+    // The summary POST fails on the first attempt (nothing applied).
+    let summaryAttempts = 0;
+    mockPlanner.addTaskComment.mockImplementation(
+      async (_id: string, text: string) => {
+        if (text === "All done") {
+          summaryAttempts++;
+          if (summaryAttempts === 1) {
+            throw new Error("Planner is down");
+          }
+        }
+      },
+    );
+    // The first getTask (post-run adjustment check) succeeds; the retry's
+    // duplicate check finds the task deleted/unassigned.
+    let getTaskCalls = 0;
+    mockPlanner.getTask.mockImplementation(async () => {
+      getTaskCalls++;
+      if (getTaskCalls === 1) {
+        return {
+          id: TASK_1,
+          projectId: "",
+          title: "Implement feature",
+          status: "To Do",
+          priority: "medium",
+          description: "Add a feature",
+          dateUpdated: "2026-10-15T01:00:00.000Z",
+          comments: [],
+          attachments: [],
+          dependencies: [],
+        };
+      }
+      // The task left the assigned list meanwhile.
+      task.status = "Done";
+      throw new PlannerRequestError(
+        `Planner request to '/api/tasks/${TASK_1}' failed with status 404`,
+        404,
+      );
+    });
+
+    const store = new FinalizationStore({ retryBaseMs: 10 });
+    const agent = createAgent(WILDCARD_ACTIONS, store);
+    agent.start();
+    await waitFor(
+      () => !store.has(TASK_1) && getTaskCalls >= 2,
+      5000,
+    );
+
+    // The record is dropped instead of retried for 24h: no status update,
+    // no crash.
+    expect(summaryAttempts).toBe(1);
+    expect(mockQoder.performTask).toHaveBeenCalledTimes(1);
+    expect(mockPlanner.updateTaskStatus).not.toHaveBeenCalled();
+    expect(console.warn).toHaveBeenCalledWith(
+      expect.stringContaining("no longer visible on Planner"),
+    );
+    agent.stop();
   });
 
   it("should process only the tasks matching the action project and start status", async () => {
@@ -6826,6 +7001,55 @@ describe("Agent", () => {
           ),
         ).toBe(true);
         expect(hasAgentComment(buildTask([]), null)).toBe(false);
+      });
+
+      it("hasMatchingSummaryComment should match the same text from the agent after the run start", () => {
+        const comments = [
+          {
+            id: "c1",
+            userId: AGENT,
+            text: "All done",
+            dateCreated: "2026-10-19T12:00:00.000Z",
+          },
+        ];
+        const since = Date.parse("2026-10-19T11:59:00.000Z");
+        expect(
+          hasMatchingSummaryComment(comments, "All done", AGENT, since),
+        ).toBe(true);
+        // An older identical comment belongs to a previous run.
+        expect(
+          hasMatchingSummaryComment(
+            comments,
+            "All done",
+            AGENT,
+            Date.parse("2026-10-19T12:01:00.000Z"),
+          ),
+        ).toBe(false);
+        // A different author or a different text never matches.
+        expect(
+          hasMatchingSummaryComment(comments, "All done", USER, since),
+        ).toBe(false);
+        expect(
+          hasMatchingSummaryComment(comments, "Other summary", AGENT, since),
+        ).toBe(false);
+      });
+
+      it("hasMatchingSummaryComment should count an unparseable date on a text and author match", () => {
+        expect(
+          hasMatchingSummaryComment(
+            [
+              {
+                id: "c1",
+                userId: AGENT,
+                text: "All done",
+                dateCreated: "not-a-date",
+              },
+            ],
+            "All done",
+            AGENT,
+            Date.now(),
+          ),
+        ).toBe(true);
       });
     });
 

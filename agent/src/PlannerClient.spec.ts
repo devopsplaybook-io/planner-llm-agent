@@ -1,4 +1,8 @@
-import { AttachmentTooLargeError, PlannerClient } from "./PlannerClient";
+import {
+  AttachmentTooLargeError,
+  PlannerClient,
+  PlannerRequestError,
+} from "./PlannerClient";
 import { Config } from "./Config";
 
 jest.mock("./OTelContext", () => ({
@@ -886,5 +890,145 @@ describe("PlannerClient", () => {
         }),
       }),
     );
+  });
+
+  // Retry policy tests: no delay is injected, the policy itself is what is
+  // being tested.
+  const retryOptions = { attempts: 3, baseDelayMs: 0, maxDelayMs: 0 };
+
+  it("should retry an idempotent GET after a 5xx and then succeed", async () => {
+    fetchMock
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ error: "boom" }), { status: 503 }),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ id: "task-1", title: "T" }), {
+          status: 200,
+        }),
+      );
+
+    const client = new PlannerClient(config, retryOptions);
+    const task = await client.getTask("task-1");
+
+    expect(task.id).toBe("task-1");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("should retry an idempotent GET after a 429 and then succeed", async () => {
+    fetchMock
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ error: "slow down" }), { status: 429 }),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ id: "task-1", title: "T" }), {
+          status: 200,
+        }),
+      );
+
+    const client = new PlannerClient(config, retryOptions);
+    const task = await client.getTask("task-1");
+
+    expect(task.id).toBe("task-1");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("should retry an idempotent GET after a network error and then succeed", async () => {
+    fetchMock
+      .mockRejectedValueOnce(new TypeError("fetch failed"))
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ id: "task-1", title: "T" }), {
+          status: 200,
+        }),
+      );
+
+    const client = new PlannerClient(config, retryOptions);
+    const task = await client.getTask("task-1");
+
+    expect(task.id).toBe("task-1");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("should not retry a 404 GET", async () => {
+    fetchMock.mockResolvedValue(
+      new Response(JSON.stringify({ error: "Not found" }), { status: 404 }),
+    );
+
+    const client = new PlannerClient(config, retryOptions);
+    await expect(client.getTask("task-1")).rejects.toMatchObject({
+      status: 404,
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("should not retry a 400 GET", async () => {
+    fetchMock.mockResolvedValue(
+      new Response(JSON.stringify({ error: "Bad request" }), { status: 400 }),
+    );
+
+    const client = new PlannerClient(config, retryOptions);
+    await expect(client.getTask("task-1")).rejects.toMatchObject({
+      status: 400,
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("should not retry a write even on a 5xx", async () => {
+    fetchMock.mockResolvedValue(
+      new Response(JSON.stringify({ error: "boom" }), { status: 500 }),
+    );
+
+    const client = new PlannerClient(config, retryOptions);
+    await expect(client.addTaskComment("task-1", "summary")).rejects.toMatchObject(
+      { status: 500 },
+    );
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("should throw after the configured attempts are exhausted", async () => {
+    fetchMock.mockImplementation(
+      async () =>
+        new Response(JSON.stringify({ error: "Service unavailable" }), {
+          status: 503,
+        }),
+    );
+
+    const client = new PlannerClient(config, retryOptions);
+    await expect(client.getTask("task-1")).rejects.toThrow(
+      "failed with status 503: ",
+    );
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it("should include the truncated response body in the error", async () => {
+    const longBody = `failure ${"x".repeat(1000)}`;
+    // A fresh response per attempt (a retried body is cancelled).
+    fetchMock.mockImplementation(
+      async () => new Response(longBody, { status: 500 }),
+    );
+
+    const client = new PlannerClient(config, retryOptions);
+    const error = await client.getTask("task-1").catch((caught) => caught);
+
+    expect(error).toBeInstanceOf(PlannerRequestError);
+    expect(error.status).toBe(500);
+    expect(error.body).toHaveLength(500);
+    expect(error.message).toContain(longBody.slice(0, 500));
+    expect(error.message).not.toContain("x".repeat(501));
+  });
+
+  it("should retry the initial fetch of an attachment download", async () => {
+    fetchMock
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ error: "boom" }), { status: 503 }),
+      )
+      .mockResolvedValueOnce(
+        new Response(Buffer.from("file-content"), { status: 200 }),
+      );
+
+    const client = new PlannerClient(config, retryOptions);
+    const data = await client.downloadTaskAttachment("task-1", "attachment-1");
+
+    expect(data.toString()).toBe("file-content");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 });

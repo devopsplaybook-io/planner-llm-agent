@@ -6,6 +6,7 @@ import { AgentActionsManager } from "./AgentActionsManager";
 import { AgentConfigRepository } from "./AgentConfigRepository";
 import { AgentNote } from "./AgentNote";
 import { Config, parseBooleanFlag } from "./Config";
+import { FinalizationStore } from "./FinalizationStore";
 import { GitEnvironment } from "./GitEnvironment";
 import { terminateLiveProcessGroups } from "./CliUtils";
 import { OTelInit, OTelLogger, OTelTracer } from "./OTelContext";
@@ -209,7 +210,37 @@ Promise.resolve().then(async () => {
   }
 
   // Agent
-  const agent = new Agent(config, agentActionsManager.config, cliAgents);
+  // Pending finalizations are persisted under DATA_DIR so a crash or rolling
+  // restart between the CLI completion and the Planner updates resumes the
+  // delivery instead of re-running the CLI. A load failure is logged and the
+  // agent starts with an empty store: state I/O must never crash-loop it.
+  const finalizationStore = new FinalizationStore({
+    dir: path.join(config.DATA_DIR, "finalization"),
+  });
+  try {
+    const { loaded, skipped } = await finalizationStore.load();
+    if (loaded > 0) {
+      logger.info(
+        `Loaded ${loaded} pending finalization record(s) from '${path.join(config.DATA_DIR, "finalization")}'`,
+      );
+    }
+    if (skipped.length > 0) {
+      logger.warn(
+        `Removed ${skipped.length} invalid pending finalization file(s): ${skipped.join(", ")}`,
+      );
+    }
+  } catch (error) {
+    logger.error(
+      "Failed to load the pending finalization records (continuing with an empty store)",
+      error as Error,
+    );
+  }
+  const agent = new Agent(
+    config,
+    agentActionsManager.config,
+    cliAgents,
+    finalizationStore,
+  );
   agent.start();
 
   // Agent note: a single Planner note named after the agent, regularly
