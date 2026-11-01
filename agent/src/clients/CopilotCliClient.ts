@@ -43,7 +43,9 @@ export class CopilotCliClient extends BaseCliAgent {
     return args;
   }
 
-  protected parseReply(result: { stdout: string; stderr: string }): string | null {
+  protected async parseReply(
+    result: { stdout: string; stderr: string },
+  ): Promise<string | null> {
     const reply = result.stdout.trim();
     return reply.length > 0 ? reply : null;
   }

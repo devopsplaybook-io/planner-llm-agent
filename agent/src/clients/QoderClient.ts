@@ -66,7 +66,9 @@ export class QoderClient extends BaseCliAgent {
     return args;
   }
 
-  protected parseReply(result: { stdout: string; stderr: string }): string | null {
+  protected async parseReply(
+    result: { stdout: string; stderr: string },
+  ): Promise<string | null> {
     return extractJsonResponse(result.stdout);
   }
 

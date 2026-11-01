@@ -3,6 +3,7 @@ import * as os from "os";
 import * as path from "path";
 import {
   getCoreSkillsPath,
+  invalidateSkillsCache,
   listAvailableSkills,
   listCoreSkills,
   listSkillsInDir,
@@ -10,6 +11,21 @@ import {
   summarizeSkillDescription,
 } from "./CoreSkills";
 import { Config } from "./Config";
+
+// Real fs-extra with counted directory/file reads: the listing-cache tests
+// assert that a cached listing performs no additional disk scan.
+jest.mock("fs-extra", () => {
+  const actual = jest.requireActual("fs-extra");
+  return {
+    ...actual,
+    readdir: jest.fn((...args: unknown[]) =>
+      (actual.readdir as (...inputs: unknown[]) => unknown)(...args),
+    ),
+    readFile: jest.fn((...args: unknown[]) =>
+      (actual.readFile as (...inputs: unknown[]) => unknown)(...args),
+    ),
+  };
+});
 
 const writeSkill = async (
   dir: string,
@@ -29,6 +45,9 @@ describe("CoreSkills", () => {
   let config: Config;
 
   beforeEach(async () => {
+    invalidateSkillsCache();
+    (fse.readdir as unknown as jest.Mock).mockClear();
+    (fse.readFile as unknown as jest.Mock).mockClear();
     dataDir = await fse.mkdtemp(path.join(os.tmpdir(), "core-skills-spec-"));
     config = new Config();
     config.DATA_DIR = dataDir;
@@ -216,6 +235,128 @@ describe("CoreSkills", () => {
       await expect(listAvailableSkills(config)).resolves.toEqual([
         { name: "shared", description: "Synced description." },
       ]);
+    });
+  });
+
+  describe("skills listing cache", () => {
+    const readdirCalls = (): number =>
+      (fse.readdir as unknown as jest.Mock).mock.calls.length;
+    const readFileCalls = (): number =>
+      (fse.readFile as unknown as jest.Mock).mock.calls.length;
+
+    const writeSyncedSkill = async (
+      folder: string,
+      name: string,
+      description: string,
+    ): Promise<void> => {
+      await fse.outputFile(
+        path.join(dataDir, "agent-config", "skills", folder, "SKILL.md"),
+        skillFile(name, description),
+      );
+    };
+
+    it("builds the listing once and reuses it", async () => {
+      config.AGENT_CONFIG_REPOSITORY =
+        "https://github.com/acme/agent-config.git";
+      await writeSkill(
+        config.CORE_SKILLS_PATH,
+        "core",
+        skillFile("core", "Core only."),
+      );
+      await writeSyncedSkill("synced", "synced", "Synced only.");
+
+      const first = await listAvailableSkills(config);
+      expect(await listAvailableSkills(config)).toEqual(first);
+      expect(first).toEqual([
+        { name: "core", description: "Core only." },
+        { name: "synced", description: "Synced only." },
+      ]);
+      // One directory listing and one SKILL.md read per source, once.
+      expect(readdirCalls()).toBe(2);
+      expect(readFileCalls()).toBe(2);
+    });
+
+    it("keeps serving the cached listing until it is invalidated", async () => {
+      await writeSkill(
+        config.CORE_SKILLS_PATH,
+        "one",
+        skillFile("one", "One."),
+      );
+      const first = await listCoreSkills(config);
+
+      await writeSkill(
+        config.CORE_SKILLS_PATH,
+        "two",
+        skillFile("two", "Two."),
+      );
+      await expect(listCoreSkills(config)).resolves.toEqual(first);
+
+      invalidateSkillsCache();
+      await expect(listCoreSkills(config)).resolves.toEqual([
+        { name: "one", description: "One." },
+        { name: "two", description: "Two." },
+      ]);
+    });
+
+    it("rebuilds the listing when the configured core path changes", async () => {
+      await writeSkill(
+        config.CORE_SKILLS_PATH,
+        "one",
+        skillFile("one", "One."),
+      );
+      await listCoreSkills(config);
+
+      const otherDir = path.join(dataDir, "other-core");
+      await writeSkill(otherDir, "two", skillFile("two", "Two."));
+      config.CORE_SKILLS_PATH = otherDir;
+
+      await expect(listCoreSkills(config)).resolves.toEqual([
+        { name: "two", description: "Two." },
+      ]);
+    });
+
+    it("caches an empty listing for a missing directory", async () => {
+      await expect(listCoreSkills(config)).resolves.toEqual([]);
+      expect(readdirCalls()).toBe(1);
+
+      await expect(listCoreSkills(config)).resolves.toEqual([]);
+      expect(readdirCalls()).toBe(1);
+    });
+
+    it("single-flights concurrent callers", async () => {
+      config.AGENT_CONFIG_REPOSITORY =
+        "https://github.com/acme/agent-config.git";
+      await writeSkill(
+        config.CORE_SKILLS_PATH,
+        "core",
+        skillFile("core", "Core only."),
+      );
+      await writeSyncedSkill("synced", "synced", "Synced only.");
+
+      const [first, second] = await Promise.all([
+        listAvailableSkills(config),
+        listAvailableSkills(config),
+      ]);
+
+      expect(first).toEqual(second);
+      expect(readdirCalls()).toBe(2);
+      expect(readFileCalls()).toBe(2);
+    });
+
+    it("matches a freshly rebuilt listing", async () => {
+      config.AGENT_CONFIG_REPOSITORY =
+        "https://github.com/acme/agent-config.git";
+      await writeSkill(
+        config.CORE_SKILLS_PATH,
+        "shared",
+        skillFile("shared", "Core description."),
+      );
+      await writeSyncedSkill("shared", "shared", "Synced description.");
+      await writeSyncedSkill("extra", "extra", "Extra only.");
+
+      const cached = await listAvailableSkills(config);
+      invalidateSkillsCache();
+      await expect(listAvailableSkills(config)).resolves.toEqual(cached);
     });
   });
 });

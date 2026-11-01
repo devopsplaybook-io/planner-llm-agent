@@ -39,7 +39,9 @@ export class ClaudeCodeClient extends BaseCliAgent {
     return args;
   }
 
-  protected parseReply(result: { stdout: string; stderr: string }): string | null {
+  protected async parseReply(
+    result: { stdout: string; stderr: string },
+  ): Promise<string | null> {
     return extractEnvelopeString(result.stdout, ["result", "response"]);
   }
 

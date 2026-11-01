@@ -3,7 +3,7 @@ import * as path from "path";
 import { Config } from "./Config";
 import { ExecFileError, extractErrorDetail, runCli } from "./CliUtils";
 import { OTelLogger, OTelTracer } from "./OTelContext";
-import { AgentSkill, listSkillsInDir } from "./CoreSkills";
+import { AgentSkill, invalidateSkillsCache, listSkillsInDir } from "./CoreSkills";
 
 const logger = OTelLogger().createModuleLogger("agent-config-repository");
 
@@ -174,6 +174,10 @@ export class AgentConfigRepository {
     } finally {
       this.syncing = false;
       span.end();
+      // The synced content may have changed (including a partially applied
+      // fetch/checkout after a failure): the cached skills listing must be
+      // rebuilt on the next prompt.
+      invalidateSkillsCache();
     }
   }
 

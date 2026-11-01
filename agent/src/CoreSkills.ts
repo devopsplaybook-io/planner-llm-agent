@@ -1,6 +1,6 @@
 import * as fse from "fs-extra";
 import * as path from "path";
-import { listAgentSkills } from "./AgentConfigRepository";
+import { getAgentSkillsPath, listAgentSkills } from "./AgentConfigRepository";
 import { Config } from "./Config";
 
 // A skill, with its name and a short description taken from the SKILL.md
@@ -11,6 +11,58 @@ export interface AgentSkill {
 }
 
 const SKILL_DESCRIPTION_MAX_LENGTH = 120;
+
+// The skills listing is immutable for the process lifetime: the image skills
+// never change and the synced copy only changes through
+// AgentConfigRepository.sync(), which invalidates these caches. A config hot
+// reload that changes a path makes the key miss naturally, so a synced skill
+// change is visible on the first prompt after the next sync (at most
+// AGENT_CONFIG_SYNC_INTERVAL, 300 s by default).
+interface SkillsCacheSlot {
+  key: string;
+  skills: Promise<AgentSkill[]>;
+}
+
+let coreSkillsCache: SkillsCacheSlot | null = null;
+let availableSkillsCache: SkillsCacheSlot | null = null;
+
+/**
+ * Clears the skills listing caches: the listing is rebuilt from disk on the
+ * next call.
+ */
+export function invalidateSkillsCache(): void {
+  coreSkillsCache = null;
+  availableSkillsCache = null;
+}
+
+function coreSkillsKey(config: Config): string {
+  return getCoreSkillsPath(config);
+}
+
+function availableSkillsKey(config: Config): string {
+  return `${getCoreSkillsPath(config)}\n${config.AGENT_CONFIG_REPOSITORY.trim()}\n${getAgentSkillsPath(config)}`;
+}
+
+/**
+ * Caches a pending listing, clearing the slot when it settles unsuccessfully
+ * so a rejected promise is never kept and the next call retries.
+ */
+function cacheSkills(
+  slot: SkillsCacheSlot,
+  read: () => SkillsCacheSlot | null,
+  write: (slot: SkillsCacheSlot | null) => void,
+): Promise<AgentSkill[]> {
+  write(slot);
+  slot.skills.then(
+    () => undefined,
+    () => {
+      if (read() === slot) {
+        write(null);
+      }
+    },
+  );
+  return slot.skills;
+}
 
 /**
  * Returns the directory holding the core skills shipped with the agent
@@ -31,7 +83,18 @@ export function getCoreSkillsPath(config: Config): string {
  * skills are skipped; a missing directory yields an empty list.
  */
 export async function listCoreSkills(config: Config): Promise<AgentSkill[]> {
-  return listSkillsInDir(getCoreSkillsPath(config));
+  const key = coreSkillsKey(config);
+  const cached = coreSkillsCache;
+  if (cached !== null && cached.key === key) {
+    return cached.skills;
+  }
+  return cacheSkills(
+    { key, skills: listSkillsInDir(key) },
+    () => coreSkillsCache,
+    (slot) => {
+      coreSkillsCache = slot;
+    },
+  );
 }
 
 /**
@@ -44,6 +107,21 @@ export async function listCoreSkills(config: Config): Promise<AgentSkill[]> {
 export async function listAvailableSkills(
   config: Config,
 ): Promise<AgentSkill[]> {
+  const key = availableSkillsKey(config);
+  const cached = availableSkillsCache;
+  if (cached !== null && cached.key === key) {
+    return cached.skills;
+  }
+  return cacheSkills(
+    { key, skills: buildAvailableSkills(config) },
+    () => availableSkillsCache,
+    (slot) => {
+      availableSkillsCache = slot;
+    },
+  );
+}
+
+async function buildAvailableSkills(config: Config): Promise<AgentSkill[]> {
   const [core, synced] = await Promise.all([
     listCoreSkills(config),
     listAgentSkills(config),

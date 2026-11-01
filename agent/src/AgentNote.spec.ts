@@ -4,6 +4,7 @@ import * as path from "path";
 import { AgentActionsConfig } from "./AgentActions";
 import { AgentNote, AgentSchedulingSnapshot } from "./AgentNote";
 import { Config } from "./Config";
+import { invalidateSkillsCache } from "./CoreSkills";
 import { PlannerClient, PlannerProject } from "./PlannerClient";
 import type { CliAgentClient } from "./clients/CliAgent";
 
@@ -43,8 +44,10 @@ describe("AgentNote", () => {
     config.AGENT_NOTE_PROJECT = "Agent Workspace";
     config.AGENT_NOTE_INTERVAL = 3600;
     // Hermetic core skills: an empty fixture directory (the default would
-    // resolve to the repository's agent/skills directory).
+    // resolve to the repository's agent/skills directory). The listing cache
+    // is module-global, so start every test cold.
     config.CORE_SKILLS_PATH = path.join(tmpRoot, "core-skills");
+    invalidateSkillsCache();
 
     planner = {
       listProjects: jest.fn(),
