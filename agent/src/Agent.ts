@@ -93,6 +93,22 @@ const MAX_ADJUSTMENT_DIRECTIVE =
 const ADJUSTMENT_FAILURE_NOTE =
   "Note: an adjustment round failed, so comments posted during the run were not taken into account.";
 
+// Trailing watermark carried by the comments-mode summary (and failure
+// comment): the id of the newest comment the run actually consumed, or
+// "none" when the brief had no comment. The pickup rule compares it with the
+// human comments, so a comment posted during the run (after the last check,
+// after the adjustment budget, or during the finalization retry backoff) is
+// re-triggered on a later poll instead of being masked by the summary. The
+// marker is an invisible HTML comment and the state lives in the Planner
+// comment itself, which makes the rule stateless and restart-safe.
+const PROCESSED_COMMENTS_MARKER_NONE = "none";
+const PROCESSED_COMMENTS_MARKER_PREFIX = "<!-- agent:processed-comments=";
+const PROCESSED_COMMENTS_MARKER_SUFFIX = " -->";
+// Anchored at the very end of the text: any content after the marker means
+// it is not a watermark (a user quoting a summary never disables pickup).
+const PROCESSED_COMMENTS_MARKER_PATTERN =
+  /<!-- agent:processed-comments=([^\s>]+) -->$/;
+
 /**
  * Sanitizes a Planner attachment file name for a safe local write: only the
  * base name is kept, and names carrying path separators or dot-only names
@@ -514,11 +530,13 @@ export class Agent {
           claimedTaskIds.add(task.id);
           // Comment-triggered actions only pick a task up when the
           // conversation waits for the agent: zero comments (the
-          // description is the initial prompt) or a last comment the agent
-          // did not author. A conversation waiting for the user is not
-          // queued work, so the skip is silent (no deferral, no queue
-          // gauge entry). The predicate is evaluated over the data every
-          // poll already fetched, which makes the rule stateless and
+          // description is the initial prompt), a last comment the agent
+          // did not author, or an agent summary whose processed-comments
+          // watermark is behind a newer human comment (a comment posted
+          // while the task was running). A conversation waiting for the
+          // user is not queued work, so the skip is silent (no deferral,
+          // no queue gauge entry). The predicate is evaluated over the data
+          // every poll already fetched, which makes the rule stateless and
           // restart-safe.
           if (
             action.trigger === "comments" &&
@@ -1027,6 +1045,12 @@ export class Agent {
     // The exact running label added at start, removed in the finally even if
     // TASK_RUNNING_LABEL or TASK_LABELS is hot-reloaded during the run.
     let runningLabel: string | null = null;
+    // The processed-comments watermark of the run: the newest comment of the
+    // pick-time brief. The adjustment rounds advance it as they consume
+    // comments; a failure leaves it behind the comments posted since, so the
+    // next poll retries them automatically. Declared here so the failure
+    // comment below can carry it.
+    let processedCommentId = newestCommentOf(task.comments)?.id ?? null;
     try {
       // The model resolves to the action model, then the actions default
       // model; the task description still overrides both (see
@@ -1165,15 +1189,27 @@ export class Agent {
       // agent a bounded number of adjustment passes to take them into
       // account. The adjustment rounds run on the agent that produced the
       // summary (the fallback one when the primary run failed).
-      const { summary: finalSummary, contentVersion } =
-        await this.adjustForNewComments(
-          task,
-          project,
-          effectiveAgent,
-          notesFile,
-          effectiveOptions,
-          summary,
-        );
+      const adjusted = await this.adjustForNewComments(
+        task,
+        project,
+        effectiveAgent,
+        notesFile,
+        effectiveOptions,
+        summary,
+      );
+      processedCommentId = adjusted.processedCommentId;
+      // Comments mode: the summary carries the processed-comments watermark,
+      // so the pickup rule can tell the comments this run covered from the
+      // ones posted after the last check (they re-trigger a run on a later
+      // poll). Pipeline summaries stay byte-identical.
+      const finalSummary =
+        action.trigger === "comments"
+          ? appendProcessedCommentsMarker(
+              adjusted.summary,
+              processedCommentId,
+            )
+          : adjusted.summary;
+      const contentVersion = adjusted.contentVersion;
       // The CLI work is done for good: from here on only the Planner
       // finalization remains, and a failure of it must never re-run the
       // CLI — the record keeps the task out of the candidates and drives
@@ -1227,11 +1263,21 @@ export class Agent {
       if (action.trigger === "comments") {
         // Comments mode: no status move (the resolved error status is
         // ignored) and no folder cleanup — the failure comment reports the
-        // problem and the user comments again to trigger a new run.
+        // problem and the user comments again to trigger a new run. It
+        // carries the current watermark, so a comment posted during the
+        // failed run stays newer than it and is retried once automatically.
         try {
           await this.planner.addTaskComment(
             task.id,
-            buildFailureComment(message, null, salvagedSummary, salvagedOutput),
+            appendProcessedCommentsMarker(
+              buildFailureComment(
+                message,
+                null,
+                salvagedSummary,
+                salvagedOutput,
+              ),
+              processedCommentId,
+            ),
           );
           logger.info(
             `Task '${task.title}' (${task.id}) failed: the failure comment was posted and the task keeps its status (comments mode)`,
@@ -1289,13 +1335,18 @@ export class Agent {
   // brief is refreshed with them and the CLI agent runs again with a
   // directive listing the new messages, at most
   // TASK_ADJUSTMENT_MAX_ROUNDS times. Returns the summary of the last
-  // successful run and the freshest observed task content version. The
-  // adjustment rounds are best-effort: a failed Planner read or a failed
-  // adjustment run never discards the completed work (the task finalizes
-  // with the summary of the last successful run, plus a note when an
-  // adjustment round failed). Only a user abort is rethrown, so it still
-  // wins over the finalization; only a failure of the initial run takes the
-  // processTask error path.
+  // successful run, the freshest observed task content version and the id of
+  // the newest comment the run actually consumed (the processed-comments
+  // watermark; null when the brief had no comment). The watermark only
+  // advances after a successful adjustment round: a budget-exhausted or
+  // failed round, an early return or a failed Planner read leave it behind
+  // the pending comments, so the next poll re-runs the task. The adjustment
+  // rounds are best-effort: a failed Planner read or a failed adjustment run
+  // never discards the completed work (the task finalizes with the summary
+  // of the last successful run, plus a note when an adjustment round
+  // failed). Only a user abort is rethrown, so it still wins over the
+  // finalization; only a failure of the initial run takes the processTask
+  // error path.
   private async adjustForNewComments(
     task: PlannerTask,
     project: PlannerProject | null,
@@ -1303,9 +1354,14 @@ export class Agent {
     notesFile: string,
     taskOptions: TaskOptions,
     initialSummary: string,
-  ): Promise<{ summary: string; contentVersion: string }> {
+  ): Promise<{
+    summary: string;
+    contentVersion: string;
+    processedCommentId: string | null;
+  }> {
     let summary = initialSummary;
     let contentVersion = task.dateUpdated;
+    let processedCommentId = newestCommentOf(task.comments)?.id ?? null;
     const knownCommentIds = new Set(task.comments.map((comment) => comment.id));
     const maxRounds = this.maxAdjustmentRounds();
     let roundsUsed = 0;
@@ -1317,31 +1373,31 @@ export class Agent {
         logger.warn(
           `Failed to check task '${task.title}' (${task.id}) for new comments (finalizing with the current summary): ${(error as Error).message}`,
         );
-        return { summary, contentVersion };
+        return { summary, contentVersion, processedCommentId };
       }
       contentVersion = freshTask.dateUpdated;
       const unknownComments = freshTask.comments.filter(
         (comment) => !knownCommentIds.has(comment.id),
       );
       if (unknownComments.length === 0) {
-        return { summary, contentVersion };
+        return { summary, contentVersion, processedCommentId };
       }
       const agentUserId = await this.resolveAgentUserId();
       if (agentUserId === null) {
-        return { summary, contentVersion };
+        return { summary, contentVersion, processedCommentId };
       }
       const newComments = unknownComments.filter(
         (comment) => comment.userId !== agentUserId,
       );
       if (newComments.length === 0) {
         // Only the agent's own comments arrived: nothing to adjust.
-        return { summary, contentVersion };
+        return { summary, contentVersion, processedCommentId };
       }
       if (roundsUsed >= maxRounds) {
         logger.warn(
           `Task '${task.title}' (${task.id}) received ${newComments.length} new comment(s) after the adjustment budget of ${maxRounds} round(s) was used up: finalizing with the current summary`,
         );
-        return { summary, contentVersion };
+        return { summary, contentVersion, processedCommentId };
       }
       roundsUsed++;
       for (const comment of freshTask.comments) {
@@ -1370,8 +1426,12 @@ export class Agent {
         return {
           summary: `${summary}\n\n${ADJUSTMENT_FAILURE_NOTE}`,
           contentVersion,
+          processedCommentId,
         };
       }
+      // The refreshed brief of this successful round covered every comment
+      // fetched above: the watermark can move past them.
+      processedCommentId = newestCommentOf(freshTask.comments)?.id ?? null;
     }
   }
 
@@ -2300,14 +2360,16 @@ function commentTimestamp(dateCreated: string): number {
   return Number.isNaN(time) ? Number.NEGATIVE_INFINITY : time;
 }
 
-// The most recent comment of a task: the greatest server-generated
+// The most recent comment of a list: the greatest server-generated
 // dateCreated, and the later array index on equal timestamps (robust to any
-// ordering of the comments array by the server). Null when the task has no
+// ordering of the comments array by the server). Null when there is no
 // comment.
-export function lastCommentOf(task: PlannerTask): PlannerTaskComment | null {
+function newestCommentOf(
+  comments: PlannerTaskComment[],
+): PlannerTaskComment | null {
   let last: PlannerTaskComment | null = null;
   let lastTime = Number.NEGATIVE_INFINITY;
-  for (const comment of task.comments) {
+  for (const comment of comments) {
     const time = commentTimestamp(comment.dateCreated);
     if (last === null || time >= lastTime) {
       last = comment;
@@ -2317,12 +2379,42 @@ export function lastCommentOf(task: PlannerTask): PlannerTaskComment | null {
   return last;
 }
 
+// The most recent comment of a task, or null when it has no comment.
+export function lastCommentOf(task: PlannerTask): PlannerTaskComment | null {
+  return newestCommentOf(task.comments);
+}
+
+// Appends the processed-comments watermark to a comments-mode comment:
+// the id of the newest comment the run consumed, or "none" when the brief
+// had no comment.
+export function appendProcessedCommentsMarker(
+  summary: string,
+  commentId: string | null,
+): string {
+  return `${summary.trimEnd()}\n\n${PROCESSED_COMMENTS_MARKER_PREFIX}${commentId ?? PROCESSED_COMMENTS_MARKER_NONE}${PROCESSED_COMMENTS_MARKER_SUFFIX}`;
+}
+
+// Extracts the processed-comments watermark of a comment text: the newest
+// consumed comment id, "none", or null when there is no trailing marker
+// (legacy summary, progress or abort comment).
+export function parseProcessedCommentsMarker(text: string): string | null {
+  const match = PROCESSED_COMMENTS_MARKER_PATTERN.exec(text.trimEnd());
+  return match ? match[1] : null;
+}
+
 // Whether a comment-triggered action must pick the task up now: zero
-// comments means pending (the description is the initial prompt) and
-// otherwise the task is picked up exactly when its last comment was not
-// authored by the agent. A null agentUserId is fail-safe: the agent's own
-// comments cannot be told apart from the user ones, so picking could loop
-// on the agent's own summary.
+// comments means pending (the description is the initial prompt), and a last
+// comment not authored by the agent means the conversation waits for the
+// agent. When the last comment is the agent's own, its processed-comments
+// watermark decides: pending iff a human comment is newer than the watermark
+// (or, for the "none" watermark, iff the task has a human comment at all).
+// An agent comment without a watermark (legacy summary, progress or abort
+// comment) keeps the previous rule and is not pending. The comparison uses
+// the same ordering as lastCommentOf and fails closed when the watermark
+// comment is no longer found, so a summary never re-triggers a loop and each
+// human comment re-triggers at most once. A null agentUserId is fail-safe:
+// the agent's own comments cannot be told apart from the user ones, so
+// picking could loop on the agent's own summary.
 export function commentsPickupPending(
   task: PlannerTask,
   agentUserId: string | null,
@@ -2331,7 +2423,37 @@ export function commentsPickupPending(
     return false;
   }
   const last = lastCommentOf(task);
-  return last === null || last.userId !== agentUserId;
+  if (last === null || last.userId !== agentUserId) {
+    return true;
+  }
+  const watermark = parseProcessedCommentsMarker(last.text);
+  if (watermark === null) {
+    return false;
+  }
+  const isHuman = (comment: PlannerTaskComment) =>
+    comment.userId !== agentUserId;
+  if (watermark === PROCESSED_COMMENTS_MARKER_NONE) {
+    return task.comments.some(isHuman);
+  }
+  const watermarkIndex = task.comments.findIndex(
+    (comment) => comment.id === watermark,
+  );
+  if (watermarkIndex === -1) {
+    return false;
+  }
+  const watermarkTime = commentTimestamp(
+    task.comments[watermarkIndex].dateCreated,
+  );
+  return task.comments.some((comment, index) => {
+    if (!isHuman(comment)) {
+      return false;
+    }
+    const time = commentTimestamp(comment.dateCreated);
+    return (
+      time > watermarkTime ||
+      (time === watermarkTime && index > watermarkIndex)
+    );
+  });
 }
 
 // Whether the agent already commented on the task at least once: the

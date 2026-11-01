@@ -3,6 +3,7 @@ import * as path from "path";
 import * as fse from "fs-extra";
 import {
   Agent,
+  appendProcessedCommentsMarker,
   buildTaskLabel,
   commentsPickupPending,
   hasAgentComment,
@@ -10,6 +11,7 @@ import {
   lastCommentOf,
   mergeLabels,
   normalizeLabelValue,
+  parseProcessedCommentsMarker,
 } from "./Agent";
 import { AgentActionsConfig } from "./AgentActions";
 import { Config } from "./Config";
@@ -5712,10 +5714,15 @@ describe("Agent", () => {
       agent.start();
       await waitFor(() =>
         mockPlanner.addTaskComment.mock.calls.some(
-          (call) => call[1] === "Agent analysis",
+          (call) => String(call[1]).startsWith("Agent analysis"),
         ),
       );
 
+      // The summary carries the processed-comments watermark of the brief:
+      // "none" since the task had no comment at pick time.
+      expect(
+        mockPlanner.addTaskComment.mock.calls.map((call) => call[1]),
+      ).toContain("Agent analysis\n\n<!-- agent:processed-comments=none -->");
       expect(mockQoder.performTask).toHaveBeenCalledTimes(1);
       // The summary comment is posted but the task never moves.
       expect(mockPlanner.updateTaskStatus).not.toHaveBeenCalled();
@@ -5744,12 +5751,19 @@ describe("Agent", () => {
       await waitFor(() => mockQoder.performTask.mock.calls.length === 1);
       await waitFor(() =>
         mockPlanner.addTaskComment.mock.calls.some(
-          (call) => call[1] === "Agent analysis",
+          (call) => String(call[1]).startsWith("Agent analysis"),
         ),
       );
+      const postedSummary = mockPlanner.addTaskComment.mock.calls
+        .map((call) => call[1] as string)
+        .find((text) => text.startsWith("Agent analysis"))!;
+      expect(postedSummary).toBe(
+        "Agent analysis\n\n<!-- agent:processed-comments=none -->",
+      );
 
-      // The agent's start and summary comments are now on the task: the
-      // conversation waits for the user and the next poll picks nothing.
+      // The agent's start and summary comments are now on the task, the
+      // summary with its watermark: the conversation waits for the user and
+      // the next poll picks nothing.
       task.comments = [
         {
           id: "c-start",
@@ -5762,7 +5776,7 @@ describe("Agent", () => {
           id: "c-summary",
           userId: "user-1",
           userName: "Test User",
-          text: "Agent analysis",
+          text: postedSummary,
           dateCreated: "2026-10-19T12:01:00.000Z",
         },
       ];
@@ -5838,8 +5852,14 @@ describe("Agent", () => {
       // The zero-comment task is processed by the first (comments) action.
       await waitFor(() =>
         mockPlanner.addTaskComment.mock.calls.some(
-          (call) => call[1] === "Investigation summary",
+          (call) => String(call[1]).startsWith("Investigation summary"),
         ),
+      );
+      const postedSummary = mockPlanner.addTaskComment.mock.calls
+        .map((call) => call[1] as string)
+        .find((text) => text.startsWith("Investigation summary"))!;
+      expect(postedSummary).toBe(
+        "Investigation summary\n\n<!-- agent:processed-comments=none -->",
       );
       expect(mockQoder.performTask).toHaveBeenCalledTimes(1);
       expect(
@@ -5857,7 +5877,7 @@ describe("Agent", () => {
           id: "c-agent",
           userId: "user-1",
           userName: "Test User",
-          text: "Investigation summary",
+          text: postedSummary,
           dateCreated: "2026-10-20T00:52:57.000Z",
         },
       ];
@@ -6096,14 +6116,309 @@ describe("Agent", () => {
       agent.start();
       await waitFor(() =>
         mockPlanner.addTaskComment.mock.calls.some(
-          (call) => call[1] === "Summary after call 3",
+          (call) => String(call[1]).startsWith("Summary after call 3"),
         ),
       );
 
       expect(mockQoder.performTask).toHaveBeenCalledTimes(3);
+      // The budget ran out on comment-during-3: the watermark records the
+      // last comment an adjustment round actually consumed, so the pending
+      // comment stays newer and re-triggers the task on a later poll.
+      expect(
+        mockPlanner.addTaskComment.mock.calls
+          .map((call) => call[1] as string)
+          .find((text) => text.startsWith("Summary after call 3")),
+      ).toBe(
+        "Summary after call 3\n\n<!-- agent:processed-comments=comment-during-2 -->",
+      );
       expect(mockPlanner.updateTaskStatus).not.toHaveBeenCalled();
       agent.stop();
     });
+
+    // Builds comment fixtures with increasing dates, in insertion order, so
+    // the watermark comparisons follow the scenario timeline.
+    const commentMaker = () => {
+      let tick = 0;
+      return (
+        id: string,
+        userId: string,
+        text: string,
+      ): Record<string, unknown> => ({
+        id,
+        userId,
+        userName: userId === "user-1" ? "Test User" : "Alice",
+        text,
+        dateCreated: new Date(
+          Date.parse("2026-10-19T12:00:00.000Z") + tick++ * 60000,
+        ).toISOString(),
+      });
+    };
+
+    const commentsTask = (comments: unknown[]) => ({
+      id: TASK_1,
+      title: "Discuss the plan",
+      status: "Plan",
+      description: "Design the conversational flow",
+      comments,
+      attachments: [] as unknown[],
+    });
+
+    it("should re-trigger a run for a comment posted before the summary", async () => {
+      config.TASK_POLLING_INTERVAL = 1;
+      const makeComment = commentMaker();
+      const task = commentsTask([]);
+      mockPlannerTasks([task]);
+      const summaries: string[] = [];
+      let injected = false;
+      mockQoder.performTask
+        .mockResolvedValueOnce("First analysis")
+        .mockResolvedValue("Second analysis");
+      mockPlanner.addTaskComment.mockImplementation(
+        async (_taskId: string, text: string) => {
+          if (!injected && text.startsWith("First analysis")) {
+            injected = true;
+            // The comment lands after the last new-comment check, before
+            // the summary is stored.
+            task.comments = [
+              ...task.comments,
+              makeComment("c-late", "user-2", "One more thing"),
+            ];
+          }
+          summaries.push(text);
+          task.comments = [
+            ...task.comments,
+            makeComment(`c-summary-${summaries.length}`, "user-1", text),
+          ];
+        },
+      );
+
+      const agent = createAgent(commentsActions());
+      agent.start();
+      await waitFor(() => summaries.length === 2, 10000);
+
+      // The first brief had no comment: its watermark is "none", so the
+      // late comment is not covered and re-triggers the task.
+      expect(summaries[0]).toBe(
+        "First analysis\n\n<!-- agent:processed-comments=none -->",
+      );
+      // The second brief covered the late comment and the first summary.
+      expect(summaries[1]).toBe(
+        "Second analysis\n\n<!-- agent:processed-comments=c-summary-1 -->",
+      );
+      // The summary never re-triggers itself: no third run.
+      await waitFor(
+        () => mockPlanner.getCurrentUser.mock.calls.length >= 4,
+        5000,
+      );
+      expect(mockQoder.performTask).toHaveBeenCalledTimes(2);
+      agent.stop();
+    }, 20000);
+
+    it("should keep the watermark behind a comment posted after the adjustment budget", async () => {
+      config.TASK_POLLING_INTERVAL = 1;
+      config.TASK_ADJUSTMENT_MAX_ROUNDS = 0;
+      const makeComment = commentMaker();
+      const task = commentsTask([
+        makeComment("c-first", "user-2", "Initial message"),
+      ]);
+      mockPlannerTasks([task]);
+      const summaries: string[] = [];
+      let runCount = 0;
+      mockQoder.performTask.mockImplementation(async () => {
+        runCount++;
+        if (runCount === 1) {
+          // A second comment lands while the CLI runs, with no adjustment
+          // budget left to consume it.
+          task.comments = [
+            ...task.comments,
+            makeComment("c-second", "user-2", "Second message"),
+          ];
+        }
+        return `Summary ${runCount}`;
+      });
+      mockPlanner.addTaskComment.mockImplementation(
+        async (_taskId: string, text: string) => {
+          summaries.push(text);
+          task.comments = [
+            ...task.comments,
+            makeComment(`c-summary-${summaries.length}`, "user-1", text),
+          ];
+        },
+      );
+
+      const agent = createAgent(commentsActions());
+      agent.start();
+      await waitFor(() => summaries.length === 2, 10000);
+
+      // The summary records the last consumed comment, not the pending one:
+      // the next poll re-runs the task exactly once.
+      expect(summaries[0]).toBe(
+        "Summary 1\n\n<!-- agent:processed-comments=c-first -->",
+      );
+      expect(summaries[1]).toBe(
+        "Summary 2\n\n<!-- agent:processed-comments=c-summary-1 -->",
+      );
+      await waitFor(
+        () => mockPlanner.getCurrentUser.mock.calls.length >= 4,
+        5000,
+      );
+      expect(mockQoder.performTask).toHaveBeenCalledTimes(2);
+      agent.stop();
+    }, 20000);
+
+    it("should retry once automatically for a comment posted during a failed run", async () => {
+      config.TASK_POLLING_INTERVAL = 1;
+      const makeComment = commentMaker();
+      const task = commentsTask([
+        makeComment("c-first", "user-2", "Initial message"),
+      ]);
+      mockPlannerTasks([task]);
+      const posted: string[] = [];
+      let runCount = 0;
+      mockQoder.performTask.mockImplementation(async () => {
+        runCount++;
+        if (runCount === 1) {
+          task.comments = [
+            ...task.comments,
+            makeComment("c-second", "user-2", "Posted while failing"),
+          ];
+          throw new Error("CLI failed");
+        }
+        return "Retry summary";
+      });
+      mockPlanner.addTaskComment.mockImplementation(
+        async (_taskId: string, text: string) => {
+          posted.push(text);
+          task.comments = [
+            ...task.comments,
+            makeComment(`c-posted-${posted.length}`, "user-1", text),
+          ];
+        },
+      );
+
+      const agent = createAgent(commentsActions());
+      agent.start();
+      await waitFor(() => runCount === 2 && posted.length >= 2, 10000);
+
+      // The failure comment carries the pick-time watermark: the comment
+      // posted during the failed run stays newer and triggers the retry.
+      const failure = posted.find((text) =>
+        text.includes("Task processing failed:"),
+      );
+      expect(failure).toBeDefined();
+      expect(
+        failure!.endsWith("<!-- agent:processed-comments=c-first -->"),
+      ).toBe(true);
+      // The retry summary covers the failure comment: no third run.
+      await waitFor(
+        () => mockPlanner.getCurrentUser.mock.calls.length >= 4,
+        5000,
+      );
+      expect(mockQoder.performTask).toHaveBeenCalledTimes(2);
+      agent.stop();
+    }, 20000);
+
+    it("should re-trigger a run for a comment posted during the finalization retry backoff", async () => {
+      config.TASK_POLLING_INTERVAL = 1;
+      const makeComment = commentMaker();
+      const task = commentsTask([]);
+      mockPlannerTasks([task]);
+      const finalizationStore = new FinalizationStore({
+        retryBaseMs: 20,
+        retryMaxMs: 20,
+      });
+      const posted: string[] = [];
+      let summaryPosts = 0;
+      let runCount = 0;
+      mockQoder.performTask.mockImplementation(async () => {
+        runCount++;
+        return runCount === 1 ? "First analysis" : "Second analysis";
+      });
+      mockPlanner.addTaskComment.mockImplementation(
+        async (_taskId: string, text: string) => {
+          summaryPosts++;
+          if (summaryPosts === 1) {
+            // The summary POST fails and a human comment lands during the
+            // backoff, while the task is excluded from the candidates.
+            task.comments = [
+              ...task.comments,
+              makeComment("c-backoff", "user-2", "During backoff"),
+            ];
+            throw new Error("Planner unavailable");
+          }
+          posted.push(text);
+          task.comments = [
+            ...task.comments,
+            makeComment(`c-summary-${summaryPosts}`, "user-1", text),
+          ];
+        },
+      );
+
+      const agent = createAgent(commentsActions(), finalizationStore);
+      agent.start();
+      await waitFor(() => runCount === 2 && posted.length >= 2, 10000);
+
+      // The retry re-posts the stored summary with its old watermark: the
+      // backoff comment was not covered, so it re-triggers a run.
+      expect(posted[0]).toBe(
+        "First analysis\n\n<!-- agent:processed-comments=none -->",
+      );
+      expect(posted[1]).toBe(
+        "Second analysis\n\n<!-- agent:processed-comments=c-summary-2 -->",
+      );
+      await waitFor(
+        () => mockPlanner.getCurrentUser.mock.calls.length >= 5,
+        5000,
+      );
+      expect(mockQoder.performTask).toHaveBeenCalledTimes(2);
+      agent.stop();
+    }, 20000);
+
+    it("should pick up a comment after a restart from the summary watermark", async () => {
+      config.TASK_POLLING_INTERVAL = 1;
+      const makeComment = commentMaker();
+      const task = commentsTask([]);
+      mockPlannerTasks([task]);
+      const summaries: string[] = [];
+      mockQoder.performTask.mockResolvedValue("Agent analysis");
+      mockPlanner.addTaskComment.mockImplementation(
+        async (_taskId: string, text: string) => {
+          summaries.push(text);
+          task.comments = [
+            ...task.comments,
+            makeComment(`c-summary-${summaries.length}`, "user-1", text),
+          ];
+        },
+      );
+
+      const firstAgent = createAgent(commentsActions(), new FinalizationStore());
+      firstAgent.start();
+      await waitFor(() => summaries.length === 1, 10000);
+      firstAgent.stop();
+
+      // A fresh agent with no in-memory state: the watermark lives only in
+      // the Planner summary comment.
+      task.comments = [
+        ...task.comments,
+        makeComment("c-human-after-restart", "user-2", "After restart"),
+      ];
+      const secondAgent = createAgent(
+        commentsActions(),
+        new FinalizationStore(),
+      );
+      secondAgent.start();
+      await waitFor(() => summaries.length === 2, 10000);
+
+      expect(summaries[0]).toBe(
+        "Agent analysis\n\n<!-- agent:processed-comments=none -->",
+      );
+      // The second brief's newest comment is the human one: covering it
+      // leaves no pending comment, so the conversation waits for the user.
+      expect(summaries[1]).toBe(
+        "Agent analysis\n\n<!-- agent:processed-comments=c-human-after-restart -->",
+      );
+      secondAgent.stop();
+    }, 20000);
 
     it("should finalize with the last successful summary when an adjustment run fails", async () => {
       mockPlannerTasks([
@@ -6184,7 +6499,7 @@ describe("Agent", () => {
       agent.start();
       await waitFor(() =>
         mockPlanner.addTaskComment.mock.calls.some(
-          (call) => call[1] === "Agent analysis",
+          (call) => String(call[1]).startsWith("Agent analysis"),
         ),
       );
 
@@ -6214,7 +6529,7 @@ describe("Agent", () => {
       await waitFor(() => mockQoder.performTask.mock.calls.length === 1);
       await waitFor(() =>
         mockPlanner.addTaskComment.mock.calls.some(
-          (call) => call[1] === "Agent analysis",
+          (call) => String(call[1]).startsWith("Agent analysis"),
         ),
       );
       const startComments = () =>
@@ -6361,6 +6676,137 @@ describe("Agent", () => {
           commentsPickupPending(
             buildTask([{ userId: USER, dateCreated: "2026-10-19T12:00:00.000Z" }]),
             null,
+          ),
+        ).toBe(false);
+      });
+
+      it("appendProcessedCommentsMarker should append the id or none, trimming trailing whitespace", () => {
+        expect(appendProcessedCommentsMarker("Summary", "c-1")).toBe(
+          "Summary\n\n<!-- agent:processed-comments=c-1 -->",
+        );
+        expect(appendProcessedCommentsMarker("Summary", null)).toBe(
+          "Summary\n\n<!-- agent:processed-comments=none -->",
+        );
+        expect(appendProcessedCommentsMarker("Summary  \n\n", "c-1")).toBe(
+          "Summary\n\n<!-- agent:processed-comments=c-1 -->",
+        );
+      });
+
+      it("parseProcessedCommentsMarker should only read a trailing marker", () => {
+        expect(
+          parseProcessedCommentsMarker(
+            "Summary\n\n<!-- agent:processed-comments=c-1 -->",
+          ),
+        ).toBe("c-1");
+        expect(
+          parseProcessedCommentsMarker(
+            "Summary\n\n<!-- agent:processed-comments=none -->",
+          ),
+        ).toBe("none");
+        expect(parseProcessedCommentsMarker("Summary")).toBeNull();
+        expect(
+          parseProcessedCommentsMarker(
+            "<!-- agent:processed-comments=c-1 -->\nMore text",
+          ),
+        ).toBeNull();
+        expect(
+          parseProcessedCommentsMarker(
+            "Summary\n\n<!-- agent:processed-comments=c-1 -->\n",
+          ),
+        ).toBe("c-1");
+      });
+
+      it("commentsPickupPending should compare the summary watermark with newer human comments", () => {
+        const summary = (id: string, dateCreated: string) => ({
+          id: `summary-${id}`,
+          userId: AGENT,
+          text: appendProcessedCommentsMarker("Summary", id),
+          dateCreated,
+        });
+        // The watermark covers the newest human comment: no loop.
+        expect(
+          commentsPickupPending(
+            buildTask([
+              {
+                id: "h1",
+                userId: USER,
+                dateCreated: "2026-10-19T12:00:00.000Z",
+              },
+              summary("h1", "2026-10-19T12:02:00.000Z"),
+            ]),
+            AGENT,
+          ),
+        ).toBe(false);
+        // A human comment newer than the watermark: pending.
+        expect(
+          commentsPickupPending(
+            buildTask([
+              {
+                id: "h1",
+                userId: USER,
+                dateCreated: "2026-10-19T12:00:00.000Z",
+              },
+              {
+                id: "h2",
+                userId: USER,
+                dateCreated: "2026-10-19T12:01:00.000Z",
+              },
+              summary("h1", "2026-10-19T12:02:00.000Z"),
+            ]),
+            AGENT,
+          ),
+        ).toBe(true);
+        // Equal timestamps: the human comment at a later array index wins.
+        expect(
+          commentsPickupPending(
+            buildTask([
+              {
+                id: "h1",
+                userId: USER,
+                dateCreated: "2026-10-19T12:00:00.000Z",
+              },
+              {
+                id: "h2",
+                userId: USER,
+                dateCreated: "2026-10-19T12:00:00.000Z",
+              },
+              summary("h1", "2026-10-19T12:02:00.000Z"),
+            ]),
+            AGENT,
+          ),
+        ).toBe(true);
+        // The "none" watermark only waits for the first human comment.
+        expect(
+          commentsPickupPending(
+            buildTask([summary("none", "2026-10-19T12:02:00.000Z")]),
+            AGENT,
+          ),
+        ).toBe(false);
+        expect(
+          commentsPickupPending(
+            buildTask([
+              {
+                id: "h1",
+                userId: USER,
+                dateCreated: "2026-10-19T12:00:00.000Z",
+              },
+              summary("none", "2026-10-19T12:02:00.000Z"),
+            ]),
+            AGENT,
+          ),
+        ).toBe(true);
+        // A watermark comment that no longer exists fails closed (no loop).
+        expect(
+          commentsPickupPending(
+            buildTask([
+              {
+                id: "h1",
+                userId: USER,
+                dateCreated: "2026-10-19T12:00:00.000Z",
+              },
+              summary("deleted", "2026-10-19T12:02:00.000Z"),
+            ]),
+            AGENT,
           ),
         ).toBe(false);
       });
