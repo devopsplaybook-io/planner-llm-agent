@@ -566,6 +566,40 @@ describe("Config", () => {
       ]);
     });
 
+    it("should report control characters in the git identity", () => {
+      const nameConfig = new Config();
+      nameConfig.PLANNER_API_KEY = "key";
+      nameConfig.GIT_USER_NAME = "Agent\nInjected";
+      expect(nameConfig.validate()).toEqual([
+        "GIT_USER_NAME must not contain control characters or newlines",
+      ]);
+
+      const emailConfig = new Config();
+      emailConfig.PLANNER_API_KEY = "key";
+      emailConfig.GIT_USER_EMAIL = "agent@test.example\rInjected";
+      expect(emailConfig.validate()).toEqual([
+        "GIT_USER_EMAIL must not contain control characters or newlines",
+      ]);
+    });
+
+    it("should report control characters in a non-empty GIT_GPG_KEY_ID", () => {
+      const config = new Config();
+      config.PLANNER_API_KEY = "key";
+      config.GIT_GPG_KEY_ID = "KEY\nID";
+
+      expect(config.validate()).toEqual([
+        "GIT_GPG_KEY_ID must not contain control characters or newlines",
+      ]);
+    });
+
+    it("should accept quotes and backslashes in the git identity", () => {
+      const config = new Config();
+      config.PLANNER_API_KEY = "key";
+      config.GIT_USER_NAME = 'Agent "Test" \\ X';
+
+      expect(config.validate()).toEqual([]);
+    });
+
     it("should not require agent note configuration by default", () => {
       const config = new Config();
       config.PLANNER_API_KEY = "key";

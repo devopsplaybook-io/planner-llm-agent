@@ -8,7 +8,9 @@ on:
 
 jobs:
   merge-build:
-    uses: devopsplaybook-io/common-utils/.github/workflows/reusable-merge-build.yml@main
+    # Pinned to a commit SHA so the build cannot change under the release.
+    # Refresh with: gh api repos/devopsplaybook-io/common-utils/commits/main --jq .sha
+    uses: devopsplaybook-io/common-utils/.github/workflows/reusable-merge-build.yml@4d4ea0dd4944408f2db109a343035c6f2746f884
     with:
       node_app_directories: '["agent"]'
     secrets:
