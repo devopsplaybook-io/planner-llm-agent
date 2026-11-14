@@ -45,7 +45,7 @@ RUN apt-get update && \
 
 # NodeJS (official tarball: version pinned, checksum verified against the
 # SHASUMS256.txt of the same versioned directory)
-ARG NODE_VERSION=26.13.0
+ARG NODE_VERSION=26.13.1
 RUN ARCH=$(dpkg --print-architecture) && \
     case "$ARCH" in \
       amd64) NODE_ARCH=x64 ;; \
@@ -81,7 +81,7 @@ RUN ARCH=$(dpkg --print-architecture) && \
     rm -f /tmp/kubectl.sha256
 
 # Helm CLI (version pinned for reproducible builds, checksum verified)
-ARG HELM_VERSION=v4.3.1
+ARG HELM_VERSION=v4.3.2
 RUN ARCH=$(dpkg --print-architecture) && \
     curl -fsSL "https://get.helm.sh/helm-${HELM_VERSION}-linux-${ARCH}.tar.gz" -o /tmp/helm.tar.gz && \
     curl -fsSL "https://get.helm.sh/helm-${HELM_VERSION}-linux-${ARCH}.tar.gz.sha256sum" -o /tmp/helm.tar.gz.sha256sum && \
@@ -92,10 +92,10 @@ RUN ARCH=$(dpkg --print-architecture) && \
 
 # yq (version pinned, SHA-256 pinned per architecture from the SHA-256 column
 # of the vendor checksums file:
-# https://github.com/mikefarah/yq/releases/download/v4.54.1/checksums)
-ARG YQ_VERSION=v4.54.1
-ARG YQ_SHA256_AMD64=8e34fc298390875de416e6a4afcb8cabeceb25d9aa8506c1a2f9353cf702ea5f
-ARG YQ_SHA256_ARM64=189088da0c6429ec5178dfaab1a114805f6cab0b61b165ab236efedf1d57a71b
+# https://github.com/mikefarah/yq/releases/download/v4.54.3/checksums)
+ARG YQ_VERSION=v4.54.3
+ARG YQ_SHA256_AMD64=129534601871538efe0ba4c5e62a34fb1d5f469bcb975c4fddeb467d82974973
+ARG YQ_SHA256_ARM64=89f69310b61b68d1245065a1241d1fc843f7a36cd6103ffd77ad987613bd1b67
 RUN ARCH=$(dpkg --print-architecture) && \
     case "$ARCH" in \
       amd64) YQ_SHA256=${YQ_SHA256_AMD64} ;; \
@@ -108,9 +108,9 @@ RUN ARCH=$(dpkg --print-architecture) && \
 
 # Go (version pinned, SHA-256 pinned per architecture from
 # https://go.dev/dl/?mode=json&include=all)
-ARG GO_VERSION=1.27.3
-ARG GO_SHA256_AMD64=65efbc80fdc1fa2cd2631cad5b481777a68e8725f34e89f50fc6ac714e379b40
-ARG GO_SHA256_ARM64=a06e99309dbcbdca1a8ccd2282c3ee146e55930886e26b4f1193269587165f49
+ARG GO_VERSION=1.27.4
+ARG GO_SHA256_AMD64=7226736c2339719cda28fbf3a54d71aa63bcefe376e98cef00034268dab24840
+ARG GO_SHA256_ARM64=3392582988a273a87ab5043ee1b2c9c17a2c3c00580bf9326c47a2e0aaaeac92
 RUN ARCH=$(dpkg --print-architecture) && \
     case "$ARCH" in \
       amd64) GO_SHA256=${GO_SHA256_AMD64} ;; \
@@ -125,8 +125,8 @@ ENV PATH="/usr/local/go/bin:${PATH}"
 
 # Rust (rustup-init from the pinned release archive, vendor .sha256 verified;
 # toolchain pinned for reproducible builds)
-ARG RUSTUP_VERSION=1.29.2
-ARG RUST_TOOLCHAIN=1.99.1
+ARG RUSTUP_VERSION=1.29.3
+ARG RUST_TOOLCHAIN=1.100.0
 ENV RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo \
     PATH="/usr/local/cargo/bin:${PATH}"
@@ -146,11 +146,11 @@ RUN RUSTUP_ARCH=$(case "$(dpkg --print-architecture)" in \
 # default, the others are selected with AGENT_CLI: claude-code, copilot-cli,
 # codex, gemini-cli)
 RUN npm install -g \
-      @qoder-ai/qodercli@1.1.81 \
-      @anthropic-ai/claude-code@2.1.316 \
-      @github/copilot@1.0.105 \
-      @openai/codex@0.166.0 \
-      @google/gemini-cli@0.66.0
+      @qoder-ai/qodercli@1.1.89 \
+      @anthropic-ai/claude-code@2.1.325 \
+      @github/copilot@1.0.112 \
+      @openai/codex@0.169.0 \
+      @google/gemini-cli@0.68.0
 
 # Verify all tools are available
 RUN node --version && npm --version && git --version && gh --version && \
