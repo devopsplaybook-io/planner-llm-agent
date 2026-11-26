@@ -14,7 +14,7 @@ jobs:
   pr-verify:
     # Pinned to a commit SHA so the quality gates cannot change under the build.
     # Refresh with: gh api repos/devopsplaybook-io/common-utils/commits/main --jq .sha
-    uses: devopsplaybook-io/common-utils/.github/workflows/reusable-pr-verify.yml@fd596fb62a41c71f596e2714b5d35cbda31985d5
+    uses: devopsplaybook-io/common-utils/.github/workflows/reusable-pr-verify.yml@7cdda8f6000fab3c2597d14ab5c65c02790079e7
     with:
       node_app_directories: '["agent"]'
     secrets:
